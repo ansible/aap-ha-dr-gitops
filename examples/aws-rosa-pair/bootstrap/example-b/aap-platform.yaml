@@ -1,0 +1,131 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: aap-platform
+  namespace: openshift-gitops
+spec:
+  goTemplate: true
+  goTemplateOptions:
+  - missingkey=error
+  ignoreApplicationDifferences:
+  - jsonPointers:
+    - /spec/syncPolicy/automated
+  template:
+    metadata:
+      name: aap-platform
+      namespace: openshift-gitops
+      labels:
+        aap.hadr.redhat.com/pair: '{{ .pair_id }}'
+        aap.hadr.redhat.com/environment: '{{ .environment_id }}'
+        aap.hadr.redhat.com/desired-role: '{{ if eq .environment_id .desired_primary_environment_id }}primary{{
+          else }}replica{{ end }}'
+      annotations:
+        argocd.argoproj.io/sync-options: Prune=false
+        argocd.argoproj.io/compare-options: IgnoreExtraneous
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/ansible-automation-platform/aap-ha-dr-gitops/
+        targetRevision: main
+        path: '{{ if eq .environment_id .desired_primary_environment_id }}examples/aws-rosa-pair/overlays/hadr-platform-primary{{
+          else }}examples/aws-rosa-pair/overlays/hadr-platform-replica{{ end }}'
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: aap
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+        - CreateNamespace=true
+        - SkipDryRunOnMissingResource=true
+        - ApplyOutOfSyncOnly=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
+      ignoreDifferences:
+      - group: apps
+        kind: Deployment
+        jsonPointers:
+        - /spec/replicas
+      - group: aap.ansible.com
+        kind: AnsibleAutomationPlatform
+        jsonPointers:
+        - /spec/database
+      - group: '*'
+        kind: '*'
+        jsonPointers:
+        - /status
+  templatePatch: |
+    spec:
+      source:
+        kustomize:
+          patches:
+            - target:
+                group: aap.ansible.com
+                version: v1alpha1
+                kind: AnsibleAutomationPlatform
+                name: aap
+              patch: |-
+                - op: replace
+                  path: /spec/public_base_url
+                  value: {{ .workloads.platform.public_base_url | toJson }}
+                - op: replace
+                  path: /spec/extra_settings
+                  value:
+                    - setting: CSRF_TRUSTED_ORIGINS
+                      value:
+                        - {{ .workloads.platform.public_base_url | toJson }}
+                        - {{ .workloads.platform.route_url | toJson }}
+            {{- if eq .environment_id .desired_primary_environment_id }}
+            - target:
+                group: batch
+                version: v1
+                kind: CronJob
+                name: aap-create-remote-execution-instances
+              patch: |-
+                - op: move
+                  from: /spec/jobTemplate/spec/template/spec/containers/0/env/1
+                  path: /spec/jobTemplate/spec/template/spec/containers/0/env/0
+                - op: replace
+                  path: /spec/jobTemplate/spec/template/spec/containers/0/env/0/value
+                  value: {{ join " " .workloads.platform.hop_node_ips | toJson }}
+                - op: replace
+                  path: /spec/jobTemplate/spec/template/spec/containers/0/env/1/value
+                  value: {{ join " " .workloads.platform.receptor_hosts | toJson }}
+            - target:
+                group: batch
+                version: v1
+                kind: CronJob
+                name: receptor-devel-patch
+              patch: |-
+                - op: replace
+                  path: /spec/jobTemplate/spec/template/spec/containers/0/env/1/value
+                  value: {{ join " " (concat .workloads.platform.receptor_hosts .workloads.platform.hop_node_ips) | toJson }}
+            {{- end }}
+  generators:
+  - matrix:
+      generators:
+      - matrix:
+          generators:
+          - git:
+              repoURL: https://github.com/ansible-automation-platform/aap-ha-dr-gitops/
+              revision: main
+              pathParamPrefix: pair
+              files:
+              - path: examples/aws-rosa-pair/deployment/argocd/pairs/*.yaml
+          - list:
+              elementsYaml: '[{{ range $i, $id := .member_environments }}{{ if $i }},{{ end }}{"environment_id":{{
+                $id | toJson }}}{{ end }}]'
+      - git:
+          repoURL: https://github.com/ansible-automation-platform/aap-ha-dr-gitops/
+          revision: main
+          pathParamPrefix: environment
+          files:
+          - path: examples/aws-rosa-pair/deployment/argocd/environments/{{ .environment_id }}.yaml
+    selector:
+      matchLabels:
+        target_cluster_id: example-b

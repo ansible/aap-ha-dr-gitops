@@ -1,0 +1,41 @@
+---
+# Fix CHK-16: API liveness — delete zombie pods (AAP-76643).
+# Pods are Running but API returns errors. Deleting forces K8s to restart.
+#
+# Input: _check_key, _check_name, _check_detail
+# Output: _fix_result, _fix_detail
+
+- name: "FIX {{ _check_name }}: Determine active cluster"
+  ansible.builtin.set_fact:
+    _zombie_context: >-
+      {% if _platform_result_a.aap_platform.active | default(false) | bool %}{{ cluster_a_context }}
+      {% else %}{{ cluster_b_context }}{% endif %}
+
+- name: "FIX {{ _check_name }}: Find controller-web pods"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ aap_namespace | default('aap') }}"
+    context: "{{ _zombie_context | trim }}"
+    label_selectors:
+      - "app.kubernetes.io/component=controller-web"
+  register: _zombie_pods
+  failed_when: false
+
+- name: "FIX {{ _check_name }}: Delete zombie controller-web pods"
+  kubernetes.core.k8s:
+    api_version: v1
+    kind: Pod
+    name: "{{ item.metadata.name }}"
+    namespace: "{{ aap_namespace | default('aap') }}"
+    context: "{{ _zombie_context | trim }}"
+    state: absent
+  loop: "{{ _zombie_pods.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  failed_when: false
+
+- name: "FIX {{ _check_name }}: Record result"
+  ansible.builtin.set_fact:
+    _fix_result: "pending"
+    _fix_detail: "Deleted {{ _zombie_pods.resources | default([]) | length }} zombie pod(s)"

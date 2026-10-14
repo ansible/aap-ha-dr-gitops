@@ -1,0 +1,17 @@
+# Enable through external-dns-enable only after the ownership handoff.
+replicaCount: 0
+fullnameOverride: external-dns-example-b
+serviceAccount:
+  name: external-dns-example-b
+txtOwnerId: external-dns-example-b
+domainFilters:
+- cluster.example.com
+env:
+- name: AWS_REGION
+  value: us-west-2
+- name: AWS_ROLE_ARN
+  value: arn:aws:iam::000000000000:role/example-eso-secrets-reader
+- name: AWS_WEB_IDENTITY_TOKEN_FILE
+  value: /var/run/secrets/aws/token
+- name: AWS_EC2_METADATA_DISABLED
+  value: 'true'

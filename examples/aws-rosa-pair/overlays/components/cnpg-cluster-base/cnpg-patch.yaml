@@ -1,0 +1,108 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: aap-postgres
+spec:
+  instances: 2
+  switchoverDelay: 60
+  startDelay: 300
+  stopDelay: 60
+  storage:
+    storageClass: gp3-csi
+  walStorage:
+    storageClass: gp3-csi
+  postgresql:
+    parameters:
+      tcp_keepalives_idle: "30"
+      tcp_keepalives_interval: "10"
+      tcp_keepalives_count: "3"
+      # Reduce forced WAL segment switches from every 5min (CNPG default) to 30min.
+      # Cuts idle WAL archiving from ~4.6 GB/day to ~0.8 GB/day. RPO for cold
+      # recovery increases from 5min to 30min; streaming replication is unaffected.
+      archive_timeout: "30min"
+  certificates:
+    serverCASecret: cnpg-ca
+    serverTLSSecret: cnpg-server-tls
+    clientCASecret: cnpg-ca
+    replicationTLSSecret: cnpg-replication-tls
+  backup:
+    barmanObjectStore:
+      endpointURL: http://rook-ceph-rgw-hub-objectstore.openshift-storage.svc:80
+      destinationPath: MUST_BE_SET_BY_OVERLAY
+      s3Credentials:
+        accessKeyId:
+          name: barman-rgw-credentials
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: barman-rgw-credentials
+          key: ACCESS_SECRET_KEY
+      data:
+        compression: snappy
+        jobs: 8
+        immediateCheckpoint: true
+      wal:
+        compression: gzip
+        maxParallel: 8
+    retentionPolicy: "2d"
+  replica:
+    self: MUST_BE_SET_BY_OVERLAY
+    source: MUST_BE_SET_BY_OVERLAY
+  externalClusters:
+    - name: MUST_BE_SET_BY_OVERLAY_SELF
+      barmanObjectStore:
+        endpointURL: http://rook-ceph-rgw-hub-objectstore.openshift-storage.svc:80
+        destinationPath: MUST_BE_SET_BY_OVERLAY
+        s3Credentials:
+          accessKeyId:
+            name: barman-rgw-credentials
+            key: ACCESS_KEY_ID
+          secretAccessKey:
+            name: barman-rgw-credentials
+            key: ACCESS_SECRET_KEY
+        wal:
+          compression: gzip
+          maxParallel: 8
+      connectionParameters:
+        host: MUST_BE_SET_BY_OVERLAY
+        port: "5432"
+        user: streaming_replica
+        sslmode: verify-ca
+        dbname: postgres
+      sslKey:
+        name: cnpg-replication-tls
+        key: tls.key
+      sslCert:
+        name: cnpg-replication-tls
+        key: tls.crt
+      sslRootCert:
+        name: cnpg-ca
+        key: ca.crt
+    - name: MUST_BE_SET_BY_OVERLAY_PARTNER
+      barmanObjectStore:
+        endpointURL: http://rook-ceph-rgw-hub-objectstore.openshift-storage.svc:80
+        destinationPath: MUST_BE_SET_BY_OVERLAY
+        s3Credentials:
+          accessKeyId:
+            name: barman-rgw-credentials
+            key: ACCESS_KEY_ID
+          secretAccessKey:
+            name: barman-rgw-credentials
+            key: ACCESS_SECRET_KEY
+        wal:
+          compression: gzip
+          maxParallel: 8
+      connectionParameters:
+        host: MUST_BE_SET_BY_OVERLAY
+        port: "5432"
+        user: streaming_replica
+        sslmode: verify-ca
+        dbname: postgres
+      sslKey:
+        name: cnpg-replication-tls
+        key: tls.key
+      sslCert:
+        name: cnpg-replication-tls
+        key: tls.crt
+      sslRootCert:
+        name: cnpg-ca
+        key: ca.crt

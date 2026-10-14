@@ -1,0 +1,23 @@
+---
+# Read-only CNPG switchover status check
+#
+# Reports the CNPG cluster's promotion/demotion state on a single cluster.
+# Uses cnpg_preflight for the actual check (reuses existing role).
+
+- name: Check CNPG status on {{ switchover_context }}
+  ansible.builtin.include_role:
+    name: aap.hadr_ops.cnpg_preflight
+  vars:
+    preflight_context: "{{ switchover_context }}"
+
+- name: Set switchover result from preflight
+  ansible.builtin.set_fact:
+    switchover_result:
+      context: "{{ switchover_context }}"
+      action: "status"
+      status: "{{ preflight_result.status | trim }}"
+      role: "{{ preflight_result.role | trim }}"
+      phase: "{{ preflight_result.phase }}"
+      ready: "{{ preflight_result.ready }}"
+      primary_pod: "{{ preflight_result.primary_pod }}"
+      error: "{{ preflight_result.error }}"

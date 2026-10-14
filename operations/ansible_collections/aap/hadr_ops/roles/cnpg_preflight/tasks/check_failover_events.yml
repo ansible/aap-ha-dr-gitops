@@ -1,0 +1,81 @@
+---
+# Check for CNPG failover events on a single cluster
+#
+# Queries Kubernetes events in the namespace for recent Failover-related
+# events from the CNPG operator. A high count indicates the cluster is
+# in a failover loop and is not stable enough for switchover operations.
+#
+# Input:
+#   preflight_context — K8s context of the target cluster
+#   aap_namespace, cluster_name
+#   preflight_failover_event_window (default: 30) — minutes to look back
+#   preflight_failover_warn_threshold (default: 3)
+#   preflight_failover_abort_threshold (default: 5)
+#
+# Output (set_fact):
+#   failover_events_result — dict with status, event_count, detail
+
+- name: Validate preflight_context is set
+  ansible.builtin.fail:
+    msg: "preflight_context must be set"
+  when: preflight_context | default('') == ''
+
+- name: Get CNPG cluster events
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Event
+    namespace: "{{ aap_namespace }}"
+    context: "{{ preflight_context }}"
+    field_selectors:
+      - "involvedObject.kind=Cluster"
+      - "involvedObject.name={{ cluster_name }}"
+  register: _fe_events
+  failed_when: false
+
+- name: Filter failover-related events within time window
+  vars:
+    _window_minutes: "{{ preflight_failover_event_window | default(30) | int }}"
+    _cutoff_epoch: "{{ (ansible_facts.date_time.epoch | int) - (_window_minutes | int * 60) }}"
+    _all_events: "{{ _fe_events.resources | default([]) if (_fe_events is not failed) else [] }}"
+    _failover_events: >-
+      {{ _all_events | selectattr('reason', 'defined') |
+         selectattr('reason', 'match', '(?i)failover|promot|switchover|demot') | list }}
+    _recent_failover_events: >-
+      {{ _failover_events | selectattr('lastTimestamp', 'defined') |
+         selectattr('lastTimestamp', 'ne', None) | list }}
+  ansible.builtin.set_fact:
+    _fe_total_events: "{{ _all_events | length }}"
+    _fe_failover_count: "{{ _recent_failover_events | length }}"
+    _fe_query_failed: "{{ _fe_events is failed }}"
+
+- name: Evaluate failover loop status
+  vars:
+    _warn_threshold: "{{ preflight_failover_warn_threshold | default(3) | int }}"
+    _abort_threshold: "{{ preflight_failover_abort_threshold | default(5) | int }}"
+  ansible.builtin.set_fact:
+    failover_events_result:
+      context: "{{ preflight_context }}"
+      status: >-
+        {% if _fe_query_failed | bool %}warn
+        {% elif (_fe_failover_count | int) > 50 %}fail
+        {% elif (_fe_failover_count | int) >= (_abort_threshold | int) %}fail
+        {% elif (_fe_failover_count | int) >= (_warn_threshold | int) %}warn
+        {% else %}pass{% endif %}
+      event_count: "{{ _fe_failover_count | int }}"
+      total_events: "{{ _fe_total_events | int }}"
+      window_minutes: "{{ preflight_failover_event_window | default(30) }}"
+      detail: >-
+        {% if _fe_query_failed | bool %}Cannot query events on {{ preflight_context }}
+        {% elif (_fe_failover_count | int) > 50 %}{{ _fe_failover_count }} failover events in {{ preflight_failover_event_window | default(30) }} min — cluster in severe failover loop, operator may need restart
+        {% elif (_fe_failover_count | int) >= (preflight_failover_abort_threshold | default(5) | int) %}{{ _fe_failover_count }} failover events in {{ preflight_failover_event_window | default(30) }} min — cluster in failover loop
+        {% elif (_fe_failover_count | int) >= (preflight_failover_warn_threshold | default(3) | int) %}{{ _fe_failover_count }} failover events in {{ preflight_failover_event_window | default(30) }} min — cluster may still be stabilizing
+        {% else %}{{ _fe_failover_count }} failover events in {{ preflight_failover_event_window | default(30) }} min — stable{% endif %}
+
+- name: Log failover events result
+  ansible.builtin.debug:
+    msg:
+      - "Failover Loop Check: {{ preflight_context }}"
+      - "  Status:       {{ failover_events_result.status | trim }}"
+      - "  Events:       {{ failover_events_result.event_count }} failover events in last {{ failover_events_result.window_minutes }} min"
+      - "  Total events: {{ failover_events_result.total_events }}"
+      - "  Detail:       {{ failover_events_result.detail | trim }}"

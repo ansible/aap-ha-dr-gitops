@@ -1,0 +1,13 @@
+---
+# Role-specific variables only.
+# Shared variables (aap_namespace, cluster_name, etc.) are provided by
+# the config_loader role — do not duplicate here.
+
+oc_binary: "oc"
+
+backup_name: ""
+backup_wait: true
+
+pitr_target_time: ""
+pitr_source_cluster: ""
+pitr_confirm: false

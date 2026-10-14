@@ -1,0 +1,9 @@
+---
+galaxy_info:
+  author: AAP HA/DR Testing Team
+  description: Manage ArgoCD application state during CNPG switchover
+  company: Red Hat
+  license: Apache-2.0
+  min_ansible_version: "2.15"
+  role_name: aap_argocd_manage
+dependencies: []

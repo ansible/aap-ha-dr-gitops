@@ -1,0 +1,6 @@
+schema_version: 1
+pair_id: example-pair
+member_environments:
+  - example-pair-a
+  - example-pair-b
+desired_primary_environment_id: example-pair-a

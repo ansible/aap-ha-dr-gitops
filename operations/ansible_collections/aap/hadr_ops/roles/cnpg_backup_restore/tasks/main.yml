@@ -1,0 +1,51 @@
+---
+# cnpg_backup_restore — Orchestrates CNPG backup and PITR restore operations.
+#
+# Dispatches to operation-specific task files based on `backup_mode`.
+# Supported modes: backup, list, verify, restore_pitr, restore_full
+
+- name: Validate backup_mode parameter
+  ansible.builtin.assert:
+    that:
+      - backup_mode is defined
+      - backup_mode in ['backup', 'list', 'verify', 'restore_pitr', 'restore_full']
+    fail_msg: >
+      backup_mode must be one of: backup, list, verify, restore_pitr, restore_full
+      (got '{{ backup_mode | default("undefined") }}')
+
+- name: Detect primary cluster
+  aap.hadr_ops.cnpg_cluster_info:
+    namespace: "{{ aap_namespace }}"
+    cluster_name: "{{ cluster_name }}"
+    context: "{{ target_context }}"
+  register: _cnpg_info
+
+- name: Validate cluster is accessible (restore_full) or healthy (other modes)
+  ansible.builtin.assert:
+    that:
+      - _cnpg_info.cluster_info is defined
+      - backup_mode == 'restore_full' or 'healthy' in _cnpg_info.cluster_info.status.phase | lower
+    fail_msg: >
+      CNPG cluster {{ cluster_name }} is not healthy
+      (phase: {{ _cnpg_info.cluster_info.status.phase | default('unknown') }}).
+      Backups should only run against a healthy cluster.
+
+- name: Include backup tasks
+  ansible.builtin.include_tasks: backup.yml
+  when: backup_mode == "backup"
+
+- name: Include list tasks
+  ansible.builtin.include_tasks: list.yml
+  when: backup_mode == "list"
+
+- name: Include verify tasks
+  ansible.builtin.include_tasks: verify.yml
+  when: backup_mode == "verify"
+
+- name: Include PITR restore tasks
+  ansible.builtin.include_tasks: restore_pitr.yml
+  when: backup_mode == "restore_pitr"
+
+- name: Include Full restore tasks
+  ansible.builtin.include_tasks: restore_full.yml
+  when: backup_mode == "restore_full"

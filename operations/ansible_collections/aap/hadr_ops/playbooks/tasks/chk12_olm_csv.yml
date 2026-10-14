@@ -1,0 +1,20 @@
+---
+# CHK-12: OLM/CSV health.
+
+- name: "CHK-12: Finalize OLM/CSV result"
+  vars:
+    _csv_statuses:
+      - "{{ _platform_result_a.csv.status | default('skip') | trim }}"
+      - "{{ _platform_result_b.csv.status | default('skip') | trim }}"
+    _csv_status: >-
+      {% if 'fail' in _csv_statuses %}fail
+      {% elif 'warn' in _csv_statuses %}warn
+      {% else %}pass{% endif %}
+    _check_key: "chk12_olm_csv"
+    _check_name: "CHK-12 OLM/CSV Health"
+    _check_status: "{{ _csv_status | trim }}"
+    _check_detail: "a={{ _platform_result_a.csv.detail | default('skip', true) | trim }}, b={{ _platform_result_b.csv.detail | default('skip', true) | trim }}"
+    _check_data:
+      cluster_a: "{{ _platform_result_a.csv | default({'status': 'skip'}) }}"
+      cluster_b: "{{ _platform_result_b.csv | default({'status': 'skip'}) }}"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/finalize_check.yml"

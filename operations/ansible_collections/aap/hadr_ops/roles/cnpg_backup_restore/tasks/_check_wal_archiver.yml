@@ -1,0 +1,65 @@
+---
+# Check WAL archiver health on the primary pod via pg_stat_archiver.
+# Reuses the same pattern as cnpg_switchover.
+
+- name: Get primary pod name
+  ansible.builtin.set_fact:
+    _primary_pod: "{{ _cnpg_info.cluster_info.status.currentPrimary }}"
+
+- name: Query pg_stat_archiver on primary
+  ansible.builtin.command:
+    argv:
+      - "{{ oc_binary }}"
+      - "--context={{ target_context }}"
+      - "exec"
+      - "-n"
+      - "{{ aap_namespace }}"
+      - "{{ _primary_pod }}"
+      - "--"
+      - "psql"
+      - "-U"
+      - "postgres"
+      - "-tAc"
+      - >-
+        SELECT json_build_object(
+          'archived_count', archived_count,
+          'failed_count', failed_count,
+          'last_archived_wal', last_archived_wal,
+          'last_archived_time', last_archived_time,
+          'last_failed_wal', last_failed_wal,
+          'last_failed_time', last_failed_time
+        ) FROM pg_stat_archiver;
+  register: _wal_archiver_raw
+  changed_when: false
+
+- name: Parse WAL archiver stats
+  ansible.builtin.set_fact:
+    _wal_archiver: "{{ _wal_archiver_raw.stdout | from_json }}"
+
+- name: Display WAL archiver status
+  ansible.builtin.debug:
+    msg:
+      - "WAL Archiver Status:"
+      - "  Archived: {{ _wal_archiver.archived_count }}"
+      - "  Failed: {{ _wal_archiver.failed_count }}"
+      - "  Last archived: {{ _wal_archiver.last_archived_wal | default('none') }}"
+      - "  Last archived at: {{ _wal_archiver.last_archived_time | default('never') }}"
+      - "  Last failed: {{ _wal_archiver.last_failed_wal | default('none') }}"
+
+- name: Evaluate WAL archiver health
+  ansible.builtin.set_fact:
+    _wal_archiver_healthy: >-
+      {{ (_wal_archiver.failed_count | int == 0) or
+         (_wal_archiver.last_archived_time is not none and
+          _wal_archiver.last_archived_time > (_wal_archiver.last_failed_time | default(''))) }}
+
+- name: Validate WAL archiver health
+  ansible.builtin.assert:
+    that:
+      - _wal_archiver_healthy | bool
+    fail_msg: >
+      WAL archiver is actively failing — last failure
+      ({{ _wal_archiver.last_failed_time | default('unknown') }}) is more recent than
+      last success ({{ _wal_archiver.last_archived_time | default('never') }}).
+      Last failed WAL: {{ _wal_archiver.last_failed_wal | default('unknown') }}.
+      Fix WAL archiving before proceeding with backup operations.

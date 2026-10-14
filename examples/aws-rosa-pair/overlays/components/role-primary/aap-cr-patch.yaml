@@ -1,0 +1,8 @@
+apiVersion: aap.ansible.com/v1alpha1
+kind: AnsibleAutomationPlatform
+metadata:
+  name: aap
+  annotations:
+    argocd.argoproj.io/sync-wave: "6"
+spec:
+  idle_aap: false

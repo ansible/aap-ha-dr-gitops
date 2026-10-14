@@ -1,0 +1,63 @@
+---
+# Force-promote a CNPG replica to primary (DR without token)
+#
+# Input:
+#   switchover_context — context of the replica to force-promote
+#   switchover_new_primary — site ID for promotion
+#
+# After promotion, delegates to cnpg_health_check for verification.
+# Reports honest status — caller decides whether to proceed or fail.
+
+- name: Force-promote to primary on {{ switchover_context }}
+  aap.hadr_ops.cnpg_switchover_step:
+    namespace: "{{ aap_namespace }}"
+    cluster_name: "{{ cluster_name }}"
+    context: "{{ switchover_context }}"
+    operation: "force_promote"
+    new_primary: "{{ switchover_new_primary }}"
+    reconciliation_wait: "{{ cnpg_promotion_wait }}"
+  register: _promote_result
+  ignore_errors: true
+
+- name: Log force promotion
+  ansible.builtin.debug:
+    msg: >-
+      CNPG force_promote on {{ switchover_context }}:
+      {{ 'completed' if _promote_result is succeeded else 'FAILED' }}
+      ({{ _promote_result.duration_seconds | default('n/a') }}s)
+
+- name: Verify cluster health after force promote
+  when: _promote_result is succeeded
+  ansible.builtin.include_role:
+    name: aap.hadr_ops.cnpg_health_check
+  vars:
+    health_check_context: "{{ switchover_context }}"
+    health_check_retries: "{{ (cnpg_readiness_timeout | int / cnpg_readiness_poll_interval | int) | int }}"
+    health_check_delay: "{{ cnpg_readiness_poll_interval }}"
+
+- name: Set switchover result (force_promote)
+  ansible.builtin.set_fact:
+    switchover_result:
+      context: "{{ switchover_context }}"
+      action: "force_promote"
+      status: >-
+        {% if not (_promote_result is succeeded) %}failed
+        {% elif (health_check_result is defined) and ((health_check_result.status | trim) == 'healthy') %}success
+        {% else %}{{ health_check_result.status | default('failed') | trim }}{% endif %}
+      duration_seconds: "{{ _promote_result.duration_seconds | default(0) }}"
+      primary_pod: "{{ health_check_result.primary_pod | default('unknown') if (health_check_result is defined) else 'unknown' }}"
+      phase: "{{ health_check_result.phase | default('unknown') if (health_check_result is defined) else 'unknown' }}"
+      warnings: "{{ _promote_result.warnings | default([]) }}"
+      error: >-
+        {% if not (_promote_result is succeeded) %}Force promote failed: {{ _promote_result.msg | default('unknown error') | truncate(200) }}
+        {% elif (health_check_result is defined) and ((health_check_result.status | trim) != 'healthy') %}{{ health_check_result.error | default('') | trim }}
+        {% else %}{% endif %}
+
+- name: Log force promotion result
+  ansible.builtin.debug:
+    msg:
+      - "CNPG force_promote on {{ switchover_context }}: {{ switchover_result.status | trim }}"
+      - "  Primary pod: {{ switchover_result.primary_pod }}"
+      - "  Phase: {{ switchover_result.phase }}"
+      - "  Warnings: {{ switchover_result.warnings | default([]) }}"
+      - "  Error: {{ switchover_result.error | trim | default('none') }}"

@@ -1,0 +1,24 @@
+---
+# switchover_workarounds — Post-switchover workarounds on a single cluster
+#
+# Per-target-system role. Apply known workarounds after CNPG promotion.
+# Each workaround is a separate task file for easy addition/removal.
+#
+# Input:
+#   workaround_context — K8s context of the target cluster
+#   aap_namespace
+#
+# Output:
+#   workaround_result — dict with applied workarounds and their status
+
+- name: Validate workaround_context is set
+  ansible.builtin.fail:
+    msg: "workaround_context must be set"
+  when: workaround_context | default('') == ''
+
+- name: Apply workarounds on {{ workaround_context }}
+  ansible.builtin.include_tasks: oauth2_secret_cleanup.yml
+
+- name: Log workarounds complete
+  ansible.builtin.debug:
+    msg: "Workarounds applied on {{ workaround_context }}"

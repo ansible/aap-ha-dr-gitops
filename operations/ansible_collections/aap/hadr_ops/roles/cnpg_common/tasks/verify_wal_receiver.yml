@@ -1,0 +1,53 @@
+---
+# Check WAL receiver status on a replica pod (pg_stat_wal_receiver).
+#
+# Unlike verify_streaming.yml (which queries pg_stat_replication on the
+# primary), this checks the replica side: is this pod actively receiving
+# WAL from a primary?
+#
+# Required variables:
+#   _wal_receiver_context:     Kubernetes context of the replica cluster
+#
+# Optional variables:
+#   _wal_receiver_kubeconfig:  Path to kubeconfig (default: omitted)
+#   _wal_receiver_retries:     Number of retries (default: 12)
+#   _wal_receiver_delay:       Seconds between retries (default: 10)
+#
+# Output variables:
+#   _wal_receiver_active:  1 if streaming, 0 otherwise (int)
+#   _wal_receiver_pod:     Name of the replica pod queried
+
+- name: "verify_wal_receiver | Find replica pod"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ aap_namespace }}"
+    label_selectors:
+      - "cnpg.io/cluster={{ cluster_name }}"
+      - "cnpg.io/instanceRole=replica"
+    context: "{{ _wal_receiver_context }}"
+    kubeconfig: "{{ _wal_receiver_kubeconfig | default(omit) }}"
+  register: _wr_pod_list
+
+- name: "verify_wal_receiver | Set replica pod name"
+  ansible.builtin.set_fact:
+    _wal_receiver_pod: "{{ (_wr_pod_list.resources | default([]) | first | default({})).metadata.name | default('') }}"
+    _wal_receiver_active: 0
+
+- name: "verify_wal_receiver | Query pg_stat_wal_receiver"
+  kubernetes.core.k8s_exec:
+    namespace: "{{ aap_namespace }}"
+    pod: "{{ _wal_receiver_pod }}"
+    command: '/bin/sh -c "psql -U postgres -t -c \"SELECT CASE WHEN pg_is_in_recovery() AND EXISTS(SELECT 1 FROM pg_stat_wal_receiver WHERE status = '"'"'streaming'"'"') THEN 1 ELSE 0 END;\""'
+    context: "{{ _wal_receiver_context }}"
+    kubeconfig: "{{ _wal_receiver_kubeconfig | default(omit) }}"
+  register: _wr_result
+  until: (_wr_result.stdout | default('0') | trim | int) >= 1
+  retries: "{{ _wal_receiver_retries | default(12) }}"
+  delay: "{{ _wal_receiver_delay | default(10) }}"
+  ignore_errors: true
+  when: _wal_receiver_pod | length > 0
+
+- name: "verify_wal_receiver | Set result fact"
+  ansible.builtin.set_fact:
+    _wal_receiver_active: "{{ _wr_result.stdout | default('0') | trim | int if (_wal_receiver_pod | default('') | length > 0) else 0 }}"

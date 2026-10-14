@@ -1,0 +1,80 @@
+---
+# CHK-01: Network Connectivity
+# Probes both clusters via cnpg_preflight, determines reachability,
+# auto-detects mode (graceful_switchover / disaster_recovery / unreachable),
+# and resolves the effective operating mode.
+
+- name: "CHK-01: Probe cluster-a via cnpg_preflight"
+  ansible.builtin.include_role:
+    name: aap.hadr_ops.cnpg_preflight
+  vars:
+    preflight_context: "{{ cluster_a_context }}"
+
+- name: "CHK-01: Save cluster-a probe result"
+  ansible.builtin.set_fact:
+    _chk01_result_a: "{{ preflight_result }}"
+    _chk01_a_reachable: "{{ (preflight_result.status | trim) != 'failed' or 'unreachable' not in (preflight_result.error | default('') | lower) }}"
+
+- name: "CHK-01: Probe cluster-b via cnpg_preflight"
+  ansible.builtin.include_role:
+    name: aap.hadr_ops.cnpg_preflight
+  vars:
+    preflight_context: "{{ cluster_b_context }}"
+
+- name: "CHK-01: Save cluster-b probe result"
+  ansible.builtin.set_fact:
+    _chk01_result_b: "{{ preflight_result }}"
+    _chk01_b_reachable: "{{ (preflight_result.status | trim) != 'failed' or 'unreachable' not in (preflight_result.error | default('') | lower) }}"
+
+- name: "CHK-01: Determine detected mode from connectivity"
+  ansible.builtin.set_fact:
+    _detected_mode: >-
+      {% if (_chk01_a_reachable | bool) and (_chk01_b_reachable | bool) %}graceful_switchover
+      {% elif (_chk01_a_reachable | bool) or (_chk01_b_reachable | bool) %}disaster_recovery
+      {% else %}unreachable{% endif %}
+    _reachable_context: >-
+      {% if (_chk01_a_reachable | bool) and not (_chk01_b_reachable | bool) %}{{ cluster_a_context }}
+      {% elif (_chk01_b_reachable | bool) and not (_chk01_a_reachable | bool) %}{{ cluster_b_context }}
+      {% else %}both{% endif %}
+    _unreachable_context: >-
+      {% if not (_chk01_a_reachable | bool) and (_chk01_b_reachable | bool) %}{{ cluster_a_context }}
+      {% elif not (_chk01_b_reachable | bool) and (_chk01_a_reachable | bool) %}{{ cluster_b_context }}
+      {% elif not (_chk01_a_reachable | bool) and not (_chk01_b_reachable | bool) %}both
+      {% else %}none{% endif %}
+
+- name: "CHK-01: Resolve effective mode"
+  ansible.builtin.set_fact:
+    _effective_mode: >-
+      {{ mode if (mode != 'auto') else (_detected_mode | trim) }}
+
+- name: "CHK-01: Build check result"
+  ansible.builtin.set_fact:
+    _chk01_status: >-
+      {% if (_detected_mode | trim) == 'unreachable' %}fail
+      {% elif (mode != 'auto') and (mode == 'graceful_switchover') and not ((_chk01_a_reachable | bool) and (_chk01_b_reachable | bool)) %}fail
+      {% else %}pass{% endif %}
+    _chk01_detail: >-
+      cluster-a={{ 'reachable' if (_chk01_a_reachable | bool) else 'UNREACHABLE' }},
+      cluster-b={{ 'reachable' if (_chk01_b_reachable | bool) else 'UNREACHABLE' }},
+      detected_mode={{ _detected_mode | trim }}
+
+- name: "CHK-01: Finalize"
+  vars:
+    _check_key: "chk01_connectivity"
+    _check_name: "CHK-01 Network Connectivity"
+    _check_status: "{{ _chk01_status | trim }}"
+    _check_detail: "{{ _chk01_detail | trim }}"
+    _check_data:
+      cluster_a:
+        reachable: "{{ _chk01_a_reachable | bool }}"
+        status: "{{ _chk01_result_a.status | trim }}"
+        role: "{{ _chk01_result_a.role | trim }}"
+        site_id: "{{ _chk01_result_a.site_id }}"
+      cluster_b:
+        reachable: "{{ _chk01_b_reachable | bool }}"
+        status: "{{ _chk01_result_b.status | trim }}"
+        role: "{{ _chk01_result_b.role | trim }}"
+        site_id: "{{ _chk01_result_b.site_id }}"
+      detected_mode: "{{ _detected_mode | trim }}"
+      effective_mode: "{{ _effective_mode | trim }}"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/finalize_check.yml"

@@ -1,0 +1,10 @@
+# Generated sanitized deployment snapshot.
+# Cluster-specific Argo CD selection for the exported pair.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- ../../applicationsets/aap-cnpg.yaml
+- ../../applicationsets/aap-eso.yaml
+- ../../applicationsets/aap-odf.yaml
+- ../../applicationsets/aap-platform.yaml
+- ../../applicationsets/aap-dns.yaml

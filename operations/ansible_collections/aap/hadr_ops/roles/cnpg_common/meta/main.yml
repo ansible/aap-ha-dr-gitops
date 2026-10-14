@@ -1,0 +1,11 @@
+---
+galaxy_info:
+  author: AAP HA/DR Testing Team
+  description: >
+    Shared task files for CNPG and AAP Kubernetes operations.
+    Not intended to be called directly — use include_role with tasks_from.
+  min_ansible_version: "2.14"
+  platforms: []
+  license: GPL-3.0-or-later
+
+dependencies: []

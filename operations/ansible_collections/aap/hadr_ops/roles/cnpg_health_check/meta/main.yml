@@ -1,0 +1,12 @@
+---
+galaxy_info:
+  role_name: cnpg_health_check
+  author: AAP HA/DR Testing Team
+  description: >-
+    CNPG cluster health verification. Supports instant snapshot (retries=1)
+    and wait-until-ready (configurable retries). Checks cluster phase and
+    primary pod readiness.
+  company: Red Hat
+  license: Apache-2.0
+  min_ansible_version: "2.15"
+dependencies: []

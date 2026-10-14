@@ -1,0 +1,38 @@
+---
+# CHK-03: Cluster Health
+# Evaluates CNPG cluster health from data already collected by CHK-01 probes.
+# No new queries — checks if either cluster is in a failed or degraded state.
+
+- name: "CHK-03: Evaluate cluster health from CHK-01 probes"
+  vars:
+    _status_a: "{{ _chk01_result_a.status | trim }}"
+    _status_b: "{{ _chk01_result_b.status | trim }}"
+    _a_applicable: "{{ _chk01_a_reachable | bool }}"
+    _b_applicable: "{{ _chk01_b_reachable | bool }}"
+  ansible.builtin.set_fact:
+    _chk03_status: >-
+      {% if _a_applicable and _status_a == 'failed' %}fail
+      {% elif _b_applicable and _status_b == 'failed' %}fail
+      {% elif _a_applicable and _status_a == 'pod_not_ready' %}warn
+      {% elif _b_applicable and _status_b == 'pod_not_ready' %}warn
+      {% else %}pass{% endif %}
+    _chk03_detail: >-
+      cluster-a={{ _chk01_result_a.status | trim }}({{ _chk01_result_a.ready }}),
+      cluster-b={{ _chk01_result_b.status | trim }}({{ _chk01_result_b.ready }})
+
+- name: "CHK-03: Finalize"
+  vars:
+    _check_key: "chk03_cluster_health"
+    _check_name: "CHK-03 Cluster Health"
+    _check_status: "{{ _chk03_status | trim }}"
+    _check_detail: "{{ _chk03_detail | trim }}"
+    _check_data:
+      cluster_a:
+        status: "{{ _chk01_result_a.status | trim }}"
+        phase: "{{ _chk01_result_a.phase }}"
+        ready: "{{ _chk01_result_a.ready }}"
+      cluster_b:
+        status: "{{ _chk01_result_b.status | trim }}"
+        phase: "{{ _chk01_result_b.phase }}"
+        ready: "{{ _chk01_result_b.ready }}"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/finalize_check.yml"

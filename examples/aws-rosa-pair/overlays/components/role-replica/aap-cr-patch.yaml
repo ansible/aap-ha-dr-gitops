@@ -1,0 +1,15 @@
+apiVersion: aap.ansible.com/v1alpha1
+kind: AnsibleAutomationPlatform
+metadata:
+  name: aap
+  annotations:
+    argocd.argoproj.io/sync-wave: "6"
+spec:
+  idle_aap: true
+  hub:
+    storage_type: s3
+    object_storage_s3_secret: hub-rgw-s3-credentials
+  lightspeed:
+    disabled: true
+  metrics:
+    disabled: true

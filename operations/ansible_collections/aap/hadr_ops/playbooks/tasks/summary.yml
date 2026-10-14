@@ -1,0 +1,95 @@
+---
+# Preflight Summary
+# Aggregates all check results into a final preflight_decision fact and
+# displays the comprehensive summary table.
+
+- name: Build preflight decision
+  vars:
+    _all_statuses: >-
+      {{ [
+        _preflight_checks.chk01_connectivity.status | default('skip'),
+        _preflight_checks.chk02_storage.status | default('skip'),
+        _preflight_checks.chk03_cluster_health.status | default('skip'),
+        _preflight_checks.chk04_failover_loop.status | default('skip'),
+        _preflight_checks.chk05_split_brain.status | default('skip'),
+        _preflight_checks.chk06_wal_timeline.status | default('skip'),
+        _preflight_checks.chk07_replication_slot.status | default('skip'),
+        _preflight_checks.chk08_wal_archiver.status | default('skip'),
+        _preflight_checks.chk09_replication_lag.status | default('skip'),
+        _preflight_checks.chk10_convergence.status | default('skip'),
+        _preflight_checks.chk11_aap_topology.status | default('skip'),
+        _preflight_checks.chk12_olm_csv.status | default('skip'),
+        _preflight_checks.chk13_promotion_token.status | default('skip'),
+        _preflight_checks.chk14_argocd.status | default('skip'),
+         _preflight_checks.chk15_chaos_artifacts.status | default('skip'),
+         _preflight_checks.chk16_api_liveness.status | default('skip'),
+         _preflight_checks.chk17_migration_state.status | default('skip')
+      ] | map('trim') | list }}
+    _has_fail: "{{ 'fail' in _all_statuses }}"
+    _has_warn: "{{ 'warn' in _all_statuses }}"
+  ansible.builtin.set_fact:
+    preflight_decision:
+      action: >-
+        {% if _has_fail | bool %}abort
+        {% elif _has_warn | bool %}proceed_with_warnings
+        {% else %}proceed{% endif %}
+      reason: >-
+        {% if _has_fail | bool %}One or more checks failed (debug mode — not enforced)
+        {% elif _has_warn | bool %}All checks passed with warnings
+        {% else %}All applicable checks passed{% endif %}
+      mode: "{{ _effective_mode | trim }}"
+      checks: "{{ _preflight_checks }}"
+      timestamp: "{{ ansible_facts.date_time.iso8601 }}"
+
+- name: Display preflight summary
+  ansible.builtin.debug:
+    msg:
+      - "=========================================="
+      - "PREFLIGHT SUMMARY"
+      - "=========================================="
+      - "Mode:     {{ preflight_decision.mode }}"
+      - "Decision: {{ preflight_decision.action | upper }}"
+      - "Reason:   {{ preflight_decision.reason }}"
+      - ""
+      - "  ── Infrastructure ──────────────────────"
+      - "  CHK-01 Network Connectivity ...... {{ _preflight_checks.chk01_connectivity.status | upper }}  ({{ _preflight_checks.chk01_connectivity.detail }})"
+      - "  CHK-02 Storage Infrastructure .... {{ (_preflight_checks.chk02_storage.status | default('skip')) | upper }}  ({{ _preflight_checks.chk02_storage.detail | default('skipped') }})"
+      - ""
+      - "  ── CNPG / Database ─────────────────────"
+      - "  CHK-03 Cluster Health ............ {{ (_preflight_checks.chk03_cluster_health.status | default('skip')) | upper }}  ({{ _preflight_checks.chk03_cluster_health.detail | default('skipped') }})"
+      - "  CHK-04 Failover Loop ............. {{ (_preflight_checks.chk04_failover_loop.status | default('skip')) | upper }}  ({{ _preflight_checks.chk04_failover_loop.detail | default('skipped') }})"
+      - "  CHK-05 Split-Brain ............... {{ (_preflight_checks.chk05_split_brain.status | default('skip')) | upper }}  ({{ _preflight_checks.chk05_split_brain.detail | default('skipped') }})"
+      - "  CHK-06 WAL Timeline .............. {{ (_preflight_checks.chk06_wal_timeline.status | default('skip')) | upper }}  ({{ _preflight_checks.chk06_wal_timeline.detail | default('skipped') }})"
+      - "  CHK-07 Replication Slot .......... {{ (_preflight_checks.chk07_replication_slot.status | default('skip')) | upper }}  ({{ _preflight_checks.chk07_replication_slot.detail | default('skipped') }})"
+      - "  CHK-08 WAL Archiver .............. {{ (_preflight_checks.chk08_wal_archiver.status | default('skip')) | upper }}  ({{ _preflight_checks.chk08_wal_archiver.detail | default('skipped') }})"
+      - "  CHK-09 Replication Lag ........... {{ (_preflight_checks.chk09_replication_lag.status | default('skip')) | upper }}  ({{ _preflight_checks.chk09_replication_lag.detail | default('skipped') }})"
+      - "  CHK-10 Recovery Convergence ...... {{ (_preflight_checks.chk10_convergence.status | default('skip')) | upper }}  ({{ _preflight_checks.chk10_convergence.detail | default('skipped') }})"
+      - ""
+      - "  ── AAP Platform ────────────────────────"
+      - "  CHK-11 AAP Topology .............. {{ (_preflight_checks.chk11_aap_topology.status | default('skip')) | upper }} ({{ _preflight_checks.chk11_aap_topology.detail | default('skipped', true) | trim }})"
+      - "         idle_deployment ........... a={{ _platform_result_a.idle_deployment.detail | default('skip') | trim }}, b={{ _platform_result_b.idle_deployment.detail | default('skip') | trim }}"
+      - "         AAP pods .................. a={{ _platform_result_a.aap_pods.detail | default('skip') | trim }}, b={{ _platform_result_b.aap_pods.detail | default('skip') | trim }}"
+      - "  CHK-12 OLM/CSV Health ............ {{ (_preflight_checks.chk12_olm_csv.status | default('skip')) | upper }} ({{ _preflight_checks.chk12_olm_csv.detail | default('skipped', true) | trim }})"
+      - "  CHK-13 Promotion Token ........... {{ (_preflight_checks.chk13_promotion_token.status | default('skip')) | upper }} ({{ _preflight_checks.chk13_promotion_token.detail | default('skipped', true) | trim }})"
+      - "  CHK-14 ArgoCD State .............. {{ (_preflight_checks.chk14_argocd.status | default('skip')) | upper }} ({{ _preflight_checks.chk14_argocd.detail | default('skipped', true) | trim }})"
+      - "  CHK-15 Chaos Artifacts ........... {{ (_preflight_checks.chk15_chaos_artifacts.status | default('skip')) | upper }} ({{ _preflight_checks.chk15_chaos_artifacts.detail | default('skipped', true) | trim }})"
+      - "  CHK-16 API Liveness .............. {{ (_preflight_checks.chk16_api_liveness.status | default('skip')) | upper }} ({{ _preflight_checks.chk16_api_liveness.detail | default('skipped', true) | trim }})"
+      - "  CHK-17 Migration State ........... {{ (_preflight_checks.chk17_migration_state.status | default('skip')) | upper }} ({{ _preflight_checks.chk17_migration_state.detail | default('not applicable', true) | trim }})"
+      - "  CHK-18 RTO Advisory .............. INFO  (expected ~10 min full recovery)"
+      - "=========================================="
+
+- name: Display autofix summary
+  when: autofix | default(false) | bool
+  ansible.builtin.debug:
+    msg:
+      - ""
+      - "  ── Autofix Summary ─────────────────────"
+      - "  Fixes attempted: {{ _autofix_stats.fixes_attempted | default(0) }}"
+      - "  Fixes succeeded: {{ _autofix_stats.fixes_succeeded | default(0) }}"
+      - "  Fixes failed:    {{ _autofix_stats.fixes_failed | default(0) }}"
+      - "  Not fixable:     {{ _autofix_stats.checks_unfixable | default(0) }}"
+      - "=========================================="
+
+- name: Push metrics to Prometheus
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/push_metrics.yml"
+  when: prometheus_pushgateway_url | default('') | length > 0

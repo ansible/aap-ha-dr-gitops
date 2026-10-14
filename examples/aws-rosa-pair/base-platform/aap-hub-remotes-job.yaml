@@ -1,0 +1,365 @@
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: aap-hub-remotes-setup
+  namespace: aap
+  annotations:
+    argocd.argoproj.io/sync-wave: "25"
+spec:
+  schedule: "*/45 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      ttlSecondsAfterFinished: 300
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: hub-remotes-setup
+            image: registry.access.redhat.com/ubi9/ubi:latest
+            command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+
+              HUB_API="http://aap.aap.svc.cluster.local/api/galaxy/pulp/api/v3"
+              AUTH_URL="https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token"
+              CERTIFIED_URL="https://console.redhat.com/api/automation-hub/content/published/"
+              VALIDATED_URL="https://console.redhat.com/api/automation-hub/content/validated/"
+
+              echo "Waiting for AAP gateway..."
+              GATEWAY_READY=0
+              for i in $(seq 1 60); do
+                STATUS=$(curl -sk http://aap.aap.svc.cluster.local/api/gateway/v1/ping/ 2>/dev/null | grep -o '"status":"[^"]*"' | head -1)
+                if echo "$STATUS" | grep -q "good"; then
+                  echo "Gateway is ready"
+                  GATEWAY_READY=1
+                  break
+                fi
+                echo "  attempt $i: $STATUS"
+                sleep 10
+              done
+              if [ "$GATEWAY_READY" = "0" ]; then
+                echo "ERROR: AAP gateway is not ready"
+                exit 1
+              fi
+
+              AUTH="-u ${ADMIN_USER}:${ADMIN_PASS}"
+              FAILED=0
+
+              # --- Helper: get remote by name ---
+              get_remote() {
+                curl -sk $AUTH "${HUB_API}/remotes/ansible/collection/?name=$1" \
+                  -H "Content-Type: application/json"
+              }
+
+              # --- Helper: get repository by name ---
+              get_repo() {
+                curl -sk $AUTH "${HUB_API}/repositories/ansible/ansible/?name=$1" \
+                  -H "Content-Type: application/json" || echo "get_repo failed"
+              }
+
+              # --- Helper: extract pulp_id from pulp_href ---
+              extract_pulp_id() {
+                echo "$1" | sed 's|/$||' | awk -F/ '{print $NF}'
+              }
+
+              # --- Helper: create a remote ---
+              create_remote() {
+                REMOTE_NAME="$1"
+                REMOTE_URL="$2"
+
+                echo "Creating remote '${REMOTE_NAME}'..."
+                RESPONSE=$(curl -sk -w "\n%{http_code}" $AUTH \
+                  -H "Content-Type: application/json" \
+                  -X POST "${HUB_API}/remotes/ansible/collection/" \
+                  -d "{
+                    \"name\": \"${REMOTE_NAME}\",
+                    \"url\": \"${REMOTE_URL}\",
+                    \"download_concurrency\": 10,
+                    \"policy\": \"immediate\",
+                    \"auth_url\": \"${AUTH_URL}\",
+                    \"token\": \"${OFFLINE_TOKEN}\"
+                  }")
+
+                HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+                BODY=$(echo "$RESPONSE" | sed '$d')
+
+                if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+                  echo "Remote '${REMOTE_NAME}' created successfully (HTTP ${HTTP_CODE})"
+                else
+                  echo "Failed to create remote '${REMOTE_NAME}': HTTP ${HTTP_CODE} - ${BODY}"
+                  return 1
+                fi
+              }
+
+              # --- Helper: update remote token ---
+              update_remote_token() {
+                REMOTE_NAME="$1"
+                PULP_ID="$2"
+
+                echo "Updating token for remote '${REMOTE_NAME}'..."
+                RESPONSE=$(curl -sk -w "\n%{http_code}" $AUTH \
+                  -H "Content-Type: application/json" \
+                  -X PATCH "${HUB_API}/remotes/ansible/collection/${PULP_ID}/" \
+                  -d "{
+                    \"token\": \"${OFFLINE_TOKEN}\"
+                  }")
+
+                HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+                BODY=$(echo "$RESPONSE" | sed '$d')
+
+                if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+                  echo "Token updated for remote '${REMOTE_NAME}' (HTTP ${HTTP_CODE})"
+                else
+                  echo "Failed to update token for remote '${REMOTE_NAME}': HTTP ${HTTP_CODE} - ${BODY}"
+                  return 1
+                fi
+              }
+
+              # --- Helper: associate remote with repository ---
+              associate_remote_to_repo() {
+                REPO_PULP_ID="$1"
+                REMOTE_HREF="$2"
+
+                echo "Associating remote with repository..."
+                RESPONSE=$(curl -sk -w "\n%{http_code}" $AUTH \
+                  -H "Content-Type: application/json" \
+                  -X PATCH "${HUB_API}/repositories/ansible/ansible/${REPO_PULP_ID}/" \
+                  -d "{
+                    \"remote\": \"${REMOTE_HREF}\"
+                  }")
+
+                HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+                BODY=$(echo "$RESPONSE" | sed '$d')
+
+                if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+                  echo "Remote associated with repository (HTTP ${HTTP_CODE})"
+                else
+                  echo "Failed to associate remote: HTTP ${HTTP_CODE} - ${BODY}"
+                  return 1
+                fi
+              }
+
+              # --- Helper: trigger repository sync ---
+              sync_repo() {
+                REPO_NAME="$1"
+                REPO_PULP_ID="$2"
+
+                echo "Triggering sync for repository '${REPO_NAME}'..."
+                RESPONSE=$(curl -sk -w "\n%{http_code}" $AUTH \
+                  -H "Content-Type: application/json" \
+                  -X POST "${HUB_API}/repositories/ansible/ansible/${REPO_PULP_ID}/sync/" \
+                  -d '{"optimize": true}')
+
+                HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+                BODY=$(echo "$RESPONSE" | sed '$d')
+
+                if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+                  TASK_HREF=$(echo "$BODY" | grep -o '"task":"[^"]*"' | head -1 | sed 's/"task":"//;s/"//')
+                  if [ -n "$TASK_HREF" ]; then
+                    echo "Sync started for '${REPO_NAME}', task: ${TASK_HREF}"
+                    echo "$TASK_HREF"
+                    return 0
+                  else
+                    echo "Sync accepted but no task href returned for '${REPO_NAME}'"
+                    return 1
+                  fi
+                else
+                  echo "Failed to trigger sync for '${REPO_NAME}': HTTP ${HTTP_CODE} - ${BODY}"
+                  return 1
+                fi
+              }
+
+              # --- Helper: wait for a Pulp task to complete ---
+              wait_for_task() {
+                TASK_HREF="$1"
+                REPO_NAME="$2"
+                MAX_WAIT=1800
+                INTERVAL=15
+                ELAPSED=0
+
+                echo "Waiting for '${REPO_NAME}' sync task to complete (timeout: ${MAX_WAIT}s)..."
+                while [ "$ELAPSED" -lt "$MAX_WAIT" ]; do
+                  TASK_DATA=$(curl -sk $AUTH "${HUB_API%/api/galaxy/pulp/api/v3}${TASK_HREF}" \
+                    -H "Content-Type: application/json")
+                  TASK_STATE=$(echo "$TASK_DATA" | grep -o '"state":"[^"]*"' | head -1 | sed 's/"state":"//;s/"//')
+
+                  case "$TASK_STATE" in
+                    completed)
+                      echo "Sync for '${REPO_NAME}' completed successfully"
+                      return 0
+                      ;;
+                    failed|canceled|cancelled)
+                      TASK_ERROR=$(echo "$TASK_DATA" | grep -o '"error":{[^}]*}' | head -1)
+                      echo "Sync for '${REPO_NAME}' ${TASK_STATE}: ${TASK_ERROR}"
+                      return 1
+                      ;;
+                    *)
+                      echo "  ${REPO_NAME}: state=${TASK_STATE}, elapsed=${ELAPSED}s"
+                      sleep "$INTERVAL"
+                      ELAPSED=$((ELAPSED + INTERVAL))
+                      ;;
+                  esac
+                done
+
+                echo "Timeout waiting for '${REPO_NAME}' sync after ${MAX_WAIT}s"
+                return 1
+              }
+
+              # ============================================================
+              # rh-certified: update offline token on existing remote
+              # ============================================================
+              echo ""
+              echo "=== Setting up rh-certified remote ==="
+              RH_CERT_DATA=$(get_remote "rh-certified")
+              RH_CERT_COUNT=$(echo "$RH_CERT_DATA" | grep -o '"count":[0-9]*' | grep -o '[0-9]*')
+
+              if [ "$RH_CERT_COUNT" != "0" ] && [ -n "$RH_CERT_COUNT" ]; then
+                PULP_HREF=$(echo "$RH_CERT_DATA" | grep -o '"pulp_href":"[^"]*"' | head -1 | sed 's/"pulp_href":"//;s/"//')
+                PULP_ID=$(extract_pulp_id "$PULP_HREF")
+                echo "Remote 'rh-certified' exists (pulp_id: ${PULP_ID}), updating token..."
+                if ! update_remote_token "rh-certified" "$PULP_ID"; then
+                  FAILED=1
+                fi
+              else
+                echo "Remote 'rh-certified' not found, creating..."
+                if ! create_remote "rh-certified" "$CERTIFIED_URL"; then
+                  FAILED=1
+                fi
+              fi
+
+              # ============================================================
+              # validated: create remote if missing, associate with repo
+              # ============================================================
+              echo ""
+              echo "=== Setting up validated remote ==="
+              VAL_DATA=$(get_remote "validated")
+              VAL_COUNT=$(echo "$VAL_DATA" | grep -o '"count":[0-9]*' | grep -o '[0-9]*')
+
+              if [ "$VAL_COUNT" != "0" ] && [ -n "$VAL_COUNT" ]; then
+                PULP_HREF=$(echo "$VAL_DATA" | grep -o '"pulp_href":"[^"]*"' | head -1 | sed 's/"pulp_href":"//;s/"//')
+                PULP_ID=$(extract_pulp_id "$PULP_HREF")
+                echo "Remote 'validated' already exists (pulp_id: ${PULP_ID}), updating token..."
+                if ! update_remote_token "validated" "$PULP_ID"; then
+                  FAILED=1
+                fi
+              else
+                echo "Remote 'validated' not found, creating..."
+                if ! create_remote "validated" "$VALIDATED_URL"; then
+                  FAILED=1
+                fi
+              fi
+
+              # Check if validated repository exists and needs remote association
+              echo "Checking validated repository..."
+              REPO_DATA=$(get_repo "validated")
+              REPO_COUNT=$(echo "$REPO_DATA" | grep -o '"count":[0-9]*' | grep -o '[0-9]*')
+
+              if [ "$REPO_COUNT" != "0" ] && [ -n "$REPO_COUNT" ]; then
+                REPO_REMOTE=$(echo "$REPO_DATA" | grep -o '"remote":"[^"]*"' | head -1 | sed 's/"remote":"//;s/"//')
+                REPO_REMOTE_NULL=$(echo "$REPO_DATA" | grep -o '"remote":null' || true)
+
+                if [ -n "$REPO_REMOTE_NULL" ] || [ -z "$REPO_REMOTE" ]; then
+                  echo "Repository 'validated' exists but has no remote associated"
+                  # Re-fetch the remote to get the pulp_href for association
+                  VAL_REMOTE_DATA=$(get_remote "validated")
+                  REMOTE_HREF=$(echo "$VAL_REMOTE_DATA" | grep -o '"pulp_href":"[^"]*"' | head -1 | sed 's/"pulp_href":"//;s/"//')
+                  REPO_HREF=$(echo "$REPO_DATA" | grep -o '"pulp_href":"[^"]*"' | head -1 | sed 's/"pulp_href":"//;s/"//')
+                  REPO_PULP_ID=$(extract_pulp_id "$REPO_HREF")
+
+                  if [ -n "$REMOTE_HREF" ] && [ -n "$REPO_PULP_ID" ]; then
+                    if ! associate_remote_to_repo "$REPO_PULP_ID" "$REMOTE_HREF"; then
+                      FAILED=1
+                    fi
+                  else
+                    echo "Could not determine remote href or repo pulp_id for association"
+                    FAILED=1
+                  fi
+                else
+                  echo "Repository 'validated' already has a remote associated, skipping"
+                fi
+              else
+                echo "Repository 'validated' not found, it will be created during sync"
+              fi
+
+              echo ""
+              if [ "$FAILED" = "1" ]; then
+                echo "Some remote setup operations failed, skipping sync"
+                exit 1
+              fi
+              echo "All hub remotes configured successfully"
+
+              # ============================================================
+              # Sync repositories
+              # ============================================================
+              echo ""
+              echo "=== Syncing repositories ==="
+              SYNC_FAILED=0
+
+              for REPO_NAME in rh-certified validated; do
+                echo ""
+                echo "--- Processing sync for '${REPO_NAME}' ---"
+                REPO_DATA=$(get_repo "$REPO_NAME")
+                REPO_COUNT=$(echo "$REPO_DATA" | grep -o '"count":[0-9]*' | grep -o '[0-9]*')
+
+                if [ "$REPO_COUNT" = "0" ] || [ -z "$REPO_COUNT" ]; then
+                  echo "Repository '${REPO_NAME}' not found, skipping sync"
+                  continue
+                fi
+
+                REPO_HREF=$(echo "$REPO_DATA" | grep -o '"pulp_href":"[^"]*"' | head -1 | sed 's/"pulp_href":"//;s/"//')
+                REPO_PULP_ID=$(extract_pulp_id "$REPO_HREF")
+                REPO_REMOTE=$(echo "$REPO_DATA" | grep -o '"remote":"[^"]*"' | head -1 | sed 's/"remote":"//;s/"//')
+                REPO_REMOTE_NULL=$(echo "$REPO_DATA" | grep -o '"remote":null' || true)
+
+                if [ -n "$REPO_REMOTE_NULL" ] || [ -z "$REPO_REMOTE" ]; then
+                  echo "Repository '${REPO_NAME}' has no remote associated, skipping sync"
+                  continue
+                fi
+
+                TASK_OUTPUT=$(sync_repo "$REPO_NAME" "$REPO_PULP_ID")
+                TASK_HREF=$(echo "$TASK_OUTPUT" | tail -1)
+
+                if [ -z "$TASK_HREF" ] || ! echo "$TASK_HREF" | grep -q "^/"; then
+                  echo "No valid task href for '${REPO_NAME}', sync may have failed"
+                  SYNC_FAILED=1
+                  continue
+                fi
+
+                if ! wait_for_task "$TASK_HREF" "$REPO_NAME"; then
+                  SYNC_FAILED=1
+                fi
+              done
+
+              echo ""
+              if [ "$SYNC_FAILED" = "1" ]; then
+                echo "Some sync operations failed"
+                exit 1
+              fi
+              echo "All repository syncs completed successfully"
+            env:
+            - name: ADMIN_USER
+              value: "admin"
+            - name: ADMIN_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: aap-admin-password
+                  key: password
+            - name: OFFLINE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hadr-hub-token
+                  key: token
+            resources:
+              requests:
+                cpu: 50m
+                memory: 64Mi
+              limits:
+                cpu: 200m
+                memory: 128Mi

@@ -1,0 +1,7 @@
+---
+# Role-specific variables only.
+# Shared variables (aap_namespace, etc.) are provided by
+# the config_loader role — do not duplicate here.
+
+# Target cluster context (required)
+workaround_context: ""

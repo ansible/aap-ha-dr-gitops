@@ -1,0 +1,408 @@
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: aap-create-remote-execution-instances
+  namespace: aap
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      ttlSecondsAfterFinished: 300
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: create-instances
+            image: quay.io/ansible/ansible-runner:latest
+            command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+
+              if ! whoami &>/dev/null; then
+                echo "runner:x:$(id -u):0:runner:/tmp:/bin/bash" >> /etc/passwd 2>/dev/null || true
+              fi
+              export HOME=/tmp
+
+              AAP_URL="http://aap.aap.svc.cluster.local"
+
+              echo "Waiting for AAP gateway..."
+              for i in $(seq 1 30); do
+                STATUS=$(curl -sk "$AAP_URL/api/gateway/v1/ping/" 2>/dev/null | grep -o '"status":"[^"]*"' | head -1)
+                if echo "$STATUS" | grep -q "good"; then
+                  echo "Gateway is ready"
+                  break
+                fi
+                echo "  attempt $i: $STATUS"
+                sleep 10
+              done
+
+              # Set up SSH key — reformat single-line key to proper OpenSSH format
+              mkdir -p /tmp/.ssh
+              python3 -c "
+              import base64, sys
+              raw = open('/ssh-key/private').read().strip()
+              # Extract the base64 body between header/footer
+              header = '-' * 5 + 'BEGIN ' + 'OPENSSH PRIVATE KEY' + '-' * 5
+              footer = '-' * 5 + 'END ' + 'OPENSSH PRIVATE KEY' + '-' * 5
+              body = raw.replace(header, '').replace(footer, '').strip()
+              # Re-wrap at 70 chars
+              clean = ''.join(body.split())
+              lines = [clean[i:i+70] for i in range(0, len(clean), 70)]
+              print(header)
+              print('\n'.join(lines))
+              print(footer)
+              " > /tmp/.ssh/id_ed25519
+              chmod 600 /tmp/.ssh/id_ed25519
+              SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -i /tmp/.ssh/id_ed25519"
+
+              configure_node() {
+                local HOST="$1" NODE_TYPE="$2"
+                echo ""
+                echo "=== Processing $NODE_TYPE node $HOST ==="
+
+                if [ "$NODE_TYPE" = "execution" ]; then
+                  # Install boot-time cleanup for persistent Podman runtime state.
+                  # This runs before the Receptor health check so existing nodes
+                  # receive the rule instead of being skipped below.
+                  ssh $SSH_OPTS ec2-user@$HOST "
+                    set -euo pipefail
+                    sudo install -d -m 0755 /etc/tmpfiles.d
+                    printf '%s\n' \
+                      '# Remove rootless Podman runtime state left across reboots' \
+                      'R! /tmp/storage-run-*/containers' \
+                      'R! /tmp/storage-run-*/libpod/tmp' |
+                      sudo tee /etc/tmpfiles.d/podman-boot-cleanup.conf >/dev/null
+                    sudo chmod 0644 /etc/tmpfiles.d/podman-boot-cleanup.conf
+                  "
+
+                  # Detect and remediate the known Podman boot-ID failure.
+                  # Cleanup is deferred whenever active job processes are present
+                  # or the node cannot be inspected safely.
+                  PODMAN_CHECK=$(ssh $SSH_OPTS ec2-user@$HOST \
+                    "sudo -u awx env HOME=/home/awx XDG_RUNTIME_DIR=/run/user/1001 podman info 2>&1" || true)
+                  if printf '%s\n' "$PODMAN_CHECK" | grep -Fq \
+                    "current system boot ID differs from cached boot ID"; then
+                    echo "Podman has stale boot-ID state on $HOST"
+
+                    JOB_CHECK=1
+                    if ssh $SSH_OPTS ec2-user@$HOST \
+                      "if ! command -v pgrep >/dev/null 2>&1; then exit 2; fi; \
+                       if pgrep -u awx -f 'conmon|podman|ansible-runner|ansible-playbook' >/dev/null 2>&1; then exit 0; fi; \
+                       exit 1" >/dev/null 2>&1; then
+                      JOB_CHECK=0
+                    else
+                      JOB_CHECK=$?
+                    fi
+                    case "$JOB_CHECK" in
+                      0|2)
+                        echo "Active execution processes or an incomplete inspection on $HOST; deferring Podman cleanup"
+                        REMEDIATION_DEFERRED=1
+                        return 0
+                        ;;
+                      1)
+                        echo "No active execution processes found on $HOST; cleaning stale Podman state"
+                        ssh $SSH_OPTS ec2-user@$HOST "
+                          set -euo pipefail
+                          sudo rm -rf /tmp/storage-run-*/containers /tmp/storage-run-*/libpod/tmp
+                          sudo -u awx env HOME=/home/awx XDG_RUNTIME_DIR=/run/user/1001 podman system migrate
+                        "
+                        ;;
+                      *)
+                        echo "Unable to inspect execution processes on $HOST; deferring Podman cleanup"
+                        REMEDIATION_DEFERRED=1
+                        return 0
+                        ;;
+                    esac
+                  fi
+                fi
+
+                # Step 1: Register instance in AAP if not exists
+                EXISTING=$(curl -sk -u "$ADMIN_USER:$ADMIN_PASS" \
+                  "$AAP_URL/api/controller/v2/instances/?hostname=$HOST" \
+                  | grep -o '"count":[0-9]*' | grep -o '[0-9]*')
+
+                if [ "$EXISTING" = "0" ] || [ -z "$EXISTING" ]; then
+                  echo "Registering instance $HOST in AAP..."
+                  RESPONSE=$(curl -sk -w "\n%{http_code}" -u "$ADMIN_USER:$ADMIN_PASS" \
+                    -H "Content-Type: application/json" \
+                    -X POST "$AAP_URL/api/controller/v2/instances/" \
+                    -d "{
+                      \"hostname\": \"$HOST\",
+                      \"node_type\": \"$NODE_TYPE\",
+                      \"listener_port\": 27199,
+                      \"peers_from_control_nodes\": true
+                    }")
+                  HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+                  if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+                    echo "Failed to register $HOST: HTTP $HTTP_CODE"
+                    return 1
+                  fi
+                  echo "Instance $HOST registered (HTTP $HTTP_CODE)"
+                else
+                  echo "Instance $HOST already registered"
+                fi
+
+                # Step 1.5: Verify basic SSH reachability before attempting configuration.
+                # Without this, an EIP with no instance behind it (e.g. hop nodes not yet
+                # provisioned) falls through to Step 2 as "not configured" and then fails
+                # silently through every remaining SSH step instead of reporting failure.
+                if ! ssh $SSH_OPTS ec2-user@$HOST "true" 2>/dev/null; then
+                  echo "ERROR: $HOST is not reachable via SSH -- skipping (instance may not exist yet)"
+                  return 1
+                fi
+
+                # Step 2: Ensure the installed receptor package is current before
+                # deciding whether configuration can be skipped. External execution
+                # nodes run receptor as a host systemd service, independently of the EE.
+                RECEPTOR_BEFORE=$(ssh $SSH_OPTS ec2-user@$HOST "rpm -q receptor --qf '%{VERSION}-%{RELEASE}.%{ARCH}' 2>/dev/null" || true)
+                if [ -n "$RECEPTOR_BEFORE" ]; then
+                  if ! ssh $SSH_OPTS ec2-user@$HOST "
+                    sudo subscription-manager repos --enable ansible-automation-platform-2.5-for-rhel-9-x86_64-rpms 2>/dev/null || \
+                      sudo subscription-manager repos --enable ansible-automation-platform-2.6-for-rhel-9-x86_64-rpms 2>/dev/null || true
+                    sudo dnf upgrade -y receptor
+                  "; then
+                    echo "ERROR: receptor upgrade failed on $HOST"
+                    return 1
+                  fi
+                  RECEPTOR_AFTER=$(ssh $SSH_OPTS ec2-user@$HOST "rpm -q receptor --qf '%{VERSION}-%{RELEASE}.%{ARCH}' 2>/dev/null" || true)
+                  echo "Receptor on $HOST: $RECEPTOR_BEFORE -> $RECEPTOR_AFTER"
+                  if [ "$RECEPTOR_BEFORE" != "$RECEPTOR_AFTER" ]; then
+                    ssh $SSH_OPTS ec2-user@$HOST "sudo systemctl restart receptor"
+                  fi
+                fi
+
+                # Step 3: Check if receptor is fully configured and connected.
+                # Accept either tcp-listener (execution/direct mode) or tcp-peer (hop mode).
+                if ssh $SSH_OPTS ec2-user@$HOST "systemctl is-active receptor && sudo test -f /etc/receptor/receptor.conf && (ss -tlnp | grep -q 27199 || sudo grep -q tcp-peer /etc/receptor/receptor.conf)" 2>/dev/null; then
+                  echo "Receptor running and configured on $HOST"
+                  return 0
+                fi
+
+                echo "Receptor not fully configured on $HOST, setting up..."
+
+                # Step 3: Register RHEL if not already registered
+                ssh $SSH_OPTS ec2-user@$HOST "sudo subscription-manager status" 2>/dev/null | grep -q "Current" || {
+                  echo "Registering RHEL on $HOST..."
+                  ssh $SSH_OPTS ec2-user@$HOST "
+                    sudo subscription-manager config --rhsm.manage_repos=1
+                    sudo subscription-manager register --username='$RHSM_USER' --password='$RHSM_PASS' --auto-attach || true
+                    "
+                }
+
+                # Step 4: Enable AAP repo and install receptor if needed
+                ssh $SSH_OPTS ec2-user@$HOST "rpm -q receptor" 2>/dev/null || {
+                  echo "Installing receptor on $HOST..."
+                  ssh $SSH_OPTS ec2-user@$HOST "
+                    sudo subscription-manager repos --enable ansible-automation-platform-2.5-for-rhel-9-x86_64-rpms 2>/dev/null || \
+                      sudo subscription-manager repos --enable ansible-automation-platform-2.6-for-rhel-9-x86_64-rpms 2>/dev/null || true
+                    sudo dnf install -y receptor
+                  "
+                }
+
+                # Step 5: Download install bundle from AAP, SCP to node, run there
+                INSTANCE_ID=$(curl -sk -u "$ADMIN_USER:$ADMIN_PASS" \
+                  "$AAP_URL/api/controller/v2/instances/?hostname=$HOST" \
+                  | python3 -c "import json,sys; r=json.load(sys.stdin); print(r['results'][0]['id'])" 2>/dev/null)
+
+                if [ -z "$INSTANCE_ID" ]; then
+                  echo "WARNING: Could not get instance ID for $HOST"
+                  return 1
+                fi
+
+                echo "Downloading install bundle for instance $INSTANCE_ID..."
+                BUNDLE=/tmp/install_bundle_${HOST}.tar.gz
+                if ! curl -sfk -u "$ADMIN_USER:$ADMIN_PASS" \
+                  "$AAP_URL/api/controller/v2/instances/$INSTANCE_ID/install_bundle/" \
+                  -o "$BUNDLE"; then
+                  echo "ERROR: failed to download install bundle for $HOST"
+                  return 1
+                fi
+
+                echo "Copying install bundle to $HOST..."
+                if ! scp $SSH_OPTS "$BUNDLE" ec2-user@$HOST:/tmp/install_bundle.tar.gz; then
+                  echo "ERROR: failed to copy install bundle to $HOST"
+                  return 1
+                fi
+
+                echo "Running install bundle on $HOST..."
+                if ! ssh $SSH_OPTS ec2-user@$HOST "
+                  set -euo pipefail
+                  sudo dnf install -y ansible-core openssl
+                  rm -rf /tmp/bundle_extract
+                  mkdir -p /tmp/bundle_extract
+                  tar xzf /tmp/install_bundle.tar.gz -C /tmp/bundle_extract
+                  BUNDLE_DIR=\$(find /tmp/bundle_extract -name 'install_receptor.yml' -type f -exec dirname {} \; | head -1)
+                  if [ -z \"\$BUNDLE_DIR\" ]; then
+                    echo 'ERROR: install_receptor.yml not found in bundle'
+                    ls -lR /tmp/bundle_extract
+                    exit 1
+                  fi
+                  cd \"\$BUNDLE_DIR\"
+                  # Rewrite inventory to run locally while keeping group_vars
+                  printf 'all:\\n  hosts:\\n    localhost:\\n      ansible_connection: local\\n      ansible_host: %s\\n' $HOST > inventory.yml
+                  sudo ansible-galaxy collection install -r requirements.yml
+                  sudo ansible-playbook -i inventory.yml install_receptor.yml -v
+                  rm -rf /tmp/bundle_extract /tmp/install_bundle.tar.gz
+                "; then
+                  echo "ERROR: install bundle run failed on $HOST"
+                  return 1
+                fi
+                echo "Install bundle applied on $HOST"
+              }
+
+              FAILED=0
+              REMEDIATION_DEFERRED=0
+
+              for HOST in $RECEPTOR_HOSTS; do
+                configure_node "$HOST" "execution" || FAILED=1
+              done
+
+              if [ -n "${HOP_NODE_IPS:-}" ]; then
+                HOP_FAILED=0
+                for HOST in $HOP_NODE_IPS; do
+                  configure_node "$HOST" "hop" || { FAILED=1; HOP_FAILED=1; }
+                done
+
+              if [ "$HOP_FAILED" = "1" ]; then
+                echo ""
+                echo "=== Skipping execution-node hop rewiring: one or more hop nodes failed to configure ==="
+              else
+              # ── Reconfigure execution nodes to route through hops ──────────
+              echo ""
+              echo "=== Reconfiguring execution nodes to peer through hops ==="
+
+              EE_HOSTS=$(curl -sk -u "$ADMIN_USER:$ADMIN_PASS" \
+                "$AAP_URL/api/controller/v2/instances/?node_type=execution&page_size=50" \
+                | python3 -c "import json,sys; print(' '.join(i['hostname'] for i in json.load(sys.stdin).get('results',[])))" 2>/dev/null || true)
+
+              if [ -z "$EE_HOSTS" ]; then
+                echo "No execution nodes found in AAP — skipping EE reconfiguration"
+              fi
+
+              EXPECTED_PEER_ADDRS=$(echo "$HOP_NODE_IPS" | tr ' ' '\n' | sort -u)
+
+              for EE_HOST in $EE_HOSTS; do
+                echo "--- EE $EE_HOST ---"
+
+                if ! CURRENT_PEER_ADDRS=$(ssh $SSH_OPTS ec2-user@$EE_HOST \
+                  "sudo awk '/^- tcp-peer:/{getline; print \$2}' /etc/receptor/receptor.conf 2>/dev/null | cut -d: -f1 | sort -u" 2>/dev/null); then
+                  echo "  ERROR: could not reach $EE_HOST to check peer config"
+                  FAILED=1
+                  continue
+                fi
+
+                if [ "$CURRENT_PEER_ADDRS" = "$EXPECTED_PEER_ADDRS" ]; then
+                  echo "  tcp-peer entries already match expected hop IPs — skipping receptor.conf update"
+                else
+                  echo "  Adding hop tcp-peer entries to $EE_HOST..."
+                  ssh $SSH_OPTS ec2-user@$EE_HOST "sudo cp /etc/receptor/receptor.conf /etc/receptor/receptor.conf.pre-hop 2>/dev/null || true"
+                  if ! ssh $SSH_OPTS ec2-user@$EE_HOST "
+                    sudo sed -i '/^- tcp-listener:/,/^- [a-z]/{/^- tcp-listener:/d;/^  /d;}' /etc/receptor/receptor.conf 2>/dev/null || true
+                    sudo sed -i '/^- tcp-peer:/,/^- [a-z]/{/^- tcp-peer:/d;/^  /d;}' /etc/receptor/receptor.conf 2>/dev/null || true
+                    sudo sed -i '/^\$/d' /etc/receptor/receptor.conf 2>/dev/null || true
+                    for HOP in $HOP_NODE_IPS; do
+                      echo '' | sudo tee -a /etc/receptor/receptor.conf > /dev/null
+                      echo \"- tcp-peer:\" | sudo tee -a /etc/receptor/receptor.conf > /dev/null
+                      echo \"    address: \${HOP}:27199\" | sudo tee -a /etc/receptor/receptor.conf > /dev/null
+                      echo \"    redial: true\" | sudo tee -a /etc/receptor/receptor.conf > /dev/null
+                      echo \"    tls: tls_client\" | sudo tee -a /etc/receptor/receptor.conf > /dev/null
+                    done
+                  "; then
+                    echo "  ERROR: failed to update receptor.conf on $EE_HOST"
+                    FAILED=1
+                    continue
+                  fi
+                  if ! ssh $SSH_OPTS ec2-user@$EE_HOST "sudo systemctl restart receptor" 2>/dev/null; then
+                    echo "  ERROR: receptor restart failed on $EE_HOST"
+                    FAILED=1
+                    continue
+                  fi
+                  echo "  receptor.conf updated and restarted"
+                fi
+
+                INST_ID=$(curl -sk -u "$ADMIN_USER:$ADMIN_PASS" \
+                  "$AAP_URL/api/controller/v2/instances/?hostname=$EE_HOST" \
+                  | python3 -c "import json,sys; r=json.load(sys.stdin); print(r['results'][0]['id'])" 2>/dev/null || echo "")
+
+                if [ -z "$INST_ID" ]; then
+                  echo "  ERROR: could not resolve instance id for $EE_HOST"
+                  FAILED=1
+                else
+                  PEERS_FLAG=$(curl -sk -u "$ADMIN_USER:$ADMIN_PASS" \
+                    "$AAP_URL/api/controller/v2/instances/$INST_ID/" \
+                    | python3 -c "import json,sys; print(json.load(sys.stdin).get('peers_from_control_nodes', ''))" 2>/dev/null || echo "")
+                  if [ "$PEERS_FLAG" != "False" ]; then
+                    if ! curl -sfk -u "$ADMIN_USER:$ADMIN_PASS" \
+                      -H "Content-Type: application/json" \
+                      -X PATCH "$AAP_URL/api/controller/v2/instances/$INST_ID/" \
+                      -d '{"peers_from_control_nodes": false}' > /dev/null; then
+                      echo "  ERROR: failed to set peers_from_control_nodes=false on $EE_HOST"
+                      FAILED=1
+                    else
+                      echo "  peers_from_control_nodes=false set"
+                    fi
+                  else
+                    echo "  peers_from_control_nodes already false"
+                  fi
+                fi
+              done
+              echo "EE reconfiguration complete"
+              fi
+              else
+                echo "HOP_NODE_IPS not set -- skipping hop node setup and EE peering reconfiguration"
+              fi
+
+              if [ "$FAILED" = "1" ]; then
+                exit 1
+              fi
+              if [ "$REMEDIATION_DEFERRED" = "1" ]; then
+                echo "Podman remediation deferred for at least one execution node; retrying on the next schedule"
+                exit 1
+              fi
+              echo "All remote execution and hop node instances configured"
+            env:
+            - name: RECEPTOR_HOSTS
+              value: "MUST_BE_SET_BY_OVERLAY"
+            - name: HOP_NODE_IPS
+              value: ""
+            - name: ADMIN_USER
+              value: "admin"
+            - name: ADMIN_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: aap-admin-password
+                  key: password
+            - name: RHSM_USER
+              valueFrom:
+                secretKeyRef:
+                  name: registry-redhat-io-pull-secret
+                  key: username
+            - name: RHSM_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: registry-redhat-io-pull-secret
+                  key: password
+            volumeMounts:
+            - name: ssh-key
+              mountPath: /ssh-key
+              readOnly: true
+            resources:
+              requests:
+                cpu: 50m
+                memory: 64Mi
+              limits:
+                cpu: 200m
+                memory: 128Mi
+          volumes:
+          - name: ssh-key
+            secret:
+              secretName: exec-node-ssh-key

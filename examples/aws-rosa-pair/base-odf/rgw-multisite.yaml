@@ -1,0 +1,36 @@
+---
+# Ceph RGW Multisite — Realm and ZoneGroup (shared across clusters)
+#
+# These are cluster-scoped naming references. The actual zone
+# configuration (which zone this cluster belongs to) is in the
+# per-cluster overlays via CephObjectZone + CephObjectStore.
+#
+# Multisite topology:
+#   Realm: hub-realm
+#     └─ ZoneGroup: hub-zonegroup
+#          ├─ Zone: example-a  (overlay: example-a)
+#          └─ Zone: example-b  (overlay: example-b)
+#
+# Active-active: both zones accept writes simultaneously.
+# Replication is asynchronous via Ceph's built-in RGW sync.
+
+apiVersion: ceph.rook.io/v1
+kind: CephObjectRealm
+metadata:
+  name: hub-realm
+  namespace: openshift-storage
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true,Prune=false
+spec: {}
+---
+apiVersion: ceph.rook.io/v1
+kind: CephObjectZoneGroup
+metadata:
+  name: hub-zonegroup
+  namespace: openshift-storage
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true,Prune=false
+spec:
+  realm: hub-realm

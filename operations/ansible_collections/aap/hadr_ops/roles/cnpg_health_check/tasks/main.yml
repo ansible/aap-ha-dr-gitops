@@ -1,0 +1,129 @@
+---
+# cnpg_health_check — Verify CNPG cluster health on a single cluster
+#
+# Checks cluster phase (healthy) and primary pod readiness.
+# Use health_check_retries=1 for instant snapshot, higher for wait-until-ready.
+#
+# Input:
+#   health_check_context — K8s context of the target cluster
+#   aap_namespace, cluster_name
+#   health_check_retries — number of polling attempts (1 = instant)
+#   health_check_delay — seconds between polls
+#
+# Output (set_fact):
+#   health_check_result — dict with status, phase, primary_pod, ready, error
+
+- name: Validate health_check_context is set
+  ansible.builtin.fail:
+    msg: "health_check_context must be set"
+  when: health_check_context | default('') == ''
+
+# ── Poll cluster phase ──────────────────────────────────────────
+
+- name: Wait for CNPG cluster healthy on {{ health_check_context }}
+  aap.hadr_ops.cnpg_cluster_info:
+    namespace: "{{ aap_namespace }}"
+    cluster_name: "{{ cluster_name }}"
+    context: "{{ health_check_context }}"
+  register: _hc_cluster
+  until: >
+    _hc_cluster is succeeded and
+    'healthy' in (_hc_cluster.cluster_info.status.phase | default('') | lower)
+  retries: "{{ health_check_retries }}"
+  delay: "{{ health_check_delay }}"
+  ignore_errors: true
+
+- name: Evaluate cluster phase
+  ansible.builtin.set_fact:
+    _hc_cluster_ok: >-
+      {{ _hc_cluster is succeeded and
+         'healthy' in (_hc_cluster.cluster_info.status.phase | default('') | lower) }}
+    _hc_primary_pod_name: >-
+      {{ _hc_cluster.cluster_info.status.currentPrimary | default('') if (_hc_cluster is succeeded and _hc_cluster.cluster_info is defined) else '' }}
+
+# ── Poll primary pod readiness ──────────────────────────────────
+
+- name: Verify primary pod is ready on {{ health_check_context }}
+  when: (_hc_cluster_ok | bool) and (_hc_primary_pod_name | trim != '')
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    name: "{{ _hc_primary_pod_name | trim }}"
+    namespace: "{{ aap_namespace }}"
+    context: "{{ health_check_context }}"
+  register: _hc_pod
+  until: >
+    _hc_pod.resources | length > 0 and
+    (_hc_pod.resources[0].status.conditions |
+     default([]) | selectattr('type', 'eq', 'Ready') | first | default({})).status | default('') == "True"
+  retries: "{{ health_check_retries }}"
+  delay: "{{ health_check_delay }}"
+  ignore_errors: true
+
+- name: Evaluate pod readiness
+  ansible.builtin.set_fact:
+    _hc_pod_ready: >-
+      {{ (_hc_pod is defined) and
+         (_hc_pod is succeeded) and
+         (_hc_pod.resources | default([]) | length > 0) }}
+
+# ── Count ready pods ────────────────────────────────────────────
+
+- name: Get CNPG pod count on {{ health_check_context }}
+  when: _hc_cluster_ok | bool
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ aap_namespace }}"
+    context: "{{ health_check_context }}"
+    label_selectors:
+      - "cnpg.io/cluster={{ cluster_name }}"
+  register: _hc_pods
+  ignore_errors: true
+
+- name: Count ready pods
+  ansible.builtin.set_fact:
+    _hc_ready_count: >-
+      {{ (_hc_pods.resources | default([]) |
+          selectattr('status.conditions', 'defined') |
+          map(attribute='status.conditions') |
+          map('selectattr', 'type', 'eq', 'Ready') |
+          map('first') | map(attribute='status', default='False') |
+          select('eq', 'True') | list | length)
+         if (_hc_pods is defined and _hc_pods is succeeded) else 0 }}
+    _hc_total_pods: "{{ _hc_pods.resources | default([]) | length if (_hc_pods is defined and _hc_pods is succeeded) else 0 }}"
+
+# ── Build result ────────────────────────────────────────────────
+
+- name: Set health check result
+  ansible.builtin.set_fact:
+    health_check_result:
+      context: "{{ health_check_context }}"
+      status: >-
+        {% if not (_hc_cluster_ok | bool) %}failed
+        {% elif not (_hc_pod_ready | default(false) | bool) %}pod_not_ready
+        {% else %}healthy{% endif %}
+      phase: "{{ _hc_cluster.cluster_info.status.phase | default('unknown') if (_hc_cluster is succeeded and _hc_cluster.cluster_info is defined) else 'unreachable' }}"
+      primary_pod: "{{ _hc_primary_pod_name | trim | default('none') }}"
+      ready: "{{ _hc_ready_count | default(0) }}/{{ _hc_total_pods | default(0) }}"
+      role: >-
+        {{ 'primary' if (_hc_cluster is succeeded and _hc_cluster.cluster_info.computed.is_primary | default(false))
+           else 'replica' if (_hc_cluster is succeeded)
+           else 'unknown' }}
+      site_id: "{{ _hc_cluster.cluster_info.spec.self | default('unknown') if (_hc_cluster is succeeded and _hc_cluster.cluster_info is defined) else 'unknown' }}"
+      error: >-
+        {% if not (_hc_cluster is succeeded) %}CNPG cluster unreachable: {{ _hc_cluster.msg | default('unknown error') | truncate(200) }}
+        {% elif not (_hc_cluster_ok | bool) %}CNPG cluster not healthy after {{ health_check_retries }} retries: phase={{ _hc_cluster.cluster_info.status.phase | default('unknown') }}
+        {% elif not (_hc_pod_ready | default(false) | bool) %}Primary pod {{ _hc_primary_pod_name | trim }} not ready after {{ health_check_retries }} retries
+        {% else %}{% endif %}
+
+- name: Log health check result
+  ansible.builtin.debug:
+    msg:
+      - "CNPG Health Check: {{ health_check_context }}"
+      - "  Status:      {{ health_check_result.status | trim }}"
+      - "  Phase:       {{ health_check_result.phase }}"
+      - "  Role:        {{ health_check_result.role | trim }}"
+      - "  Ready:       {{ health_check_result.ready }}"
+      - "  Primary Pod: {{ health_check_result.primary_pod }}"
+      - "  Error:       {{ health_check_result.error | trim | default('none') }}"

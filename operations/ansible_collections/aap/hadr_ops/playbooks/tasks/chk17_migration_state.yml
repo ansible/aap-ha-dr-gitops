@@ -1,0 +1,112 @@
+---
+# CHK-17: AAP database migration state.
+# This is applicable to disaster recovery and restore-replication runs only.
+# A failed migration Job is reported for manual deletion so the AAP operator
+# can recreate it. Preflight never deletes the Job automatically.
+
+- name: "CHK-17: Evaluate migration state"
+  when: mode in ['disaster_recovery', 'restore_replication']
+  block:
+    - name: "CHK-17: Find AAP task pods on cluster-a"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ aap_namespace }}"
+        context: "{{ cluster_a_context }}"
+        label_selectors:
+          - "app.kubernetes.io/component=controller-task"
+      register: _task_pods_a
+      when: _chk01_a_reachable | bool
+      failed_when: false
+
+    - name: "CHK-17: Find AAP task pods on cluster-b"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ aap_namespace }}"
+        context: "{{ cluster_b_context }}"
+        label_selectors:
+          - "app.kubernetes.io/component=controller-task"
+      register: _task_pods_b
+      when: _chk01_b_reachable | bool
+      failed_when: false
+
+    - name: "CHK-17: Find current AAP migration Jobs on cluster-a"
+      kubernetes.core.k8s_info:
+        api_version: batch/v1
+        kind: Job
+        namespace: "{{ aap_namespace }}"
+        context: "{{ cluster_a_context }}"
+        label_selectors:
+          - "app.kubernetes.io/part-of={{ aap_name }}"
+      register: _migration_jobs_a
+      when: _chk01_a_reachable | bool
+      failed_when: false
+
+    - name: "CHK-17: Find current AAP migration Jobs on cluster-b"
+      kubernetes.core.k8s_info:
+        api_version: batch/v1
+        kind: Job
+        namespace: "{{ aap_namespace }}"
+        context: "{{ cluster_b_context }}"
+        label_selectors:
+          - "app.kubernetes.io/part-of={{ aap_name }}"
+      register: _migration_jobs_b
+      when: _chk01_b_reachable | bool
+      failed_when: false
+
+    - name: "CHK-17: Inspect migration state"
+      vars:
+        _jobs_a: >-
+          {{ (_migration_jobs_a | default({})).resources | default([])
+             | selectattr('metadata.name', 'search', '(?i)migrat') | list }}
+        _jobs_b: >-
+          {{ (_migration_jobs_b | default({})).resources | default([])
+             | selectattr('metadata.name', 'search', '(?i)migrat') | list }}
+        _task_pods: >-
+          {{ (_task_pods_a.resources | default([]) if (_task_pods_a is defined) else [])
+             + (_task_pods_b.resources | default([]) if (_task_pods_b is defined) else []) }}
+        _init_waiting_pods: >-
+          {% set waiting = [] %}
+          {% for pod in _task_pods %}
+          {% for status in pod.status.initContainerStatuses | default([]) %}
+          {% if status.state.waiting is defined %}
+          {% if waiting.append(pod.metadata.name ~ ': ' ~ (status.state.waiting.reason | default('waiting'))) %}{% endif %}
+          {% endif %}
+          {% endfor %}
+          {% endfor %}
+          {{ waiting }}
+        _all_jobs: "{{ _jobs_a + _jobs_b }}"
+        _active_jobs: >-
+          {{ _all_jobs | selectattr('status.active', 'defined')
+             | rejectattr('status.active', 'equalto', 0) | list }}
+        _failed_jobs: >-
+          {{ _all_jobs | selectattr('status.failed', 'defined')
+             | rejectattr('status.failed', 'equalto', 0) | list }}
+        _current_jobs: "{{ _active_jobs + _failed_jobs }}"
+        _migration_status: >-
+          {% if _failed_jobs | length > 0 or (_init_waiting_pods | from_yaml | length) > 0 %}fail
+          {% elif _active_jobs | length > 0 %}warn
+          {% elif (_all_jobs | length) == 0 %}warn
+          {% else %}pass{% endif %}
+        _migration_detail: >-
+          {% if _failed_jobs | length > 0 %}
+          Migration Job failed: {{ _failed_jobs | map(attribute='metadata.name') | join(', ') }}. Delete the Job manually so the AAP operator can recreate it.
+          {% elif (_init_waiting_pods | from_yaml | length) > 0 %}
+          AAP task pod init is waiting: {{ _init_waiting_pods | from_yaml | join(', ') }}{% if _current_jobs | length > 0 %}; migration Job: {{ _current_jobs | map(attribute='metadata.name') | join(', ') }}{% endif %}
+          {% elif _active_jobs | length > 0 %}
+          Migration Job is active: {{ _active_jobs | map(attribute='metadata.name') | join(', ') }}
+          {% elif (_all_jobs | length) == 0 %}
+          No current AAP migration Job was found; migration state is unknown
+          {% else %}
+          Current AAP migration Job completed successfully
+          {% endif %}
+        _check_key: "chk17_migration_state"
+        _check_name: "CHK-17 Migration State"
+        _check_status: "{{ _migration_status | trim }}"
+        _check_detail: "{{ _migration_detail | trim }}"
+        _check_data:
+          cluster_a_jobs: "{{ _jobs_a | map(attribute='metadata.name') | list }}"
+          cluster_b_jobs: "{{ _jobs_b | map(attribute='metadata.name') | list }}"
+          init_waiting_pods: "{{ _init_waiting_pods | from_yaml }}"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/finalize_check.yml"

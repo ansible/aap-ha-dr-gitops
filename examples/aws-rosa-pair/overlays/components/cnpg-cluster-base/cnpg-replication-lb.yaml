@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: aap-postgres-replication
+  namespace: aap
+  labels:
+    aap.redhat.com/external-dns: replication
+  annotations:
+    external-dns.alpha.kubernetes.io/hostname: replaced-by-selfHost
+    external-dns.alpha.kubernetes.io/ttl: "30"
+    external-dns.alpha.kubernetes.io/alias: "false"
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-connection-idle-timeout: "3600"
+spec:
+  type: LoadBalancer
+  selector:
+    cnpg.io/cluster: aap-postgres
+    cnpg.io/instanceRole: primary
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+      protocol: TCP

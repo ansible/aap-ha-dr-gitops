@@ -1,0 +1,37 @@
+---
+# Autofix dispatcher — called from finalize_check.yml when autofix=true
+# and a check has failed. Looks up the fix in _autofix_registry and
+# delegates to autofix_attempt.yml for the retry loop.
+#
+# Input (set as facts before calling):
+#   _check_key:    dict key (e.g. "chk05_split_brain")
+#   _check_name:   display name (e.g. "CHK-05 Split-Brain Detection")
+#   _check_status: "fail"
+#   _check_detail: human-readable detail
+
+- name: "{{ _check_name }}: Look up fix"
+  ansible.builtin.set_fact:
+    _fix_meta: "{{ _autofix_registry[_check_key] | default({'fixable': false, 'reason': 'no registry entry'}) }}"
+
+- name: "{{ _check_name }}: Not fixable"
+  when: not (_fix_meta.fixable | bool)
+  block:
+    - name: "{{ _check_name }}: Log — not auto-fixable"
+      ansible.builtin.debug:
+        msg: >-
+          AUTOFIX SKIP: {{ _check_name }} is not auto-fixable.
+          Reason: {{ _fix_meta.reason | default('no fix registered') }}
+
+    - name: "{{ _check_name }}: Update stats — unfixable"
+      ansible.builtin.set_fact:
+        _autofix_stats: >-
+          {{ _autofix_stats | combine({
+            'checks_unfixable': (_autofix_stats.checks_unfixable | int) + 1
+          }) }}
+
+- name: "{{ _check_name }}: Attempt autofix"
+  when: _fix_meta.fixable | bool
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/autofix_attempt.yml"
+  vars:
+    _fix_task_file: "{{ _fix_meta.fix_task }}"
+    _recheck_task_file: "{{ _fix_meta.recheck_task }}"

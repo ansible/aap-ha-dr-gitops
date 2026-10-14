@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base-eso
+
+patches:
+  - path: eso-region-patch.yaml
+    target:
+      group: external-secrets.io
+      version: v1
+      kind: ClusterSecretStore
+      name: cluster-cross-account-secret-store
+
+components:
+  - ../components/secrets-aws

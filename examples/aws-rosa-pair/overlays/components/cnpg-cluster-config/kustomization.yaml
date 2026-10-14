@@ -1,0 +1,118 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+components:
+  - ../cnpg-cluster-base
+
+replacements:
+  - source:
+      kind: ConfigMap
+      name: cnpg-cluster-params
+      fieldPath: data.selfName
+    targets:
+      - select:
+          kind: Cluster
+          name: aap-postgres
+        fieldPaths:
+          - spec.replica.self
+          - spec.replica.primary
+          - spec.externalClusters.0.name
+        options:
+          create: true
+  - source:
+      kind: ConfigMap
+      name: cnpg-cluster-params
+      fieldPath: data.partnerName
+    targets:
+      - select:
+          kind: Cluster
+          name: aap-postgres
+        fieldPaths:
+          - spec.replica.source
+          - spec.externalClusters.1.name
+  - source:
+      kind: ConfigMap
+      name: cnpg-cluster-params
+      fieldPath: data.selfWalPath
+    targets:
+      - select:
+          kind: Cluster
+          name: aap-postgres
+        fieldPaths:
+          - spec.backup.barmanObjectStore.destinationPath
+          - spec.externalClusters.0.barmanObjectStore.destinationPath
+  - source:
+      kind: ConfigMap
+      name: cnpg-cluster-params
+      fieldPath: data.partnerWalPath
+    targets:
+      - select:
+          kind: Cluster
+          name: aap-postgres
+        fieldPaths:
+          - spec.externalClusters.1.barmanObjectStore.destinationPath
+  - source:
+      kind: ConfigMap
+      name: cnpg-cluster-params
+      fieldPath: data.selfHost
+    targets:
+      - select:
+          kind: Service
+          name: aap-postgres-replication
+        fieldPaths:
+          - metadata.annotations.[external-dns.alpha.kubernetes.io/hostname]
+      - select:
+          kind: Cluster
+          name: aap-postgres
+        fieldPaths:
+          - spec.externalClusters.0.connectionParameters.host
+  - source:
+      kind: ConfigMap
+      name: cnpg-cluster-params
+      fieldPath: data.partnerHost
+    targets:
+      - select:
+          kind: Cluster
+          name: aap-postgres
+        fieldPaths:
+          - spec.externalClusters.1.connectionParameters.host
+  - source:
+      kind: ConfigMap
+      name: cnpg-cluster-params
+      fieldPath: data.serverCert
+    targets:
+      - select:
+          kind: ExternalSecret
+          name: cnpg-server-tls
+        fieldPaths:
+          - spec.data.0.remoteRef.property
+  - source:
+      kind: ConfigMap
+      name: cnpg-cluster-params
+      fieldPath: data.serverKey
+    targets:
+      - select:
+          kind: ExternalSecret
+          name: cnpg-server-tls
+        fieldPaths:
+          - spec.data.1.remoteRef.property
+  - source:
+      kind: ConfigMap
+      name: cnpg-cluster-params
+      fieldPath: data.replicationCert
+    targets:
+      - select:
+          kind: ExternalSecret
+          name: cnpg-replication-tls
+        fieldPaths:
+          - spec.data.0.remoteRef.property
+  - source:
+      kind: ConfigMap
+      name: cnpg-cluster-params
+      fieldPath: data.replicationKey
+    targets:
+      - select:
+          kind: ExternalSecret
+          name: cnpg-replication-tls
+        fieldPaths:
+          - spec.data.1.remoteRef.property

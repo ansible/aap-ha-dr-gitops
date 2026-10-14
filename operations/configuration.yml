@@ -1,0 +1,8 @@
+---
+- name: Load operations configuration without cluster access
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Validate and derive topology
+      ansible.builtin.import_role:
+        name: aap.hadr_ops.config_loader

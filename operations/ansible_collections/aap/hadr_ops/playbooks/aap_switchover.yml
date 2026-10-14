@@ -1,0 +1,47 @@
+---
+# AAP Platform Switchover — Backward-Compatible Dispatcher
+#
+# Routes to the mode-specific playbook based on the -e mode= parameter.
+# Preserves backward compatibility with krkn scripts and make targets.
+#
+# Usage (from the example repository root):
+#   ansible-playbook operations/ansible_collections/aap/hadr_ops/playbooks/aap_switchover.yml \
+#     -e @my-deployment/operations/clusters.yml -e mode=graceful
+#
+#   ansible-playbook operations/ansible_collections/aap/hadr_ops/playbooks/aap_switchover.yml \
+#     -e @my-deployment/operations/clusters.yml -e mode=disaster_recovery -e target_primary=site-b -e confirm=yes
+#
+#   ansible-playbook operations/ansible_collections/aap/hadr_ops/playbooks/aap_switchover.yml \
+#     -e @my-deployment/operations/clusters.yml -e mode=restore_replication -e target_primary=site-b -e confirm=yes
+#
+# Requires: cluster topology via -e @<clusters file> (see the generated <deployment>/operations/clusters.yml)
+
+- name: AAP Switchover — Validate mode
+  hosts: localhost
+  gather_facts: false
+  vars:
+    mode: "graceful"
+  tasks:
+    - name: Validate mode parameter
+      ansible.builtin.assert:
+        that:
+          - mode in ['graceful', 'disaster_recovery', 'restore_replication']
+        fail_msg: >
+          mode must be 'graceful', 'disaster_recovery', or 'restore_replication'.
+          Usage: ansible-playbook operations/ansible_collections/aap/hadr_ops/playbooks/aap_switchover.yml -e @my-deployment/operations/clusters.yml -e mode=graceful
+
+    - name: Display selected mode
+      ansible.builtin.debug:
+        msg: "Dispatching to {{ mode }} playbook..."
+
+- name: Dispatch graceful switchover
+  ansible.builtin.import_playbook: aap_graceful_switchover.yml
+  when: mode | default('graceful') == "graceful"
+
+- name: Dispatch disaster recovery
+  ansible.builtin.import_playbook: aap_disaster_recovery.yml
+  when: mode | default('') == "disaster_recovery"
+
+- name: Dispatch restore replication
+  ansible.builtin.import_playbook: aap_restore_replication.yml
+  when: mode | default('') == "restore_replication"

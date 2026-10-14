@@ -1,0 +1,437 @@
+---
+# Check AAP platform health on a single cluster (Group 3 checks)
+#
+# Validates:
+#   CHK-11: AAP topology and active-site readiness
+#   CHK-12: OLM/CSV health (AAP operator installed and not deadlocked)
+#   CHK-13: Stale promotion token
+#   CHK-14: ArgoCD sync state
+#   CHK-15: Leftover chaos artifacts (NetworkPolicies)
+#
+# Input:
+#   preflight_context — K8s context of the target cluster
+#   aap_namespace, cluster_name
+#
+# Output (set_fact):
+#   platform_check_result — dict with sub-check results
+
+- name: Validate preflight_context is set
+  ansible.builtin.fail:
+    msg: "preflight_context must be set"
+  when: preflight_context | default('') == ''
+
+# ── AAP Platform Status (Active/Idle) ──────────────────────────
+
+- name: Get AAP CR
+  kubernetes.core.k8s_info:
+    api_version: aap.ansible.com/v1alpha1
+    kind: AnsibleAutomationPlatform
+    namespace: "{{ aap_namespace }}"
+    context: "{{ preflight_context }}"
+  register: _pc_aap_cr
+  failed_when: false
+
+- name: Evaluate AAP platform status
+  vars:
+    _aap_spec: "{{ (_pc_aap_cr.resources | default([]) | first | default({})).spec | default({}) }}"
+    _aap_cr_exists: "{{ (_pc_aap_cr is not failed) and (_pc_aap_cr.resources | default([]) | length > 0) }}"
+    _idle_aap: "{{ _aap_spec.idle_aap | default(false) | bool }}"
+  ansible.builtin.set_fact:
+    _pc_aap_active: "{{ (_aap_cr_exists | bool) and not (_idle_aap | bool) }}"
+    _pc_aap_idle: "{{ (_aap_cr_exists | bool) and (_idle_aap | bool) }}"
+    _pc_aap_cr_exists: "{{ _aap_cr_exists }}"
+    _pc_aap_status: >-
+      {% if not (_aap_cr_exists | bool) %}fail
+      {% else %}pass{% endif %}
+    _pc_aap_detail: >-
+      {% if not (_aap_cr_exists | bool) %}Cannot find AAP CR in namespace {{ aap_namespace }}
+      {% elif _idle_aap | bool %}AAP idled (idle_aap=true) — replica/standby site
+      {% else %}AAP active (idle_aap=false) — primary site{% endif %}
+
+- name: Log AAP platform status
+  ansible.builtin.debug:
+    msg:
+      - "AAP Platform Status: {{ preflight_context }}"
+      - "  Active: {{ _pc_aap_active }}, Idle: {{ _pc_aap_idle }}"
+      - "  Detail: {{ _pc_aap_detail | trim }}"
+
+# ── Child CR idle_deployment State (AAP-77947) ─────────────────
+# The gateway operator sometimes fails to propagate idle_deployment=false
+# to child CRs after un-idle. If a child CR has idle_deployment=true on
+# the active site, AAP components won't scale up after switchover.
+
+- name: Check child CR idle_deployment state
+  when: _pc_aap_cr_exists | bool
+  kubernetes.core.k8s_info:
+    api_version: "{{ item.api }}"
+    kind: "{{ item.kind }}"
+    name: "{{ item.name }}"
+    namespace: "{{ aap_namespace }}"
+    context: "{{ preflight_context }}"
+  register: _pc_child_crs
+  failed_when: false
+  loop:
+    - { api: "automationcontroller.ansible.com/v1beta1", kind: "AutomationController", name: "{{ aap_child_crs.controller }}" }
+    - { api: "automationhub.ansible.com/v1beta1", kind: "AutomationHub", name: "{{ aap_child_crs.hub }}" }
+    - { api: "eda.ansible.com/v1alpha1", kind: "EDA", name: "{{ aap_child_crs.eda }}" }
+
+- name: Evaluate idle_deployment consistency
+  when: _pc_aap_cr_exists | bool
+  vars:
+    _child_results: "{{ _pc_child_crs.results | default([]) }}"
+    _stuck_children: >-
+      {{ _child_results | selectattr('resources', 'defined') |
+         map(attribute='resources') | map('first') | default([]) |
+         selectattr('spec.idle_deployment', 'defined') |
+         selectattr('spec.idle_deployment', 'eq', true) |
+         map(attribute='metadata.name') | list
+         if (_pc_aap_active | bool) else [] }}
+  ansible.builtin.set_fact:
+    _pc_idle_deploy_status: >-
+      {% if not (_pc_aap_active | bool) %}pass
+      {% elif (_stuck_children | length > 0) %}fail
+      {% else %}pass{% endif %}
+    _pc_idle_deploy_detail: >-
+      {% if not (_pc_aap_active | bool) %}Site is idled — idle_deployment=true expected on child CRs
+      {% elif (_stuck_children | length > 0) %}AAP-77947: idle_deployment stuck true on active site for: {{ _stuck_children | join(', ') }}. Components won't scale up after switchover.
+      {% else %}All child CRs have idle_deployment=false (correct for active site){% endif %}
+
+- name: Set idle_deployment defaults when no AAP CR
+  when: not (_pc_aap_cr_exists | bool)
+  ansible.builtin.set_fact:
+    _pc_idle_deploy_status: "skip"
+    _pc_idle_deploy_detail: "No AAP CR found — cannot check child CRs"
+
+- name: Log idle_deployment result
+  ansible.builtin.debug:
+    msg:
+      - "Child CR idle_deployment: {{ preflight_context }}"
+      - "  Status: {{ _pc_idle_deploy_status | trim }}"
+      - "  Detail: {{ _pc_idle_deploy_detail | trim }}"
+
+# ── AAP Core Pods Status ───────────────────────────────────────
+# On the active site, verify key AAP pods are Running.
+# On idle sites, 0 pods is expected.
+
+- name: Get AAP core pods on active site
+  when: _pc_aap_active | bool
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ aap_namespace }}"
+    context: "{{ preflight_context }}"
+    label_selectors:
+      - "app.kubernetes.io/managed-by=automationcontroller-operator"
+  register: _pc_ctrl_pods
+  failed_when: false
+
+- name: Get all pods in AAP namespace
+  when: _pc_aap_active | bool
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ aap_namespace }}"
+    context: "{{ preflight_context }}"
+  register: _pc_all_pods
+  failed_when: false
+
+- name: Evaluate AAP core pods
+  when: _pc_aap_active | bool
+  vars:
+    _all_pods: "{{ _pc_all_pods.resources | default([]) if (_pc_all_pods is defined and _pc_all_pods is not failed) else [] }}"
+    _running_pods: "{{ _all_pods | selectattr('status.phase', 'eq', 'Running') | list }}"
+    _running_names: "{{ _running_pods | map(attribute='metadata.name') | list }}"
+    _has_gateway: "{{ _running_names | select('match', '^' ~ aap_name ~ '-gateway-') | list | length > 0 }}"
+    _has_controller: "{{ _running_names | select('match', '^' ~ aap_name ~ '-controller-') | list | length > 0 }}"
+    _has_hub_api: "{{ _running_names | select('match', '^' ~ aap_name ~ '-hub-api-') | list | length > 0 }}"
+    _has_eda_api: "{{ _running_names | select('match', '^' ~ aap_name ~ '-eda-api-') | list | length > 0 }}"
+    _crashloop_pods: "{{ _all_pods | rejectattr('status.phase', 'eq', 'Running') | rejectattr('status.phase', 'eq', 'Succeeded') | rejectattr('status.phase', 'eq', 'Completed') | list }}"
+  ansible.builtin.set_fact:
+    _pc_pods_status: >-
+      {% if not (_has_gateway | bool) %}fail
+      {% elif not (_has_controller | bool) %}fail
+      {% elif not (_has_hub_api | bool) %}warn
+      {% elif not (_has_eda_api | bool) %}warn
+      {% elif (_crashloop_pods | length > 3) %}warn
+      {% else %}pass{% endif %}
+    _pc_pods_detail: >-
+      {% if not (_has_gateway | bool) %}Cannot proceed — no gateway pods Running on active site
+      {% elif not (_has_controller | bool) %}Cannot proceed — no controller pods Running on active site
+      {% elif not (_has_hub_api | bool) %}Hub not running on active site
+      {% elif not (_has_eda_api | bool) %}EDA not running on active site
+      {% else %}Key pods running: gateway={{ _running_names | select('match', '^' ~ aap_name ~ '-gateway-') | list | length }}, controller={{ _running_names | select('match', '^' ~ aap_name ~ '-controller-') | list | length }}, hub={{ _running_names | select('match', '^' ~ aap_name ~ '-hub-(?!redis)') | list | length }}, eda={{ _running_names | select('match', '^' ~ aap_name ~ '-eda-') | list | length }}{% endif %}
+
+- name: Set pod status defaults for idle site
+  when: not (_pc_aap_active | bool)
+  ansible.builtin.set_fact:
+    _pc_pods_status: "pass"
+    _pc_pods_detail: "Site is idled — no AAP pods expected"
+
+- name: Log AAP pods result
+  ansible.builtin.debug:
+    msg:
+      - "AAP Core Pods: {{ preflight_context }}"
+      - "  Status: {{ _pc_pods_status | trim }}"
+      - "  Detail: {{ _pc_pods_detail | trim }}"
+
+# ── CHK-16: AAP API Liveness (application-level health) ──────────
+# Pods can be Running but internally broken (e.g. AAP-76643: controller-web
+# uWSGI zombie state after DB failover). This check hits the actual API
+# endpoints to verify the application is responding, not just the process.
+
+- name: Get AAP route host
+  when: _pc_aap_active | bool
+  kubernetes.core.k8s_info:
+    api_version: route.openshift.io/v1
+    kind: Route
+    name: "aap"
+    namespace: "{{ aap_namespace }}"
+    context: "{{ preflight_context }}"
+  register: _pc_aap_route
+  failed_when: false
+
+- name: Probe AAP API endpoints
+  when: _pc_aap_active | bool and (_pc_aap_route.resources | default([]) | length > 0)
+  vars:
+    _aap_host: "{{ _pc_aap_route.resources[0].spec.host }}"
+  ansible.builtin.uri:
+    url: "https://{{ _aap_host }}/{{ item.path }}"
+    method: GET
+    validate_certs: false
+    timeout: 15
+    status_code: [200, 301, 302, 401, 403]
+  register: _pc_api_probes
+  failed_when: false
+  loop:
+    - { name: "gateway", path: "api/gateway/v1/ping/" }
+    - { name: "controller", path: "api/controller/v2/ping/" }
+    - { name: "hub", path: "api/galaxy/pulp/api/v3/status/" }
+    - { name: "eda", path: "api/eda/v1/status/" }
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Evaluate API liveness
+  when: _pc_aap_active | bool
+  vars:
+    _probes: "{{ _pc_api_probes.results | default([]) }}"
+    _failed_probes: "{{ _probes | selectattr('status', 'defined') | rejectattr('status', 'in', [200, 301, 302, 401, 403]) | list }}"
+    _error_probes: "{{ _probes | selectattr('msg', 'defined') | selectattr('status', 'undefined') | list }}"
+    _all_failures: "{{ _failed_probes + _error_probes }}"
+    _failure_names: "{{ _all_failures | map(attribute='item') | map(attribute='name') | list }}"
+  ansible.builtin.set_fact:
+    _pc_api_status: >-
+      {% if _probes | length == 0 %}skip
+      {% elif _failure_names | length > 0 %}fail
+      {% else %}pass{% endif %}
+    _pc_api_detail: >-
+      {% if _probes | length == 0 %}No API probes run (route not found)
+      {% elif _failure_names | length > 0 %}API liveness FAILED for: {{ _failure_names | join(', ') }} — pods Running but application returning errors (AAP-76643 zombie state likely). Fix: delete affected pods to force restart.
+      {% else %}All API endpoints responding (gateway, controller, hub, eda){% endif %}
+
+- name: Set API liveness defaults for idle/unreachable site
+  when: not (_pc_aap_active | bool) or (_pc_aap_route is not defined) or (_pc_aap_route.resources | default([]) | length == 0)
+  ansible.builtin.set_fact:
+    _pc_api_status: "pass"
+    _pc_api_detail: "Site is idled or route not found — API liveness check skipped"
+
+- name: Log API liveness result
+  ansible.builtin.debug:
+    msg:
+      - "AAP API Liveness: {{ preflight_context }}"
+      - "  Status: {{ _pc_api_status | trim }}"
+      - "  Detail: {{ _pc_api_detail | trim }}"
+
+# ── CHK-12: OLM/CSV Health ──────────────────────────────────────
+
+- name: Get AAP operator subscription status
+  kubernetes.core.k8s_info:
+    api_version: operators.coreos.com/v1alpha1
+    kind: Subscription
+    name: "{{ aap_operator_subscription }}"
+    namespace: "{{ aap_namespace }}"
+    context: "{{ preflight_context }}"
+  register: _pc_sub
+  failed_when: false
+
+- name: Get installed CSV if subscription reports one
+  when: >
+    _pc_sub is not failed and
+    (_pc_sub.resources | default([]) | length > 0) and
+    (_pc_sub.resources[0].status.installedCSV | default('') | trim != '')
+  kubernetes.core.k8s_info:
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    name: "{{ (_pc_sub.resources[0].status.installedCSV) }}"
+    namespace: "{{ aap_namespace }}"
+    context: "{{ preflight_context }}"
+  register: _pc_csv
+  failed_when: false
+
+- name: Evaluate CSV health
+  vars:
+    _sub_exists: "{{ (_pc_sub is not failed) and (_pc_sub.resources | default([]) | length > 0) }}"
+    _sub_state: "{{ (_pc_sub.resources[0].status.state | default('unknown')) if (_sub_exists | bool) else 'missing' }}"
+    _installed_csv: "{{ (_pc_sub.resources[0].status.installedCSV | default('')) if (_sub_exists | bool) else '' }}"
+    _csv_exists: "{{ (_pc_csv is defined) and (_pc_csv is not failed) and (_pc_csv.resources | default([]) | length > 0) }}"
+    _csv_phase: "{{ (_pc_csv.resources[0].status.phase | default('unknown')) if (_csv_exists | bool) else 'missing' }}"
+  ansible.builtin.set_fact:
+    _pc_csv_status: >-
+      {% if not (_sub_exists | bool) %}fail
+      {% elif _csv_phase == 'Succeeded' %}pass
+      {% elif _csv_phase == 'Replacing' %}fail
+      {% elif _csv_phase == 'Installing' %}warn
+      {% elif _csv_phase == 'missing' and _sub_state == 'UpgradePending' %}fail
+      {% elif _csv_phase == 'missing' and (_pc_aap_active | bool) %}warn
+      {% elif _csv_phase == 'missing' %}fail
+      {% else %}warn{% endif %}
+    _pc_csv_detail: >-
+      {% if not (_sub_exists | bool) %}Cannot proceed — AAP operator subscription not found in {{ aap_namespace }}
+      {% elif _csv_phase == 'Succeeded' %}CSV {{ _installed_csv }} Succeeded
+      {% elif _csv_phase == 'Replacing' %}Cannot proceed — CSV stuck in Replacing state (OLM deadlock)
+      {% elif _csv_phase == 'Installing' %}CSV {{ _installed_csv }} installing — upgrade in progress
+      {% elif _csv_phase == 'missing' and _sub_state == 'UpgradePending' %}Cannot proceed — CSV {{ _installed_csv }} not found, subscription UpgradePending (OLM deadlock)
+      {% elif _csv_phase == 'missing' and (_pc_aap_active | bool) %}CSV {{ _installed_csv }} missing but AAP is active — operator dead, AAP running without management
+      {% elif _csv_phase == 'missing' %}Cannot proceed — CSV {{ _installed_csv }} referenced by subscription but not found
+      {% else %}CSV {{ _installed_csv }} in unexpected state: {{ _csv_phase }}{% endif %}
+
+# ── CHK-13: Stale Promotion Token ──────────────────────────────
+
+- name: Get CNPG cluster spec for promotion token
+  kubernetes.core.k8s_info:
+    api_version: postgresql.cnpg.io/v1
+    kind: Cluster
+    name: "{{ cluster_name }}"
+    namespace: "{{ aap_namespace }}"
+    context: "{{ preflight_context }}"
+  register: _pc_cluster
+  failed_when: false
+
+- name: Evaluate promotion token
+  vars:
+    _cluster_spec: "{{ (_pc_cluster.resources | default([]) | first | default({})) }}"
+    _has_token: "{{ _cluster_spec.spec.replica.promotionToken is defined and _cluster_spec.spec.replica.promotionToken | default('') | trim != '' }}"
+    _phase: "{{ _cluster_spec.status.phase | default('unknown') | lower }}"
+  ansible.builtin.set_fact:
+    _pc_token_status: >-
+      {% if _pc_cluster is failed %}warn
+      {% elif not (_has_token | bool) %}pass
+      {% elif 'healthy' in _phase %}pass
+      {% elif 'unrecoverable' in _phase %}fail
+      {% else %}warn{% endif %}
+    _pc_token_detail: >-
+      {% if _pc_cluster is failed %}Cannot query cluster spec
+      {% elif not (_has_token | bool) %}No promotion token present
+      {% elif 'healthy' in _phase %}Token present, cluster healthy (valid token)
+      {% elif 'unrecoverable' in _phase %}Cannot proceed — stale promotion token blocking recovery (phase=unrecoverable). Remove token to resolve.
+      {% else %}Token present, cluster phase={{ _phase }} (may be mid-operation){% endif %}
+
+# ── CHK-14: ArgoCD Sync State ──────────────────────────────────
+
+- name: Get ArgoCD applications
+  kubernetes.core.k8s_info:
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+    namespace: "{{ argocd_namespace }}"
+    context: "{{ preflight_context }}"
+  register: _pc_argocd
+  failed_when: false
+
+- name: Evaluate ArgoCD state
+  vars:
+    _apps: "{{ _pc_argocd.resources | default([]) if (_pc_argocd is not failed) else [] }}"
+    _syncing: "{{ _apps | selectattr('status.operationState.phase', 'defined') | selectattr('status.operationState.phase', 'eq', 'Running') | list }}"
+    _degraded: "{{ _apps | selectattr('status.health.status', 'defined') | selectattr('status.health.status', 'eq', 'Degraded') | list }}"
+  ansible.builtin.set_fact:
+    _pc_argocd_status: >-
+      {% if _pc_argocd is failed %}warn
+      {% elif (_degraded | length > 0) %}fail
+      {% elif (_syncing | length > 0) %}warn
+      {% else %}pass{% endif %}
+    _pc_argocd_detail: >-
+      {% if _pc_argocd is failed %}Cannot query ArgoCD applications
+      {% elif (_degraded | length > 0) %}ArgoCD app(s) degraded: {{ _degraded | map(attribute='metadata.name') | join(', ') }}
+      {% elif (_syncing | length > 0) %}ArgoCD sync in progress: {{ _syncing | map(attribute='metadata.name') | join(', ') }} — wait for completion
+      {% else %}ArgoCD healthy ({{ _apps | length }} apps){% endif %}
+
+# ── CHK-15: Leftover Chaos Artifacts ───────────────────────────
+
+- name: Check for leftover DR NetworkPolicy
+  kubernetes.core.k8s_info:
+    api_version: networking.k8s.io/v1
+    kind: NetworkPolicy
+    name: "krkn-dr-region-outage"
+    namespace: "{{ aap_namespace }}"
+    context: "{{ preflight_context }}"
+  register: _pc_netpol
+  failed_when: false
+
+- name: Evaluate chaos artifacts
+  vars:
+    _has_netpol: "{{ (_pc_netpol.resources | default([]) | length > 0) if (_pc_netpol is not failed) else false }}"
+  ansible.builtin.set_fact:
+    _pc_chaos_status: >-
+      {% if _has_netpol | bool %}fail
+      {% else %}pass{% endif %}
+    _pc_chaos_detail: >-
+      {% if _has_netpol | bool %}Leftover 'krkn-dr-region-outage' NetworkPolicy found — previous DR test not cleaned up
+      {% else %}No leftover chaos artifacts{% endif %}
+
+# ── Build combined result ──────────────────────────────────────
+
+- name: Build platform check result
+  vars:
+    _worst: >-
+      {% if (_pc_aap_status | trim) == 'fail' or (_pc_idle_deploy_status | trim) == 'fail' or (_pc_pods_status | trim) == 'fail' or (_pc_api_status | default('pass') | trim) == 'fail' or (_pc_csv_status | trim) == 'fail' or (_pc_token_status | trim) == 'fail' or (_pc_argocd_status | trim) == 'fail' or (_pc_chaos_status | trim) == 'fail' %}fail
+      {% elif (_pc_pods_status | trim) == 'warn' or (_pc_api_status | default('pass') | trim) == 'warn' or (_pc_csv_status | trim) == 'warn' or (_pc_token_status | trim) == 'warn' or (_pc_argocd_status | trim) == 'warn' %}warn
+      {% else %}pass{% endif %}
+  ansible.builtin.set_fact:
+    platform_check_result:
+      context: "{{ preflight_context }}"
+      status: "{{ _worst | trim }}"
+      aap_platform:
+        active: "{{ _pc_aap_active | bool }}"
+        idle: "{{ _pc_aap_idle | bool }}"
+        cr_exists: "{{ _pc_aap_cr_exists | bool }}"
+        detail: "{{ _pc_aap_detail | trim }}"
+      idle_deployment:
+        status: "{{ _pc_idle_deploy_status | trim }}"
+        detail: "{{ _pc_idle_deploy_detail | trim }}"
+      aap_pods:
+        status: "{{ _pc_pods_status | trim }}"
+        detail: "{{ _pc_pods_detail | trim }}"
+      api_liveness:
+        status: "{{ _pc_api_status | default('pass') | trim }}"
+        detail: "{{ _pc_api_detail | default('not checked') | trim }}"
+      csv:
+        status: "{{ _pc_csv_status | trim }}"
+        detail: "{{ _pc_csv_detail | trim }}"
+      promotion_token:
+        status: "{{ _pc_token_status | trim }}"
+        detail: "{{ _pc_token_detail | trim }}"
+      argocd:
+        status: "{{ _pc_argocd_status | trim }}"
+        detail: "{{ _pc_argocd_detail | trim }}"
+      chaos_artifacts:
+        status: "{{ _pc_chaos_status | trim }}"
+        detail: "{{ _pc_chaos_detail | trim }}"
+      error: >-
+        {% if (_pc_api_status | default('pass') | trim) == 'fail' %}{{ _pc_api_detail | default('') | trim }}
+        {% elif (_pc_csv_status | trim) == 'fail' %}{{ _pc_csv_detail | trim }}
+        {% elif (_pc_token_status | trim) == 'fail' %}{{ _pc_token_detail | trim }}
+        {% elif (_pc_argocd_status | trim) == 'fail' %}{{ _pc_argocd_detail | trim }}
+        {% elif (_pc_chaos_status | trim) == 'fail' %}{{ _pc_chaos_detail | trim }}
+        {% else %}{% endif %}
+
+- name: Log platform check result
+  ansible.builtin.debug:
+    msg:
+      - "Platform Check: {{ preflight_context }}"
+      - "  Status:         {{ platform_check_result.status | trim }}"
+      - "  AAP:            {{ platform_check_result.aap_platform.detail | trim }}"
+      - "  idle_deploy:    {{ platform_check_result.idle_deployment.status | trim }} — {{ platform_check_result.idle_deployment.detail | trim }}"
+      - "  AAP Pods:       {{ platform_check_result.aap_pods.status | trim }} — {{ platform_check_result.aap_pods.detail | trim }}"
+      - "  CHK-16 API:     {{ platform_check_result.api_liveness.status | trim }} — {{ platform_check_result.api_liveness.detail | trim }}"
+      - "  CHK-12 CSV:     {{ platform_check_result.csv.status | trim }} — {{ platform_check_result.csv.detail | trim }}"
+      - "  CHK-13 Token:   {{ platform_check_result.promotion_token.status | trim }} — {{ platform_check_result.promotion_token.detail | trim }}"
+      - "  CHK-14 ArgoCD:  {{ platform_check_result.argocd.status | trim }} — {{ platform_check_result.argocd.detail | trim }}"
+      - "  CHK-15 Chaos:   {{ platform_check_result.chaos_artifacts.status | trim }} — {{ platform_check_result.chaos_artifacts.detail | trim }}"

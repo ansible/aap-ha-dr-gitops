@@ -1,0 +1,69 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: aap-dns
+  namespace: openshift-gitops
+spec:
+  goTemplate: true
+  goTemplateOptions:
+  - missingkey=error
+  generators:
+  - matrix:
+      generators:
+      - matrix:
+          generators:
+          - git:
+              repoURL: https://github.com/ansible-automation-platform/aap-ha-dr-gitops/
+              revision: main
+              pathParamPrefix: pair
+              files:
+              - path: examples/aws-rosa-pair/deployment/argocd/pairs/*.yaml
+          - list:
+              elementsYaml: '[{{ range $i, $id := .member_environments }}{{ if $i }},{{ end }}{"environment_id":{{
+                $id | toJson }}}{{ end }}]'
+      - git:
+          repoURL: https://github.com/ansible-automation-platform/aap-ha-dr-gitops/
+          revision: main
+          pathParamPrefix: environment
+          files:
+          - path: examples/aws-rosa-pair/deployment/argocd/environments/{{ .environment_id }}.yaml
+    selector:
+      matchLabels:
+        target_cluster_id: example-a
+  template:
+    metadata:
+      name: aap-dns
+      namespace: openshift-gitops
+      annotations:
+        argocd.argoproj.io/sync-options: Prune=false
+        argocd.argoproj.io/compare-options: IgnoreExtraneous
+    spec:
+      project: default
+      sources:
+      - repoURL: https://kubernetes-sigs.github.io/external-dns/
+        chart: external-dns
+        targetRevision: 1.22.0
+        helm:
+          releaseName: external-dns
+          skipCrds: true
+          valueFiles:
+          - $values/examples/aws-rosa-pair/overlays/external-dns/base/values.yaml
+          - $values/examples/aws-rosa-pair/overlays/external-dns/overlays/{{ .target_cluster_id }}/values.yaml
+      - repoURL: https://github.com/ansible-automation-platform/aap-ha-dr-gitops/
+        targetRevision: main
+        ref: values
+        path: examples/aws-rosa-pair/overlays/external-dns/overlays/{{ .target_cluster_id }}
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: external-dns
+      syncPolicy:
+        syncOptions:
+        - CreateNamespace=true
+        - SkipDryRunOnMissingResource=true
+        - ApplyOutOfSyncOnly=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m

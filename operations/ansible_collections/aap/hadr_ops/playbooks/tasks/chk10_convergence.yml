@@ -1,0 +1,41 @@
+---
+# CHK-10: Replica Recovery Convergence
+# Two-sample check on the replica to determine if the replay gap is
+# shrinking (converging) or growing (diverging).
+# Only runs if _dual_topology_ok AND CHK-09 reported lag > 0.
+
+- name: "CHK-10: Check convergence on replica"
+  when: >
+    (_dual_topology_ok | bool) and
+    (replication_lag_result is defined) and
+    (replication_lag_result.lag_seconds | default(0) | float > 0)
+  ansible.builtin.include_role:
+    name: aap.hadr_ops.cnpg_preflight
+    tasks_from: check_convergence.yml
+  vars:
+    preflight_context: "{{ _wal_replica_context }}"
+
+- name: "CHK-10: Skip if not applicable"
+  when: >
+    not ((_dual_topology_ok | bool) and
+    (replication_lag_result is defined) and
+    (replication_lag_result.lag_seconds | default(0) | float > 0))
+  ansible.builtin.set_fact:
+    _chk10_status: "skip"
+    _chk10_detail: "Skipped — replica is caught up or topology not applicable"
+
+- name: "CHK-10: Set status from result"
+  when: convergence_result is defined
+  ansible.builtin.set_fact:
+    _chk10_status: "{{ convergence_result.status | trim }}"
+    _chk10_detail: "{{ convergence_result.detail | trim }}"
+
+- name: "CHK-10: Finalize"
+  vars:
+    _check_key: "chk10_convergence"
+    _check_name: "CHK-10 Recovery Convergence"
+    _check_status: "{{ _chk10_status | trim }}"
+    _check_detail: "{{ _chk10_detail | trim }}"
+    _check_data:
+      trend: "{{ convergence_result.trend | default('N/A') }}"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/finalize_check.yml"

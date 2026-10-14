@@ -1,0 +1,27 @@
+---
+# Role-specific variables only.
+# Shared variables (aap_namespace, aap_name, etc.) are provided by
+# the config_loader role — do not duplicate here.
+
+# Target cluster context (required)
+lifecycle_context: ""
+
+# aap_key_deployments is derived by config_loader from aap_name.
+# Do not redefine here — config_loader's set_fact (precedence 19) always
+# overrides role defaults (precedence 2).
+
+# Timing — idle verification
+aap_idle_verify_retries: 6
+aap_idle_verify_delay: 5
+
+# Timing — operator reconciliation wait
+aap_reconciliation_retries: 12
+aap_reconciliation_delay: 10
+
+# Timing — deployment scaling and health checks
+aap_readiness_timeout: 600
+aap_readiness_poll_interval: 15
+
+# If true, fail the playbook on activation errors (reconciliation/deployment).
+# If false (default), set lifecycle_result.status="failed" and return to caller.
+lifecycle_fail_on_error: false

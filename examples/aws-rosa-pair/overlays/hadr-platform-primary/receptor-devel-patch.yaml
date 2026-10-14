@@ -1,0 +1,16 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: receptor-devel-patch
+spec:
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: build-and-patch
+              env:
+                - name: PATCH_RECEPTOR
+                  value: "true"
+                - name: RECEPTOR_HOSTS
+                  value: MUST_BE_SET_BY_APPLICATION_SET

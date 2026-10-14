@@ -1,0 +1,52 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-ready-check
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 100
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: pg-check
+          image: ghcr.io/cloudnative-pg/postgresql:15.10
+          env:
+            - name: PGHOST
+              valueFrom:
+                secretKeyRef:
+                  name: aap-gateway-postgres-configuration
+                  key: host
+            - name: PGPORT
+              valueFrom:
+                secretKeyRef:
+                  name: aap-gateway-postgres-configuration
+                  key: port
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: aap-gateway-postgres-configuration
+                  key: username
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: aap-gateway-postgres-configuration
+                  key: password
+            - name: PGDATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: aap-gateway-postgres-configuration
+                  key: database
+            - name: PGSSLMODE
+              value: prefer
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              until psql -c "SELECT 1" >/dev/null 2>&1; do
+                echo "Waiting for database at ${PGHOST}:${PGPORT}..."
+                sleep 5
+              done
+              echo "Database is accepting connections."

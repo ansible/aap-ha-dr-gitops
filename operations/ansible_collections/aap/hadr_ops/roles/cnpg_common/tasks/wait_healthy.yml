@@ -1,0 +1,27 @@
+---
+# Poll cnpg_cluster_info until the CNPG cluster reports healthy status.
+#
+# Required variables:
+#   _healthy_context:        Kubernetes context name
+#
+# Optional variables:
+#   _healthy_kubeconfig:     Path to kubeconfig (default: omitted)
+#   _healthy_timeout:        Total timeout in seconds (default: 300)
+#   _healthy_poll_interval:  Seconds between polls (default: 10)
+#
+# Output variables:
+#   _healthy_result:         cnpg_cluster_info result (cluster_info dict)
+
+- name: "wait_healthy | Poll CNPG cluster until healthy"
+  aap.hadr_ops.cnpg_cluster_info:
+    namespace: "{{ aap_namespace }}"
+    cluster_name: "{{ cluster_name }}"
+    context: "{{ _healthy_context }}"
+    kubeconfig: "{{ _healthy_kubeconfig | default(omit) }}"
+  register: _healthy_result
+  until: >
+    _healthy_result.cluster_info.status.phase is defined and
+    'healthy' in _healthy_result.cluster_info.status.phase | lower
+  retries: "{{ ((_healthy_timeout | default(300)) | int / (_healthy_poll_interval | default(10)) | int) | int }}"
+  delay: "{{ _healthy_poll_interval | default(10) }}"
+  ignore_errors: true

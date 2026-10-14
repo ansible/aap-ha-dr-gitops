@@ -1,0 +1,32 @@
+---
+# CHK-11: AAP topology and active-site readiness.
+
+- name: "CHK-11: Evaluate topology"
+  vars:
+    _topology_statuses:
+      - "{{ 'pass' if (_platform_result_a.aap_platform.cr_exists | default(false) | bool) else 'fail' }}"
+      - "{{ _platform_result_a.idle_deployment.status | default('skip') | trim }}"
+      - "{{ _platform_result_a.aap_pods.status | default('skip') | trim }}"
+      - "{{ 'pass' if (_platform_result_b.aap_platform.cr_exists | default(false) | bool) else 'fail' }}"
+      - "{{ _platform_result_b.idle_deployment.status | default('skip') | trim }}"
+      - "{{ _platform_result_b.aap_pods.status | default('skip') | trim }}"
+    _topology_details:
+      - "{{ _platform_result_a.aap_platform.detail | default('', true) | trim }}"
+      - "{{ _platform_result_a.idle_deployment.detail | default('', true) | trim }}"
+      - "{{ _platform_result_a.aap_pods.detail | default('', true) | trim }}"
+      - "{{ _platform_result_b.aap_platform.detail | default('', true) | trim }}"
+      - "{{ _platform_result_b.idle_deployment.detail | default('', true) | trim }}"
+      - "{{ _platform_result_b.aap_pods.detail | default('', true) | trim }}"
+    _topology_status: >-
+      {% if 'fail' in _topology_statuses %}fail
+      {% elif 'warn' in _topology_statuses %}warn
+      {% else %}pass{% endif %}
+    _check_key: "chk11_aap_topology"
+    _check_name: "CHK-11 AAP Topology"
+    _check_status: "{{ _topology_status | trim }}"
+    _check_detail: "{{ _topology_details | reject('equalto', '') | join(' | ') }}"
+    _check_data:
+      coverage: "{{ ((_platform_result_a.aap_platform.active | default(false) | bool) and (_platform_result_b.aap_platform.idle | default(false) | bool)) | ternary('FULL', ((_platform_result_a.aap_platform.active | default(false) | bool) or (_platform_result_b.aap_platform.active | default(false) | bool)) | ternary('ONE', 'NONE')) }}"
+      cluster_a: "{{ {'aap_platform': _platform_result_a.aap_platform | default({}), 'idle_deployment': _platform_result_a.idle_deployment | default({}), 'aap_pods': _platform_result_a.aap_pods | default({})} }}"
+      cluster_b: "{{ {'aap_platform': _platform_result_b.aap_platform | default({}), 'idle_deployment': _platform_result_b.idle_deployment | default({}), 'aap_pods': _platform_result_b.aap_pods | default({})} }}"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/finalize_check.yml"

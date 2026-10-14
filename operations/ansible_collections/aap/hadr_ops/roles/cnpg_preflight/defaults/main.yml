@@ -1,0 +1,7 @@
+---
+# Role-specific variables only.
+# Shared variables (aap_namespace, cluster_name, etc.) are provided by
+# the config_loader role — do not duplicate here.
+
+# Target system to check (required)
+preflight_context: ""

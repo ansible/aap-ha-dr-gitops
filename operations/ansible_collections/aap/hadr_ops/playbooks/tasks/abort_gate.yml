@@ -1,0 +1,57 @@
+---
+# Decision gate — include after each check to evaluate the result and
+# fail fast if the decision is abort or manual_intervention_required.
+#
+# Expected input (set as facts before calling this):
+#   _current_check_name:   e.g. "CHK-02 Storage Infrastructure"
+#   _current_check_status: "pass" | "warn" | "fail" | "skip"
+#   _current_check_detail: human-readable detail string
+#
+# Optional:
+#   preflight_debug: false (default) — if true, log failures but don't abort
+#
+# Behavior:
+#   pass → continue (no action)
+#   warn → log warning, continue
+#   fail → determine if abort or manual_intervention_required, then fail
+#          (unless preflight_debug=true, then log and continue)
+#   skip → continue (no action)
+
+- name: "{{ _current_check_name }}: Decision — WARN"
+  when: (_current_check_status | trim) == 'warn'
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ _current_check_name }} — {{ _current_check_detail | trim }}.
+      Proceeding with caution.
+
+- name: "{{ _current_check_name }}: Decision — FAIL (debug mode, continuing)"
+  when: (_current_check_status | trim) == 'fail' and (preflight_debug | default(false) | bool)
+  ansible.builtin.debug:
+    msg: >-
+      DEBUG MODE — would have aborted:
+      {{ 'MANUAL INTERVENTION REQUIRED' if ('Cannot' in _current_check_detail or 'unreachable' in (_current_check_detail | lower) or 'RBAC' in _current_check_detail) else 'ABORT' }}:
+      {{ _current_check_name }} — {{ _current_check_detail | trim }}
+
+- name: "{{ _current_check_name }}: Decision — FAIL (autofix exhausted)"
+  when:
+    - (_current_check_status | trim) == 'fail'
+    - autofix | default(false) | bool
+    - _fix_result | default('none') != 'none'
+    - not (preflight_debug | default(false) | bool)
+  ansible.builtin.fail:
+    msg: >-
+      PREFLIGHT ABORT (autofix exhausted):
+      {{ _current_check_name }} — Fix was attempted but did not resolve the issue.
+      Fix result: {{ _fix_result | default('unknown') | trim }}.
+      {{ _current_check_detail | trim }}
+
+- name: "{{ _current_check_name }}: Decision — FAIL"
+  when:
+    - (_current_check_status | trim) == 'fail'
+    - not (preflight_debug | default(false) | bool)
+    - _fix_result | default('none') == 'none' or not (autofix | default(false) | bool)
+  ansible.builtin.fail:
+    msg: >-
+      PREFLIGHT {{ 'MANUAL INTERVENTION REQUIRED' if ('Cannot' in _current_check_detail or 'unreachable' in (_current_check_detail | lower) or 'RBAC' in _current_check_detail) else 'ABORT' }}:
+      {{ _current_check_name }} — {{ _current_check_detail | trim }}.
+      {{ 'This requires manual investigation before retrying.' if ('Cannot' in _current_check_detail or 'unreachable' in (_current_check_detail | lower) or 'RBAC' in _current_check_detail) else 'Conditions are unsafe for switchover.' }}

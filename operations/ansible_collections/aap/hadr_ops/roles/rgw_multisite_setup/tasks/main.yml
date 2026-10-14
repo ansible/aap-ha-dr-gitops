@@ -1,0 +1,755 @@
+---
+# RGW Multisite Setup — 8-step bootstrap for active-active replication.
+#
+# Replaces deployment/scripts/rgw-multisite-setup.sh, which used ephemeral
+# oc run pods (name collisions, orphans on error, stdout contamination).
+# This role uses kubernetes.core.k8s_exec on the existing rook-ceph-tools pod,
+# which already has /etc/ceph/ credentials mounted.
+#
+# Required variables (set by playbook from vars/clusters.yml):
+#   master_context:   k8s context of the master cluster (realm authority)
+#   replica_context:  k8s context of the replica cluster
+
+# ============================================================================
+# PREFLIGHT: Verify prerequisites exist and are ready on both clusters
+# ============================================================================
+
+- name: "preflight | Check CephCluster on master"
+  kubernetes.core.k8s_info:
+    api_version: ceph.rook.io/v1
+    kind: CephCluster
+    namespace: "{{ rgw_namespace }}"
+    context: "{{ master_context }}"
+  register: _master_ceph_cluster
+
+- name: "preflight | Assert master CephCluster is Ready"
+  ansible.builtin.assert:
+    that:
+      - _master_ceph_cluster.resources | length > 0
+      - _master_ceph_cluster.resources[0].status.phase | default('') == 'Ready'
+    fail_msg: >
+      Master CephCluster not Ready
+      (phase={{ _master_ceph_cluster.resources[0].status.phase | default('missing') }})
+
+- name: "preflight | Check CephCluster on replica"
+  kubernetes.core.k8s_info:
+    api_version: ceph.rook.io/v1
+    kind: CephCluster
+    namespace: "{{ rgw_namespace }}"
+    context: "{{ replica_context }}"
+  register: _replica_ceph_cluster
+
+- name: "preflight | Assert replica CephCluster is Ready"
+  ansible.builtin.assert:
+    that:
+      - _replica_ceph_cluster.resources | length > 0
+      - _replica_ceph_cluster.resources[0].status.phase | default('') == 'Ready'
+    fail_msg: >
+      Replica CephCluster not Ready
+      (phase={{ _replica_ceph_cluster.resources[0].status.phase | default('missing') }})
+
+- name: "preflight | Check rook-ceph-mgr-a deploy on master"
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: Deployment
+    name: rook-ceph-mgr-a
+    namespace: "{{ rgw_namespace }}"
+    context: "{{ master_context }}"
+  register: _master_mgr
+
+- name: "preflight | Assert master mgr deploy exists"
+  ansible.builtin.assert:
+    that: _master_mgr.resources | length > 0
+    fail_msg: "rook-ceph-mgr-a deployment not found on {{ master_context }}"
+
+- name: "preflight | Check rook-ceph-mgr-a deploy on replica"
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: Deployment
+    name: rook-ceph-mgr-a
+    namespace: "{{ rgw_namespace }}"
+    context: "{{ replica_context }}"
+  register: _replica_mgr
+
+- name: "preflight | Assert replica mgr deploy exists"
+  ansible.builtin.assert:
+    that: _replica_mgr.resources | length > 0
+    fail_msg: "rook-ceph-mgr-a deployment not found on {{ replica_context }}"
+
+- name: "preflight | Check hub-objectstore CephObjectStore on master"
+  kubernetes.core.k8s_info:
+    api_version: ceph.rook.io/v1
+    kind: CephObjectStore
+    name: hub-objectstore
+    namespace: "{{ rgw_namespace }}"
+    context: "{{ master_context }}"
+  register: _master_objectstore
+
+- name: "preflight | Assert master CephObjectStore exists"
+  ansible.builtin.assert:
+    that: _master_objectstore.resources | length > 0
+    fail_msg: "hub-objectstore CephObjectStore not found on {{ master_context }}"
+
+- name: "preflight | Check hub-objectstore CephObjectStore on replica"
+  kubernetes.core.k8s_info:
+    api_version: ceph.rook.io/v1
+    kind: CephObjectStore
+    name: hub-objectstore
+    namespace: "{{ rgw_namespace }}"
+    context: "{{ replica_context }}"
+  register: _replica_objectstore
+
+- name: "preflight | Assert replica CephObjectStore exists"
+  ansible.builtin.assert:
+    that: _replica_objectstore.resources | length > 0
+    fail_msg: "hub-objectstore CephObjectStore not found on {{ replica_context }}"
+
+- name: "preflight | Check hub-realm-keys secret on master"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: "{{ rgw_realm_secret_name }}"
+    namespace: "{{ rgw_namespace }}"
+    context: "{{ master_context }}"
+  register: _realm_keys_secret
+
+- name: "preflight | Assert hub-realm-keys secret exists"
+  ansible.builtin.assert:
+    that: _realm_keys_secret.resources | length > 0
+    fail_msg: "Secret {{ rgw_realm_secret_name }} not found on {{ master_context }} — ESO not synced yet?"
+
+- name: "preflight | Check rgw-s3-replication route on master"
+  kubernetes.core.k8s_info:
+    api_version: route.openshift.io/v1
+    kind: Route
+    name: "{{ rgw_route_name }}"
+    namespace: "{{ rgw_namespace }}"
+    context: "{{ master_context }}"
+  register: _master_route
+
+- name: "preflight | Assert master RGW route exists"
+  ansible.builtin.assert:
+    that: _master_route.resources | length > 0
+    fail_msg: "Route {{ rgw_route_name }} not found on {{ master_context }}"
+
+- name: "preflight | Check rgw-s3-replication route on replica"
+  kubernetes.core.k8s_info:
+    api_version: route.openshift.io/v1
+    kind: Route
+    name: "{{ rgw_route_name }}"
+    namespace: "{{ rgw_namespace }}"
+    context: "{{ replica_context }}"
+  register: _replica_route
+
+- name: "preflight | Assert replica RGW route exists"
+  ansible.builtin.assert:
+    that: _replica_route.resources | length > 0
+    fail_msg: "Route {{ rgw_route_name }} not found on {{ replica_context }}"
+
+- name: "preflight | Find rook-ceph-tools pod on master"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ rgw_namespace }}"
+    label_selectors:
+      - app=rook-ceph-tools
+    field_selectors:
+      - status.phase=Running
+    context: "{{ master_context }}"
+  register: _master_toolbox_pods
+
+- name: "preflight | Assert master toolbox pod is Running"
+  ansible.builtin.assert:
+    that: _master_toolbox_pods.resources | length > 0
+    fail_msg: >
+      rook-ceph-tools pod not found or not Running in {{ rgw_namespace }}
+      on {{ master_context }}. Deploy the Rook toolbox (CephToolbox CR) first.
+
+- name: "preflight | Find rook-ceph-tools pod on replica"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ rgw_namespace }}"
+    label_selectors:
+      - app=rook-ceph-tools
+    field_selectors:
+      - status.phase=Running
+    context: "{{ replica_context }}"
+  register: _replica_toolbox_pods
+
+- name: "preflight | Assert replica toolbox pod is Running"
+  ansible.builtin.assert:
+    that: _replica_toolbox_pods.resources | length > 0
+    fail_msg: >
+      rook-ceph-tools pod not found or not Running in {{ rgw_namespace }}
+      on {{ replica_context }}. Deploy the Rook toolbox (CephToolbox CR) first.
+
+# ============================================================================
+# RESOLVE VARIABLES: Discover runtime values from cluster state
+# ============================================================================
+
+- name: "vars | Discover master CephObjectZone name"
+  kubernetes.core.k8s_info:
+    api_version: ceph.rook.io/v1
+    kind: CephObjectZone
+    namespace: "{{ rgw_namespace }}"
+    context: "{{ master_context }}"
+  register: _master_zone_cr
+
+- name: "vars | Assert master CephObjectZone found"
+  ansible.builtin.assert:
+    that: _master_zone_cr.resources | length > 0
+    fail_msg: "No CephObjectZone CR found in {{ rgw_namespace }} on {{ master_context }}"
+
+- name: "vars | Discover replica CephObjectZone name"
+  kubernetes.core.k8s_info:
+    api_version: ceph.rook.io/v1
+    kind: CephObjectZone
+    namespace: "{{ rgw_namespace }}"
+    context: "{{ replica_context }}"
+  register: _replica_zone_cr
+
+- name: "vars | Assert replica CephObjectZone found"
+  ansible.builtin.assert:
+    that: _replica_zone_cr.resources | length > 0
+    fail_msg: "No CephObjectZone CR found in {{ rgw_namespace }} on {{ replica_context }}"
+
+- name: "vars | Set topology facts"
+  ansible.builtin.set_fact:
+    _rgw_access: "{{ _realm_keys_secret.resources[0].data['access-key'] | b64decode }}"
+    _rgw_secret: "{{ _realm_keys_secret.resources[0].data['secret-key'] | b64decode }}"
+    _master_rgw: "{{ _master_route.resources[0].spec.host }}"
+    _replica_rgw: "{{ _replica_route.resources[0].spec.host }}"
+    _master_zone: "{{ _master_zone_cr.resources[0].metadata.name }}"
+    _replica_zone: "{{ _replica_zone_cr.resources[0].metadata.name }}"
+    _master_toolbox_pod: "{{ (_master_toolbox_pods.resources | first).metadata.name }}"
+    _replica_toolbox_pod: "{{ (_replica_toolbox_pods.resources | first).metadata.name }}"
+
+- name: "vars | Display setup plan"
+  ansible.builtin.debug:
+    msg:
+      - "============================================"
+      - "RGW Multisite Setup (idempotent)"
+      - "  Master:  {{ master_context }} (zone={{ _master_zone }}, rgw={{ _master_rgw }})"
+      - "  Replica: {{ replica_context }} (zone={{ _replica_zone }}, rgw={{ _replica_rgw }})"
+      - "  Toolbox: {{ _master_toolbox_pod }} / {{ _replica_toolbox_pod }}"
+      - "============================================"
+
+# ============================================================================
+# STEP 1: System user + zone defaults on master
+# ============================================================================
+
+- name: "step1 | Check system user exists"
+  ansible.builtin.include_tasks: _toolbox_exec.yml
+  vars:
+    _pod_name: "{{ _master_toolbox_pod }}"
+    _context: "{{ master_context }}"
+    _cmd: "radosgw-admin user info --uid={{ rgw_system_uid }}"
+
+- name: "step1 | Set user_exists fact"
+  ansible.builtin.set_fact:
+    _user_exists: "{{ _exec_result.return_code == 0 }}"
+
+- name: "step1 | Create system user (skip if exists)"
+  ansible.builtin.include_tasks: _toolbox_exec.yml
+  vars:
+    _pod_name: "{{ _master_toolbox_pod }}"
+    _context: "{{ master_context }}"
+    _no_log: true
+    _cmd: >-
+      radosgw-admin user create
+      --uid={{ rgw_system_uid }}
+      --display-name='hub-realm system user'
+      --system
+      --access-key='{{ _rgw_access }}'
+      --secret='{{ _rgw_secret }}'
+      '--caps=buckets=*;users=*;metadata=*;usage=*;zone=*'
+  when: not _user_exists
+
+- name: "step1 | Assert user create succeeded"
+  ansible.builtin.assert:
+    that: _exec_result.return_code == 0
+    fail_msg: "Failed to create system user: {{ _exec_result.stderr }}"
+  when: not _user_exists
+
+- name: "step1 | Update system user credentials (idempotent)"
+  ansible.builtin.include_tasks: _toolbox_exec.yml
+  vars:
+    _pod_name: "{{ _master_toolbox_pod }}"
+    _context: "{{ master_context }}"
+    _no_log: true
+    _cmd: >-
+      radosgw-admin user modify
+      --uid={{ rgw_system_uid }}
+      --access-key='{{ _rgw_access }}'
+      --secret='{{ _rgw_secret }}'
+      --system
+
+- name: "step1 | Assert user modify succeeded"
+  ansible.builtin.assert:
+    that: _exec_result.return_code == 0
+    fail_msg: "Failed to modify system user: {{ _exec_result.stderr }}"
+
+- name: "step1 | Set realm/zonegroup/zone defaults and update zone endpoint"
+  ansible.builtin.include_tasks: _toolbox_exec.yml
+  vars:
+    _pod_name: "{{ _master_toolbox_pod }}"
+    _context: "{{ master_context }}"
+    _cmd: |
+      radosgw-admin realm default --rgw-realm={{ rgw_realm }} --default
+      radosgw-admin zonegroup default --rgw-zonegroup={{ rgw_zonegroup }}
+      radosgw-admin zone default --rgw-zone={{ _master_zone }}
+      radosgw-admin zone modify --rgw-zone={{ _master_zone }} \
+        --access-key='{{ _rgw_access }}' \
+        --secret='{{ _rgw_secret }}' \
+        --endpoints=https://{{ _master_rgw }}
+
+- name: "step1 | Assert defaults + endpoint update succeeded"
+  ansible.builtin.assert:
+    that: _exec_result.return_code == 0
+    fail_msg: "Failed to set zone defaults on master: {{ _exec_result.stderr }}"
+
+# ============================================================================
+# STEP 2: Clean stale zones + enable log_data
+# ============================================================================
+
+- name: "step2 | Get current zonegroup state"
+  ansible.builtin.include_tasks: _toolbox_exec.yml
+  vars:
+    _pod_name: "{{ _master_toolbox_pod }}"
+    _context: "{{ master_context }}"
+    _cmd: "radosgw-admin --rgw-realm={{ rgw_realm }} zonegroup get"
+
+- name: "step2 | Assert zonegroup get succeeded"
+  ansible.builtin.assert:
+    that: _exec_result.return_code == 0
+    fail_msg: "Failed to get zonegroup: {{ _exec_result.stderr }}"
+
+- name: "step2 | Set stale zone list (zones other than master and replica)"
+  ansible.builtin.set_fact:
+    _stale_zones: >-
+      {{ (_exec_result.stdout | from_json).zones
+         | map(attribute='name')
+         | difference([_master_zone, _replica_zone])
+         | list }}
+
+- name: "step2 | Remove stale zones from zonegroup and delete them"
+  ansible.builtin.include_tasks: _toolbox_exec.yml
+  vars:
+    _pod_name: "{{ _master_toolbox_pod }}"
+    _context: "{{ master_context }}"
+    _cmd: |
+      radosgw-admin --rgw-realm={{ rgw_realm }} zonegroup remove \
+        --rgw-zonegroup={{ rgw_zonegroup }} --rgw-zone={{ item }} || true
+      radosgw-admin --rgw-realm={{ rgw_realm }} zone rm --rgw-zone={{ item }} || true
+      echo "removed stale zone: {{ item }}"
+  loop: "{{ _stale_zones }}"
+
+- name: "step2 | Remove default zone/zonegroup entries (idempotent)"
+  ansible.builtin.include_tasks: _toolbox_exec.yml
+  vars:
+    _pod_name: "{{ _master_toolbox_pod }}"
+    _context: "{{ master_context }}"
+    _cmd: |
+      radosgw-admin zonegroup remove --rgw-zonegroup=default --rgw-zone=default || true
+      radosgw-admin zone delete --rgw-zone=default || true
+      radosgw-admin zonegroup delete --rgw-zonegroup=default || true
+
+# ============================================================================
+# STEP 3: Register replica zone in master zonegroup
+# ============================================================================
+
+- name: "step3 | Get zonegroup to check replica registration"
+  ansible.builtin.include_tasks: _toolbox_exec.yml
+  vars:
+    _pod_name: "{{ _master_toolbox_pod }}"
+    _context: "{{ master_context }}"
+    _cmd: "radosgw-admin --rgw-realm={{ rgw_realm }} zonegroup get"
+
+- name: "step3 | Assert zonegroup get succeeded"
+  ansible.builtin.assert:
+    that: _exec_result.return_code == 0
+    fail_msg: "Failed to get zonegroup: {{ _exec_result.stderr }}"
+
+- name: "step3 | Set replica_registered fact"
+  ansible.builtin.set_fact:
+    _replica_registered: >-
+      {{ _replica_zone in
+         ((_exec_result.stdout | from_json).zones | map(attribute='name') | list) }}
+
+- name: "step3 | Register replica zone in zonegroup (skip if already registered)"
+  ansible.builtin.include_tasks: _toolbox_exec.yml
+  vars:
+    _pod_name: "{{ _master_toolbox_pod }}"
+    _context: "{{ master_context }}"
+    _cmd: >-
+      radosgw-admin --rgw-realm={{ rgw_realm }} zone create
+      --rgw-zone={{ _replica_zone }}
+      --rgw-zonegroup={{ rgw_zonegroup }}
+      --endpoints=https://{{ _replica_rgw }}
+      --read-only=0
+  when: not _replica_registered
+
+- name: "step3 | Assert replica zone registration succeeded"
+  ansible.builtin.assert:
+    that: _exec_result.return_code == 0
+    fail_msg: "Failed to register replica zone {{ _replica_zone }}: {{ _exec_result.stderr }}"
+  when: not _replica_registered
+
+# ============================================================================
+# STEP 4: Sync policy — always remove-then-recreate
+#
+# sync group flow create APPENDS (does not replace), so we must remove first.
+# This was the root cause of the zone ID/name mismatch bug on cluster set 02.
+# ============================================================================
+
+- name: "step4 | Remove stale zonegroup sync flow and pipe (|| true — may not exist)"
+  ansible.builtin.include_tasks: _toolbox_exec.yml
+  vars:
+    _pod_name: "{{ _master_toolbox_pod }}"
+    _context: "{{ master_context }}"
+    _cmd: |
+      radosgw-admin sync group flow remove \
+        --group-id=bidir-sync --flow-id=bidir-flow --flow-type=symmetrical || true
+      radosgw-admin sync group pipe remove \
+        --group-id=bidir-sync --pipe-id=all-buckets || true
+
+- name: "step4 | Create zonegroup-level sync group, flow, and pipe"
+  ansible.builtin.include_tasks: _toolbox_exec.yml
+  vars:
+    _pod_name: "{{ _master_toolbox_pod }}"
+    _context: "{{ master_context }}"
+    _cmd: |
+      radosgw-admin sync group create --group-id=bidir-sync --status=enabled
+      radosgw-admin sync group flow create \
+        --group-id=bidir-sync --flow-id=bidir-flow --flow-type=symmetrical \
+        --zones={{ _master_zone }},{{ _replica_zone }}
+      radosgw-admin sync group pipe create \
+        --group-id=bidir-sync --pipe-id=all-buckets \
+        '--source-zones=*' '--dest-zones=*'
+
+- name: "step4 | Assert zonegroup sync policy created"
+  ansible.builtin.assert:
+    that: _exec_result.return_code == 0
+    fail_msg: "Failed to create zonegroup sync policy: {{ _exec_result.stderr }}"
+
+- name: "step4 | Check if {{ rgw_bucket }} bucket exists on master"
+  ansible.builtin.include_tasks: _toolbox_exec.yml
+  vars:
+    _pod_name: "{{ _master_toolbox_pod }}"
+    _context: "{{ master_context }}"
+    _cmd: "radosgw-admin bucket stats --bucket={{ rgw_bucket }}"
+
+- name: "step4 | Set bucket_exists fact"
+  ansible.builtin.set_fact:
+    _bucket_exists: "{{ _exec_result.return_code == 0 }}"
+
+- name: "step4 | Remove stale bucket-level sync flow and pipe"
+  ansible.builtin.include_tasks: _toolbox_exec.yml
+  vars:
+    _pod_name: "{{ _master_toolbox_pod }}"
+    _context: "{{ master_context }}"
+    _cmd: |
+      radosgw-admin sync group flow remove \
+        --group-id=hub-bucket-sync --flow-id=hub-bidir --flow-type=symmetrical \
+        --bucket={{ rgw_bucket }} || true
+      radosgw-admin sync group pipe remove \
+        --group-id=hub-bucket-sync --pipe-id=hub-pipe \
+        --bucket={{ rgw_bucket }} || true
+  when: _bucket_exists
+
+- name: "step4 | Create bucket-level sync group, flow, and pipe"
+  ansible.builtin.include_tasks: _toolbox_exec.yml
+  vars:
+    _pod_name: "{{ _master_toolbox_pod }}"
+    _context: "{{ master_context }}"
+    _cmd: |
+      radosgw-admin sync group create \
+        --group-id=hub-bucket-sync --status=enabled --bucket={{ rgw_bucket }}
+      radosgw-admin sync group flow create \
+        --group-id=hub-bucket-sync --flow-id=hub-bidir --flow-type=symmetrical \
+        --zones={{ _master_zone }},{{ _replica_zone }} --bucket={{ rgw_bucket }}
+      radosgw-admin sync group pipe create \
+        --group-id=hub-bucket-sync --pipe-id=hub-pipe \
+        '--source-zones=*' '--dest-zones=*' --bucket={{ rgw_bucket }}
+  when: _bucket_exists
+
+- name: "step4 | Assert bucket sync policy created"
+  ansible.builtin.assert:
+    that: _exec_result.return_code == 0
+    fail_msg: "Failed to create bucket sync policy: {{ _exec_result.stderr }}"
+  when: _bucket_exists
+
+- name: "step4 | Note bucket sync skipped (OBC not bound yet)"
+  ansible.builtin.debug:
+    msg: "Bucket sync policy skipped — {{ rgw_bucket }} does not exist yet. Re-run after OBC binds."
+  when: not _bucket_exists
+
+# ============================================================================
+# STEP 5: Commit period on master + configure and pull period on replica
+# ============================================================================
+
+- name: "step5 | Commit period on master"
+  ansible.builtin.include_tasks: _toolbox_exec.yml
+  vars:
+    _pod_name: "{{ _master_toolbox_pod }}"
+    _context: "{{ master_context }}"
+    _cmd: "radosgw-admin --rgw-realm={{ rgw_realm }} period update --commit"
+
+- name: "step5 | Assert period commit succeeded"
+  ansible.builtin.assert:
+    that: _exec_result.return_code == 0
+    fail_msg: "Failed to commit period on master: {{ _exec_result.stderr }}"
+
+- name: "step5 | Configure replica defaults and clean default zone/zonegroup"
+  ansible.builtin.include_tasks: _toolbox_exec.yml
+  vars:
+    _pod_name: "{{ _replica_toolbox_pod }}"
+    _context: "{{ replica_context }}"
+    _cmd: |
+      radosgw-admin realm default --rgw-realm={{ rgw_realm }} --default
+      radosgw-admin zonegroup default --rgw-zonegroup={{ rgw_zonegroup }}
+      radosgw-admin zone default --rgw-zone={{ _replica_zone }}
+      radosgw-admin zonegroup remove --rgw-zonegroup=default --rgw-zone=default || true
+      radosgw-admin zone delete --rgw-zone=default || true
+      radosgw-admin zonegroup delete --rgw-zonegroup=default || true
+      true
+
+- name: "step5 | Assert replica configuration succeeded"
+  ansible.builtin.assert:
+    that: _exec_result.return_code == 0
+    fail_msg: "Failed to configure replica: {{ _exec_result.stderr }}"
+
+- name: "step5 | Pull period on replica (with retry)"
+  ansible.builtin.include_tasks: _toolbox_exec.yml
+  vars:
+    _pod_name: "{{ _replica_toolbox_pod }}"
+    _context: "{{ replica_context }}"
+    _no_log: true
+    _cmd: |
+      SUCCESS=0
+      for i in $(seq 1 {{ rgw_period_pull_retries }}); do
+        radosgw-admin --rgw-realm={{ rgw_realm }} period pull \
+          --url=https://{{ _master_rgw }} \
+          --access-key='{{ _rgw_access }}' \
+          --secret='{{ _rgw_secret }}' \
+          --default && SUCCESS=1 && break
+        echo "Period pull attempt $i failed, retrying in {{ rgw_period_pull_delay }}s..."
+        sleep {{ rgw_period_pull_delay }}
+      done
+      [ "$SUCCESS" = "1" ] || { echo "FATAL: period pull failed after all retries"; exit 1; }
+
+- name: "step5 | Assert period pull succeeded"
+  ansible.builtin.assert:
+    that: _exec_result.return_code == 0
+    fail_msg: "Failed to pull period on replica after {{ rgw_period_pull_retries }} attempts: {{ _exec_result.stderr }}"
+
+# ============================================================================
+# STEP 6: Restart RGW pods on both clusters and wait for health
+# ============================================================================
+
+- name: "step6 | Get RGW pods on master"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ rgw_namespace }}"
+    label_selectors:
+      - app=rook-ceph-rgw
+    context: "{{ master_context }}"
+  register: _master_rgw_pods
+
+- name: "step6 | Delete RGW pods on master"
+  kubernetes.core.k8s:
+    api_version: v1
+    kind: Pod
+    name: "{{ item.metadata.name }}"
+    namespace: "{{ rgw_namespace }}"
+    state: absent
+    context: "{{ master_context }}"
+    wait: false
+  loop: "{{ _master_rgw_pods.resources }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+
+- name: "step6 | Get RGW pods on replica"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ rgw_namespace }}"
+    label_selectors:
+      - app=rook-ceph-rgw
+    context: "{{ replica_context }}"
+  register: _replica_rgw_pods
+
+- name: "step6 | Delete RGW pods on replica"
+  kubernetes.core.k8s:
+    api_version: v1
+    kind: Pod
+    name: "{{ item.metadata.name }}"
+    namespace: "{{ rgw_namespace }}"
+    state: absent
+    context: "{{ replica_context }}"
+    wait: false
+  loop: "{{ _replica_rgw_pods.resources }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+
+- name: "step6 | Wait for master RGW route to respond"
+  ansible.builtin.uri:
+    url: "https://{{ _master_rgw }}"
+    validate_certs: false
+    status_code:
+      - 200
+      - 403
+    timeout: 10
+  register: _master_rgw_health
+  until: _master_rgw_health is not failed
+  retries: "{{ (rgw_restart_wait_seconds / 10) | int }}"
+  delay: 10
+  ignore_errors: true
+
+- name: "step6 | Warn if master RGW did not become healthy in time"
+  ansible.builtin.debug:
+    msg: "WARNING: Master RGW at {{ _master_rgw }} did not respond within {{ rgw_restart_wait_seconds }}s"
+  when: _master_rgw_health is failed
+
+- name: "step6 | Wait for replica RGW route to respond"
+  ansible.builtin.uri:
+    url: "https://{{ _replica_rgw }}"
+    validate_certs: false
+    status_code:
+      - 200
+      - 403
+    timeout: 10
+  register: _replica_rgw_health
+  until: _replica_rgw_health is not failed
+  retries: "{{ (rgw_restart_wait_seconds / 10) | int }}"
+  delay: 10
+  ignore_errors: true
+
+- name: "step6 | Warn if replica RGW did not become healthy in time"
+  ansible.builtin.debug:
+    msg: "WARNING: Replica RGW at {{ _replica_rgw }} did not respond within {{ rgw_restart_wait_seconds }}s"
+  when: _replica_rgw_health is failed
+
+# ============================================================================
+# STEP 7: Bucket sync init — both directions
+# ============================================================================
+
+- name: "step7 | Init bucket sync on master (pull from replica zone)"
+  ansible.builtin.include_tasks: _toolbox_exec.yml
+  vars:
+    _pod_name: "{{ _master_toolbox_pod }}"
+    _context: "{{ master_context }}"
+    _cmd: |
+      if radosgw-admin --rgw-realm={{ rgw_realm }} bucket stats \
+          --bucket={{ rgw_bucket }} >/dev/null 2>&1; then
+        radosgw-admin --rgw-realm={{ rgw_realm }} bucket sync init \
+          --source-zone={{ _replica_zone }} --bucket={{ rgw_bucket }}
+        echo "init sync {{ _replica_zone }} -> {{ _master_zone }} done"
+      else
+        echo "{{ rgw_bucket }} not on master yet (will sync after replication)"
+      fi
+  when: _bucket_exists
+
+- name: "step7 | Init bucket sync on replica (pull from master zone)"
+  ansible.builtin.include_tasks: _toolbox_exec.yml
+  vars:
+    _pod_name: "{{ _replica_toolbox_pod }}"
+    _context: "{{ replica_context }}"
+    _cmd: |
+      if radosgw-admin --rgw-realm={{ rgw_realm }} bucket stats \
+          --bucket={{ rgw_bucket }} >/dev/null 2>&1; then
+        radosgw-admin --rgw-realm={{ rgw_realm }} bucket sync init \
+          --source-zone={{ _master_zone }} --bucket={{ rgw_bucket }}
+        echo "init sync {{ _master_zone }} -> {{ _replica_zone }} done"
+      else
+        echo "{{ rgw_bucket }} not on replica yet (will sync after replication)"
+      fi
+  when: _bucket_exists
+
+# ============================================================================
+# STEP 8: Fix bucket creation_time (Rook bug workaround)
+#
+# Rook sets creation_time=0 on newly created buckets. OBC binding fails when
+# the synced replica sees epoch time. We patch the metadata to current time.
+# ============================================================================
+
+- name: "step8 | Fix bucket creation_time on master (if epoch)"
+  ansible.builtin.include_tasks: _toolbox_exec.yml
+  vars:
+    _pod_name: "{{ _master_toolbox_pod }}"
+    _context: "{{ master_context }}"
+    _cmd: |
+      if radosgw-admin --rgw-realm={{ rgw_realm }} bucket stats \
+          --bucket={{ rgw_bucket }} >/dev/null 2>&1; then
+        radosgw-admin --rgw-realm={{ rgw_realm }} metadata get \
+          bucket:{{ rgw_bucket }} > /tmp/bm.json
+        PATCHED=$(python3 -c '
+      import json, datetime
+      d = json.load(open("/tmp/bm.json"))
+      ct = d.get("data", {}).get("bucket", {}).get("creation_time", "")
+      if ct in ("0.000000", "1970-01-01 00:00:00.000000Z", ""):
+          d["data"]["bucket"]["creation_time"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+          json.dump(d, open("/tmp/bm.json", "w"))
+          print("patched")
+      else:
+          print("ok")
+      ')
+        if [ "$PATCHED" = "patched" ]; then
+          radosgw-admin --rgw-realm={{ rgw_realm }} metadata put \
+            bucket:{{ rgw_bucket }} < /tmp/bm.json
+          echo "creation_time fixed on master"
+        else
+          echo "creation_time ok on master"
+        fi
+      else
+        echo "{{ rgw_bucket }} not present on master, skipping"
+      fi
+  when: _bucket_exists
+
+- name: "step8 | Fix bucket creation_time on replica (if epoch)"
+  ansible.builtin.include_tasks: _toolbox_exec.yml
+  vars:
+    _pod_name: "{{ _replica_toolbox_pod }}"
+    _context: "{{ replica_context }}"
+    _cmd: |
+      if radosgw-admin --rgw-realm={{ rgw_realm }} bucket stats \
+          --bucket={{ rgw_bucket }} >/dev/null 2>&1; then
+        radosgw-admin --rgw-realm={{ rgw_realm }} metadata get \
+          bucket:{{ rgw_bucket }} > /tmp/bm.json
+        PATCHED=$(python3 -c '
+      import json, datetime
+      d = json.load(open("/tmp/bm.json"))
+      ct = d.get("data", {}).get("bucket", {}).get("creation_time", "")
+      if ct in ("0.000000", "1970-01-01 00:00:00.000000Z", ""):
+          d["data"]["bucket"]["creation_time"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+          json.dump(d, open("/tmp/bm.json", "w"))
+          print("patched")
+      else:
+          print("ok")
+      ')
+        if [ "$PATCHED" = "patched" ]; then
+          radosgw-admin --rgw-realm={{ rgw_realm }} metadata put \
+            bucket:{{ rgw_bucket }} < /tmp/bm.json
+          echo "creation_time fixed on replica"
+        else
+          echo "creation_time ok on replica"
+        fi
+      else
+        echo "{{ rgw_bucket }} not present on replica, skipping"
+      fi
+  when: _bucket_exists
+
+# ============================================================================
+# DONE
+# ============================================================================
+
+- name: "done | RGW multisite setup complete"
+  ansible.builtin.debug:
+    msg:
+      - "============================================"
+      - "RGW multisite setup complete!"
+      - "  Verify: make rgw-sync-status CLUSTER_SET=XX"
+      - "  Health: make aap-ready CLUSTER_SET=XX"
+      - "============================================"

@@ -1,0 +1,72 @@
+---
+### Ceph storage settings
+
+# Kubernetes context for the cluster with Ceph storage
+ceph_context: ''
+
+# Operation: recover (full workflow) or set_ratios (direct ratio update)
+ceph_operation: recover
+
+# Kubeconfig file path (optional, uses default if not specified)
+ceph_kubeconfig: ''
+
+# Namespace where rook-ceph-operator is deployed
+ceph_namespace: 'openshift-storage'
+
+### Full ratio thresholds
+#
+# All ratios must be between 0.0 and 1.0
+# Must satisfy: nearfull < backfillfull < full
+
+# Temporary elevated ratios (used during recovery)
+ceph_full_ratio_elevated: 0.95
+ceph_backfillfull_ratio_elevated: 0.90
+ceph_nearfull_ratio_elevated: 0.85
+
+# Default ratios (normal operation)
+ceph_full_ratio_default: 0.85
+ceph_backfillfull_ratio_default: 0.80
+ceph_nearfull_ratio_default: 0.75
+
+# Direct ratio-setting targets. Defaults restore normal operation thresholds.
+ceph_full_ratio_target: '{{ ceph_full_ratio_default }}'
+ceph_backfillfull_ratio_target: '{{ ceph_backfillfull_ratio_default }}'
+ceph_nearfull_ratio_target: '{{ ceph_nearfull_ratio_default }}'
+
+### Recovery behavior
+
+# Automatically trigger cleanup operations when full detected
+ceph_auto_cleanup: true
+
+# Automatically restore default ratios after recovery
+ceph_auto_restore_defaults: true
+
+# Wait for Ceph HEALTH_OK before restoring defaults
+ceph_wait_for_health_ok: true
+
+# Maximum time to wait for cleanup to complete (seconds)
+ceph_cleanup_timeout: 3600
+
+# Maximum time to wait for Ceph health to recover (seconds)
+ceph_health_timeout: 1800
+
+### AAP cleanup integration
+
+# Namespace where AAP is deployed
+aap_namespace: 'aap'
+
+# Trigger AAP cleanup job during recovery
+ceph_trigger_aap_cleanup: true
+
+# AAP cleanup CronJob name
+aap_cleanup_cronjob: 'aap-set-cleanup-schedules'
+
+### WAL cleanup integration
+
+# Delete WAL ObjectBucketClaim to free space
+ceph_delete_wal_obc: false
+ceph_delete_wal_obc_confirm: false
+
+# WAL OBC name
+ceph_wal_obc_name: 'cnpg-wal-obc'
+...

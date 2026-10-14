@@ -1,0 +1,29 @@
+namespace: aap
+name: hadr_ops
+version: 1.0.0
+readme: README.md
+authors:
+  - AAP HA/DR Team
+description: >
+  Operational Ansible collection for Ansible Automation Platform HA/DR.
+  Orchestrates graceful switchover, disaster recovery force-promotion, and
+  post-DR replication restore across distributed CloudNativePG clusters.
+license:
+  - GPL-3.0-or-later
+tags:
+  - hadr
+  - disaster_recovery
+  - switchover
+  - cloudnativepg
+  - ansible
+  - automation_platform
+dependencies:
+  kubernetes.core: ">=3.0.0"
+  community.general: ">=8.0.0"
+repository: "https://github.com/ansible-automation-platform/aap-ha-dr-gitops"
+documentation: "https://github.com/ansible-automation-platform/aap-ha-dr-gitops/tree/devel/operations"
+homepage: "https://github.com/ansible-automation-platform/aap-ha-dr-gitops"
+issues: "https://github.com/ansible-automation-platform/aap-ha-dr-gitops/issues"
+build_ignore:
+  - "*.pyc"
+  - "__pycache__"

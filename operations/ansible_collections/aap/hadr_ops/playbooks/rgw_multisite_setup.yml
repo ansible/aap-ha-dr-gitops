@@ -1,0 +1,54 @@
+---
+# RGW Multisite Setup
+#
+# Bootstraps active-active Ceph RGW replication across two OpenShift clusters.
+# Idempotent — safe to re-run on already-configured clusters.
+#
+# Usage (from the example repository root):
+#   ansible-playbook operations/ansible_collections/aap/hadr_ops/playbooks/rgw_multisite_setup.yml \
+#     -e @my-deployment/operations/clusters.yml
+#   ansible-playbook ... -e @my-deployment/operations/clusters.yml -e cluster_set=02
+#   ansible-playbook ... -e @my-deployment/operations/clusters.yml -e cluster_set=02 -e master_site=b
+#
+# Also called via Makefile:
+#   make rgw-multisite-setup CLUSTER_SET=01
+#
+# Variables:
+#   cluster_set:  "01" (default) or "02" — selects cluster contexts from vars/clusters.yml
+#   master_site:  "a" (default) or "b" — which cluster holds the authoritative realm
+#                 The other cluster becomes the replica.
+
+- name: RGW Multisite Setup
+  hosts: localhost
+  gather_facts: true
+  vars:
+    master_site: "a"
+    replica_site: "{{ 'b' if master_site == 'a' else 'a' }}"
+  tasks:
+    - name: Load and validate configuration
+      ansible.builtin.import_role:
+        name: aap.hadr_ops.config_loader
+
+    - name: Validate master_site
+      ansible.builtin.assert:
+        that:
+          - master_site in ['a', 'b']
+        fail_msg: >
+          Invalid master_site={{ master_site }}. Must be 'a' or 'b'.
+
+    - name: Derive RGW master/replica contexts
+      ansible.builtin.set_fact:
+        master_context: "{{ cluster_sets[cluster_set].clusters[master_site].context }}"
+        replica_context: "{{ cluster_sets[cluster_set].clusters[replica_site].context }}"
+
+    - name: Display setup info
+      ansible.builtin.debug:
+        msg:
+          - "RGW Multisite Setup"
+          - "  Cluster Set: {{ cluster_set }}"
+          - "  Master site: {{ master_site }} ({{ master_context }})"
+          - "  Replica site: {{ replica_site }} ({{ replica_context }})"
+
+    - name: Run RGW multisite setup role
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.rgw_multisite_setup

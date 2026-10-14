@@ -1,0 +1,44 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cnpg-barman-retention
+spec:
+  schedule: "27 2 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: barman
+              image: ghcr.io/cloudnative-pg/postgresql:15.10
+              command: ["/bin/sh", "-c"]
+              args:
+                - >-
+                  for prefix in example-a example-b; do
+                    barman-cloud-backup-delete
+                    --endpoint-url "$ENDPOINT"
+                    --retention-policy "RECOVERY WINDOW OF 2 DAYS"
+                    "s3://cnpg-wal/$prefix/"
+                    aap-postgres;
+                  done
+              env:
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: barman-rgw-credentials
+                      key: ACCESS_KEY_ID
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: barman-rgw-credentials
+                      key: ACCESS_SECRET_KEY
+                - name: ENDPOINT
+                  value: http://rook-ceph-rgw-hub-objectstore.openshift-storage.svc:80

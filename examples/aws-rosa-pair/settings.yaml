@@ -1,0 +1,6 @@
+schema_version: 1
+git:
+  # CHANGE: HTTPS URL of your fork; authentication is configured in ArgoCD.
+  repo_url: https://github.com/ansible-automation-platform/aap-ha-dr-gitops/
+  # CHANGE: a branch, tag, or commit containing the whole deployment.
+  revision: main

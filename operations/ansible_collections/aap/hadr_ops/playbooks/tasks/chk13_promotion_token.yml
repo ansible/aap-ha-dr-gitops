@@ -1,0 +1,20 @@
+---
+# CHK-13: CNPG promotion token health.
+
+- name: "CHK-13: Finalize promotion token result"
+  vars:
+    _token_statuses:
+      - "{{ _platform_result_a.promotion_token.status | default('skip') | trim }}"
+      - "{{ _platform_result_b.promotion_token.status | default('skip') | trim }}"
+    _token_status: >-
+      {% if 'fail' in _token_statuses %}fail
+      {% elif 'warn' in _token_statuses %}warn
+      {% else %}pass{% endif %}
+    _check_key: "chk13_promotion_token"
+    _check_name: "CHK-13 Promotion Token"
+    _check_status: "{{ _token_status | trim }}"
+    _check_detail: "a={{ _platform_result_a.promotion_token.detail | default('skip', true) | trim }}, b={{ _platform_result_b.promotion_token.detail | default('skip', true) | trim }}"
+    _check_data:
+      cluster_a: "{{ _platform_result_a.promotion_token | default({'status': 'skip'}) }}"
+      cluster_b: "{{ _platform_result_b.promotion_token | default({'status': 'skip'}) }}"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/finalize_check.yml"

@@ -1,0 +1,55 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: cnpg-server-tls
+  namespace: aap
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  refreshInterval: 24h
+  secretStoreRef:
+    name: cluster-cross-account-secret-store
+    kind: ClusterSecretStore
+  target:
+    name: cnpg-server-tls
+    creationPolicy: Owner
+    template:
+      type: kubernetes.io/tls
+  data:
+    - secretKey: tls.crt # gitleaks:allow -- ExternalSecret key name
+      remoteRef:
+        key: example/aap/shared/cnpg-tls
+        property: MUST_BE_SET_BY_OVERLAY-server.crt
+    - secretKey: tls.key # gitleaks:allow -- ExternalSecret key name
+      remoteRef:
+        key: example/aap/shared/cnpg-tls
+        property: MUST_BE_SET_BY_OVERLAY-server.key
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: cnpg-replication-tls
+  namespace: aap
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  refreshInterval: 24h
+  secretStoreRef:
+    name: cluster-cross-account-secret-store
+    kind: ClusterSecretStore
+  target:
+    name: cnpg-replication-tls
+    creationPolicy: Owner
+    template:
+      type: kubernetes.io/tls
+  data:
+    - secretKey: tls.crt # gitleaks:allow -- ExternalSecret key name
+      remoteRef:
+        key: example/aap/shared/cnpg-tls
+        property: MUST_BE_SET_BY_OVERLAY-replication.crt
+    - secretKey: tls.key # gitleaks:allow -- ExternalSecret key name
+      remoteRef:
+        key: example/aap/shared/cnpg-tls
+        property: MUST_BE_SET_BY_OVERLAY-replication.key

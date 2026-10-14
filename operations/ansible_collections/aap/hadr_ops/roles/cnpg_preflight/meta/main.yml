@@ -1,0 +1,11 @@
+---
+galaxy_info:
+  role_name: cnpg_preflight
+  author: AAP HA/DR Testing Team
+  description: >-
+    Pre-flight checks for CNPG distributed switchover. Detects current topology,
+    validates WAL timeline consistency, and checks archiver health.
+  company: Red Hat
+  license: Apache-2.0
+  min_ansible_version: "2.15"
+dependencies: []

@@ -1,0 +1,149 @@
+---
+# AAP CNPG Backup and PITR Restore
+#
+# This playbook manages CloudNativePG backup and point-in-time restore
+# operations for the AAP platform database. Integrates with Barman Cloud
+# and the existing CNPG cluster configuration.
+#
+# Usage (from the example repository root):
+#   # Trigger on-demand backup (auto-detects primary)
+#   ansible-playbook operations/ansible_collections/aap/hadr_ops/playbooks/aap_backup_restore.yml \
+#     -e @my-deployment/operations/clusters.yml -e mode=backup
+#
+#   # Trigger backup on cluster set 02 (auto-detects primary)
+#   ansible-playbook operations/ansible_collections/aap/hadr_ops/playbooks/aap_backup_restore.yml \
+#     -e @my-deployment/operations/clusters.yml -e mode=backup -e cluster_set=02
+#
+#   # List all backups (auto-detects primary)
+#   ansible-playbook operations/ansible_collections/aap/hadr_ops/playbooks/aap_backup_restore.yml \
+#     -e @my-deployment/operations/clusters.yml -e mode=list
+#
+#   # Restore to point-in-time (requires explicit target_cluster)
+#   ansible-playbook operations/ansible_collections/aap/hadr_ops/playbooks/aap_backup_restore.yml \
+#     -e @my-deployment/operations/clusters.yml -e mode=restore_pitr -e target_cluster=a \
+#     -e pitr_target_time=2026-05-27T12:00:00Z
+#
+#   # Full restore from backup (requires explicit target_cluster)
+#   ansible-playbook operations/ansible_collections/aap/hadr_ops/playbooks/aap_backup_restore.yml \
+#     -e @my-deployment/operations/clusters.yml -e mode=restore_full -e target_cluster=a \
+#     -e restore_confirm=true
+#
+# Requires: cluster topology via -e @<clusters file> (see the generated <deployment>/operations/clusters.yml)
+#
+#   # Cross-cluster PITR: restore cluster-b from cluster-a's backup archive
+#   ansible-playbook operations/ansible_collections/aap/hadr_ops/playbooks/aap_backup_restore.yml \
+#     -e mode=restore_pitr -e target_cluster=b -e pitr_source_cluster=dc-east \
+#     -e pitr_target_time=2026-05-27T12:00:00Z -e pitr_confirm=true
+#
+# Variables:
+#   cluster_set: "01" (default) — selects cluster contexts
+#   mode: "backup", "list", "verify", "restore_pitr", or "restore_full"
+#   target_cluster: "auto" (default), "a", or "b"
+#     - auto: detects the primary cluster (backup, list, verify only)
+#     - a/b: explicit target (required for restore_pitr and restore_full)
+#   pitr_target_time: ISO 8601 timestamp for PITR (required for restore_pitr)
+#   pitr_source_cluster: source cluster's site_id for cross-cluster restore (e.g., "dc-east" from inventory, default: "" = same cluster)
+#   backup_wait: whether to wait for backup completion (default: true)
+
+- name: AAP CNPG Backup and Restore
+  hosts: localhost
+  gather_facts: true
+  vars:
+    mode: "backup"
+    target_cluster: "auto"
+    pitr_source_cluster: ""
+  tasks:
+    - name: Load and validate configuration
+      ansible.builtin.import_role:
+        name: aap.hadr_ops.config_loader
+
+    - name: Validate mode parameter
+      ansible.builtin.assert:
+        that:
+          - mode in ['backup', 'list', 'verify', 'restore_pitr', 'restore_full']
+        fail_msg: "mode must be 'backup', 'list', 'verify', 'restore_pitr', or 'restore_full'"
+
+    - name: Validate target_cluster parameter
+      ansible.builtin.assert:
+        that:
+          - target_cluster in ['auto', 'a', 'b']
+        fail_msg: "target_cluster must be 'auto', 'a', or 'b'"
+
+    - name: Require explicit target_cluster for destructive modes
+      ansible.builtin.assert:
+        that:
+          - target_cluster in ['a', 'b']
+        fail_msg: >
+          target_cluster must be explicitly set to 'a' or 'b' for {{ mode }}.
+          Auto-detection is only supported for non-destructive modes (backup, list, verify).
+      when: mode in ['restore_pitr', 'restore_full'] and target_cluster == 'auto'
+
+    - name: Auto-detect primary cluster
+      when: target_cluster == 'auto'
+      block:
+        - name: Probe cluster A for primary status
+          aap.hadr_ops.cnpg_cluster_info:
+            namespace: "{{ aap_namespace }}"
+            cluster_name: "{{ cluster_name }}"
+            context: "{{ cluster_a_context }}"
+          register: _probe_a
+
+        - name: Probe cluster B for primary status
+          aap.hadr_ops.cnpg_cluster_info:
+            namespace: "{{ aap_namespace }}"
+            cluster_name: "{{ cluster_name }}"
+            context: "{{ cluster_b_context }}"
+          register: _probe_b
+
+        - name: Resolve primary cluster
+          ansible.builtin.set_fact:
+            target_cluster: >-
+              {{ 'a' if (_probe_a.cluster_info.computed.is_primary | default(false))
+                 else 'b' if (_probe_b.cluster_info.computed.is_primary | default(false))
+                 else 'NONE' }}
+
+        - name: Validate primary was detected
+          ansible.builtin.assert:
+            that:
+              - target_cluster in ['a', 'b']
+            fail_msg: >
+              Could not auto-detect the primary cluster.
+              Cluster A ({{ cluster_a_context }}): is_primary={{ _probe_a.cluster_info.computed.is_primary | default('unknown') }}
+              Cluster B ({{ cluster_b_context }}): is_primary={{ _probe_b.cluster_info.computed.is_primary | default('unknown') }}
+              Please specify -e target_cluster=a or -e target_cluster=b explicitly.
+
+        - name: Display auto-detected primary
+          ansible.builtin.debug:
+            msg: "Auto-detected primary: cluster {{ target_cluster }} ({{ cluster_a_context if target_cluster == 'a' else cluster_b_context }})"
+
+    - name: Derive target context from config_loader facts
+      ansible.builtin.set_fact:
+        target_context: "{{ cluster_a_context if target_cluster == 'a' else cluster_b_context }}"
+        target_site_id: "{{ site_id_a if target_cluster == 'a' else site_id_b }}"
+
+    - name: Display operation parameters
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "AAP CNPG Backup / Restore"
+          - "Mode: {{ mode }}"
+          - "Cluster Set: {{ cluster_set }}"
+          - "Target: {{ target_context }} (site_id={{ target_site_id }})"
+          - "Namespace: {{ aap_namespace }}"
+          - "Cluster: {{ cluster_name }}"
+          - "=========================================="
+
+    - name: Execute backup/restore operation
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.cnpg_backup_restore
+      vars:
+        backup_mode: "{{ mode }}"
+
+    - name: Display final result
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "Operation Complete"
+          - "Mode: {{ mode }}"
+          - "Result: {{ cnpg_backup_result.message | default('done') }}"
+          - "=========================================="

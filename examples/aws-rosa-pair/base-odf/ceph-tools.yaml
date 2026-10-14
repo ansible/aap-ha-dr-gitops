@@ -1,0 +1,64 @@
+---
+# GitOps-managed Ceph administration toolbox.
+# The image should match the Ceph version deployed by the ODF subscription.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aap-hadr-ceph-tools
+  namespace: openshift-storage
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rook-ceph-tools
+  template:
+    metadata:
+      labels:
+        app: rook-ceph-tools
+    spec:
+      containers:
+        - name: tools
+          # TODO: Make this overlay-driven or validate it against the deployed ODF/Ceph version.
+          image: quay.io/ceph/ceph:v19.2.1
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              mkdir -p /etc/ceph
+              MON_HOSTS=$(printf '%s' "$CEPH_MON" | sed 's/[a-z]=//g')
+              printf '[global]\nfsid = %s\nmon_host = %s\n' "$CEPH_FSID" "$MON_HOSTS" > /etc/ceph/ceph.conf
+              printf '[client.admin]\nkey = %s\n' "$CEPH_ADMIN_KEY" > /etc/ceph/ceph.client.admin.keyring
+              exec sleep infinity
+          env:
+            - name: CEPH_FSID
+              valueFrom:
+                secretKeyRef:
+                  name: rook-ceph-mon
+                  key: fsid
+            - name: CEPH_ADMIN_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: rook-ceph-mon
+                  key: ceph-secret
+            - name: CEPH_MON
+              valueFrom:
+                configMapKeyRef:
+                  name: rook-ceph-mon-endpoints
+                  key: data
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: ceph-config
+              mountPath: /etc/ceph
+      volumes:
+        - name: ceph-config
+          emptyDir: {}

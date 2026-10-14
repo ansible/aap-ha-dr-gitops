@@ -1,0 +1,66 @@
+schema_version: 1
+environment_id: example-pair-a
+target_cluster_id: example-a
+namespace: aap
+installation_name: aap
+installation_type: aap_hadr
+rgw_zone_name: example-a
+rgw_role: primary
+workloads:
+  cnpg:
+    site_name: example-a
+    wal_path: s3://cnpg-wal/example-a/
+    replication_host: postgres-repl.cluster-a.example.com
+    storage_class: gp3-csi
+    data_size: 2Ti
+    wal_size: 200Gi
+    instances: 2
+    peer:
+      site_name: example-b
+      wal_path: s3://cnpg-wal/example-b/
+      replication_host: postgres-repl.cluster-b.example.com
+  platform:
+    public_base_url: https://aap.example.com
+    route_url: https://aap-aap.apps.cluster-a.example.com
+    receptor_hosts:
+    - 192.0.2.11
+    - 192.0.2.12
+    hop_node_ips:
+    - 192.0.2.13
+    - 192.0.2.14
+  odf:
+    endpoint: https://rgw.cluster-a.example.com
+    partner_endpoint: https://rgw.cluster-b.example.com
+    storage_class: gp3-csi
+  eso:
+    role_arn: arn:aws:iam::000000000000:role/example-eso-secrets-reader
+    secret_prefix: example/aap/shared
+  observability:
+    remote_write_url: https://example.invalid/api/v1/write
+  logging:
+    loki_url: https://example.invalid/api/logs/v1/application/
+certificates:
+  server: example-a-server.crt
+  server_key: example-a-server.key
+  replication: example-a-replication.crt
+  replication_key: example-a-replication.key
+retention:
+  days: 7
+  interval_hours: 1
+infrastructure:
+  aws_account_id: '000000000000'
+  aws_region: us-east-1
+  secrets_manager_region: us-east-1
+  terraform_workspace: example-hadr
+  external_dns:
+    enabled: true
+    name: example-dns
+    role_arn: arn:aws:iam::000000000000:role/example-eso-secrets-reader
+cluster:
+  cluster_id: example-a
+  provider: rosa
+  control_plane_model: hosted
+  management_api_endpoint: https://api.cluster-a.example.com:6443
+  apps_domain: cluster-a.example.com
+  storage_class: gp3-csi
+  context: customer-cluster-a

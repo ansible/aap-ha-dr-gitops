@@ -1,0 +1,41 @@
+---
+# Execute a SQL query on a CNPG pod via psql.
+#
+# Required variables:
+#   _query:           SQL query string (e.g. "SELECT timeline_id FROM pg_control_checkpoint();")
+#   _query_context:   Kubernetes context name
+#   _query_labels:    Label selector string (e.g. "cnpg.io/cluster=aap-postgres,cnpg.io/instanceRole=primary")
+#
+# Optional variables:
+#   _query_kubeconfig:       Path to kubeconfig (default: omitted)
+#   _query_field_selectors:  Field selector list (default: ["status.phase=Running"])
+#
+# Output variables:
+#   _query_pod:     Name of the pod found
+#   _query_result:  k8s_exec result dict (stdout, stderr, return_code)
+
+- name: "psql_query | Find pod matching {{ _query_labels }}"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ aap_namespace }}"
+    label_selectors: "{{ _query_labels.split(',') }}"
+    field_selectors: "{{ _query_field_selectors | default(['status.phase=Running']) }}"
+    context: "{{ _query_context }}"
+    kubeconfig: "{{ _query_kubeconfig | default(omit) }}"
+  register: _query_pod_list
+
+- name: "psql_query | Set pod name"
+  ansible.builtin.set_fact:
+    _query_pod: "{{ (_query_pod_list.resources | default([]) | first | default({})).metadata.name | default('') }}"
+    _query_result: {"stdout": "", "stderr": "", "return_code": 1, "skipped": true}
+
+- name: "psql_query | Execute SQL on {{ _query_pod }}"
+  kubernetes.core.k8s_exec:
+    namespace: "{{ aap_namespace }}"
+    pod: "{{ _query_pod }}"
+    command: '/bin/sh -c "psql -U postgres -t -c \"{{ _query }}\""'
+    context: "{{ _query_context }}"
+    kubeconfig: "{{ _query_kubeconfig | default(omit) }}"
+  register: _query_result
+  when: _query_pod | length > 0

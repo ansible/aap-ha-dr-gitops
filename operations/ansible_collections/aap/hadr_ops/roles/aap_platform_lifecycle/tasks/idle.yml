@@ -1,0 +1,77 @@
+---
+# Set AAP to idle (idle_aap=true) on a single cluster
+# Verifies the CR was patched successfully.
+
+- name: Set AAP idle on {{ lifecycle_context }}
+  aap.hadr_ops.aap_platform_scale:
+    namespace: "{{ aap_namespace }}"
+    aap_name: "{{ aap_name }}"
+    context: "{{ lifecycle_context }}"
+    scale_to: "idle"
+    direct_deployment_scale: false
+  register: _idle_result
+
+- name: Verify AAP CR has idle_aap=true
+  kubernetes.core.k8s_info:
+    api_version: aap.ansible.com/v1alpha1
+    kind: AnsibleAutomationPlatform
+    name: "{{ aap_name }}"
+    namespace: "{{ aap_namespace }}"
+    context: "{{ lifecycle_context }}"
+  register: _idle_cr_check
+  until: >
+    _idle_cr_check.resources | length > 0 and
+    (_idle_cr_check.resources[0].spec.idle_aap | default(false) | bool)
+  retries: "{{ aap_idle_verify_retries }}"
+  delay: "{{ aap_idle_verify_delay }}"
+  ignore_errors: true
+
+- name: Evaluate idle verification
+  ansible.builtin.set_fact:
+    _idle_verified: >-
+      {{ _idle_cr_check is succeeded and
+         (_idle_cr_check.resources | default([]) | length > 0) and
+         (_idle_cr_check.resources[0].spec.idle_aap | default(false) | bool) }}
+
+- name: Set lifecycle result (idle verified)
+  when: _idle_verified | bool
+  ansible.builtin.set_fact:
+    lifecycle_result:
+      context: "{{ lifecycle_context }}"
+      action: "idle"
+      status: "idle"
+      failed_stage: ""
+      idle_verified: true
+      message: "{{ _idle_result.message | default('patched') }}"
+      error: ""
+
+- name: Handle idle verification failure
+  when: not (_idle_verified | bool)
+  block:
+    - name: Set lifecycle result (idle failed)
+      ansible.builtin.set_fact:
+        lifecycle_result:
+          context: "{{ lifecycle_context }}"
+          action: "idle"
+          status: "failed"
+          failed_stage: "idle_verification"
+          idle_verified: false
+          message: "{{ _idle_result.message | default('patched') }}"
+          error: >-
+            idle_aap not confirmed on CR after
+            {{ aap_idle_verify_retries }} retries ({{ aap_idle_verify_retries | int * aap_idle_verify_delay | int }}s)
+
+    - name: Log idle failure
+      ansible.builtin.debug:
+        msg:
+          - "IDLE FAILED on {{ lifecycle_context }}"
+          - "  {{ lifecycle_result.error | trim }}"
+
+    - name: Fail playbook (idle not verified, lifecycle_fail_on_error=true)
+      when: lifecycle_fail_on_error | bool
+      ansible.builtin.fail:
+        msg: "{{ lifecycle_result.error | trim }}"
+
+- name: Log idle result
+  ansible.builtin.debug:
+    msg: "AAP idle on {{ lifecycle_context }}: {{ lifecycle_result.status | trim }} (idle_aap verified: {{ lifecycle_result.idle_verified }})"

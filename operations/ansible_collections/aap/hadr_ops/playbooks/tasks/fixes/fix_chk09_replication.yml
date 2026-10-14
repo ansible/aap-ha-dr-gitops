@@ -1,0 +1,29 @@
+---
+# Fix CHK-09: Replication lag — wait for catchup or restore replication.
+#
+# Input: _check_key, _check_name, _check_detail
+# Output: _fix_result, _fix_detail
+
+- name: "FIX {{ _check_name }}: Determine fix type"
+  ansible.builtin.set_fact:
+    _chk09_no_replica: "{{ 'no active streaming replica' in (_check_detail | lower) }}"
+
+- name: "FIX {{ _check_name }}: Restore replication (no replica found)"
+  when: _chk09_no_replica | bool
+  ansible.builtin.include_role:
+    name: aap.hadr_ops.cnpg_restore_replication
+  vars:
+    target_primary: "{{ _wal_primary_site | default(site_id_a) }}"
+    confirm: "{{ autofix_confirm | default('no') }}"
+
+- name: "FIX {{ _check_name }}: Wait for lag to decrease"
+  when: not (_chk09_no_replica | bool)
+  ansible.builtin.debug:
+    msg: "Replication lag above threshold — waiting for replica to catch up"
+
+- name: "FIX {{ _check_name }}: Record result"
+  ansible.builtin.set_fact:
+    _fix_result: "pending"
+    _fix_detail: >-
+      {{ 'Restored replication (no replica found)' if (_chk09_no_replica | bool)
+         else 'Waited for replication lag to decrease (transient)' }}

@@ -1,0 +1,116 @@
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: aap-apply-license
+  namespace: aap
+  annotations:
+    argocd.argoproj.io/sync-wave: "15"
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      ttlSecondsAfterFinished: 300
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: apply-license
+            image: registry.access.redhat.com/ubi9/ubi:latest
+            command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Waiting for AAP gateway..."
+              for i in $(seq 1 30); do
+                STATUS=$(curl -sk http://aap.aap.svc.cluster.local/api/gateway/v1/ping/ 2>/dev/null | grep -o '"status":"[^"]*"' | head -1)
+                if echo "$STATUS" | grep -q "good"; then
+                  echo "Gateway is ready"
+                  break
+                fi
+                if [ "$i" = "30" ]; then
+                  echo "Gateway not ready after 5 minutes, will retry next schedule"
+                  exit 0
+                fi
+                echo "  attempt $i: $STATUS"
+                sleep 10
+              done
+
+              python3 -c "
+              import json, urllib.request, ssl, sys, os, base64
+
+              ctx = ssl.create_default_context()
+              ctx.check_hostname = False
+              ctx.verify_mode = ssl.CERT_NONE
+
+              gw = 'http://aap.aap.svc.cluster.local'
+              creds = base64.b64encode(f'{os.environ[\"ADMIN_USER\"]}:{os.environ[\"ADMIN_PASS\"]}'.encode()).decode()
+              headers = {'Content-Type': 'application/json', 'Authorization': f'Basic {creds}'}
+
+              # Check if already licensed
+              req = urllib.request.Request(f'{gw}/api/controller/v2/config/', headers=headers)
+              resp = urllib.request.urlopen(req, context=ctx)
+              config = json.loads(resp.read())
+              if config.get('license_info', {}).get('license_type') == 'enterprise':
+                  print('License already applied, skipping')
+                  sys.exit(0)
+
+              # Step 1: fetch available subscriptions
+              print('Fetching available subscriptions...')
+              payload = json.dumps({
+                  'subscriptions_username': os.environ['RHN_USER'],
+                  'subscriptions_password': os.environ['RHN_PASS']
+              }).encode()
+              req = urllib.request.Request(f'{gw}/api/controller/v2/config/subscriptions/', data=payload, headers=headers, method='POST')
+              try:
+                  resp = urllib.request.urlopen(req, context=ctx, timeout=60)
+                  subs = json.loads(resp.read())
+              except urllib.error.HTTPError as e:
+                  print(f'Failed to fetch subscriptions: HTTP {e.code} - {e.read().decode()}')
+                  sys.exit(1)
+
+              # Step 2: find and attach first valid AAP subscription
+              aap_sub = next((s for s in subs if s.get('valid_key') and s.get('sku') == 'MCT3696'), None)
+              if not aap_sub:
+                  print(f'No valid AAP subscription found ({len(subs)} subscriptions returned)')
+                  sys.exit(1)
+
+              print(f'Attaching: {aap_sub[\"subscription_name\"]} (id={aap_sub[\"subscription_id\"]})')
+              payload = json.dumps({'subscription_id': aap_sub['subscription_id']}).encode()
+              req = urllib.request.Request(f'{gw}/api/controller/v2/config/attach/', data=payload, headers=headers, method='POST')
+              try:
+                  resp = urllib.request.urlopen(req, context=ctx)
+                  print(f'License applied successfully (HTTP {resp.status})')
+              except urllib.error.HTTPError as e:
+                  print(f'Failed to attach: HTTP {e.code} - {e.read().decode()}')
+                  sys.exit(1)
+              "
+            env:
+            - name: ADMIN_USER
+              value: "admin"
+            - name: ADMIN_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: aap-admin-password
+                  key: password
+            - name: RHN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: registry-redhat-io-pull-secret
+                  key: username
+            - name: RHN_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: registry-redhat-io-pull-secret
+                  key: password
+            resources:
+              requests:
+                cpu: 50m
+                memory: 64Mi
+              limits:
+                cpu: 200m
+                memory: 128Mi

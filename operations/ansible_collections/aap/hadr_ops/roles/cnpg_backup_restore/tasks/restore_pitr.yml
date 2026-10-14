@@ -1,0 +1,285 @@
+---
+# Point-in-time recovery: hibernate cluster, patch bootstrap to recovery mode.
+# Wrapped in block/rescue to ensure cleanup on failure.
+
+- name: Validate PITR parameters
+  ansible.builtin.assert:
+    that:
+      - pitr_target_time | length > 0
+    fail_msg: "pitr_target_time is required for restore_pitr mode (ISO 8601 format)"
+
+- name: Get cluster recoverability window
+  ansible.builtin.command:
+    argv:
+      - "{{ oc_binary }}"
+      - "--context={{ target_context }}"
+      - "get"
+      - "cluster"
+      - "{{ cluster_name }}"
+      - "-n"
+      - "{{ aap_namespace }}"
+      - "-o"
+      - "jsonpath={.status.firstRecoverabilityPoint}"
+  register: _first_recoverable
+  changed_when: false
+  when: pitr_source_cluster | default('') | length == 0
+
+- name: Check WAL archiver health before PITR
+  ansible.builtin.include_tasks: _check_wal_archiver.yml
+  when: pitr_source_cluster | default('') | length == 0
+
+- name: Validate target time is within recoverable window
+  ansible.builtin.assert:
+    that:
+      - _first_recoverable.stdout | trim | length > 0
+      - pitr_target_time >= (_first_recoverable.stdout | trim)
+      - pitr_target_time <= (_wal_archiver.last_archived_time | default(''))
+    fail_msg: >
+      Target time {{ pitr_target_time }} is outside the recoverable window.
+      Recoverable period: {{ _first_recoverable.stdout | trim }}
+      to {{ _wal_archiver.last_archived_time | default('unknown (WAL archiver not reporting)') }}.
+      Choose a time within this range.
+  when: pitr_source_cluster | default('') | length == 0
+
+- name: Display PITR warning
+  ansible.builtin.debug:
+    msg:
+      - "=========================================="
+      - "POINT-IN-TIME RECOVERY"
+      - "Cluster: {{ cluster_name }}"
+      - "Namespace: {{ aap_namespace }}"
+      - "Context: {{ target_context }}"
+      - "Target time: {{ pitr_target_time }}"
+      - "Recoverable window: {{ _first_recoverable.stdout | trim }} to {{ _wal_archiver.last_archived_time }}"
+      - ""
+      - "WARNING: This will hibernate the cluster and initiate recovery."
+      - "All current connections will be terminated."
+      - "=========================================="
+  when: pitr_source_cluster | default('') | length == 0
+
+- name: Display cross-cluster PITR warning
+  ansible.builtin.debug:
+    msg:
+      - "=========================================="
+      - "POINT-IN-TIME RECOVERY (CROSS-CLUSTER)"
+      - "Cluster: {{ cluster_name }}"
+      - "Namespace: {{ aap_namespace }}"
+      - "Context: {{ target_context }}"
+      - "Target time: {{ pitr_target_time }}"
+      - "Recovery source: {{ pitr_source_cluster }}"
+      - ""
+      - "WARNING: This will hibernate the cluster and initiate recovery"
+      - "from the remote cluster's WAL archive."
+      - "Recoverability window validation skipped (cross-cluster)."
+      - "All current connections will be terminated."
+      - "=========================================="
+  when: pitr_source_cluster | default('') | length > 0
+
+- name: Pause for confirmation (skip with -e pitr_confirm=true)
+  ansible.builtin.pause:
+    prompt: "Press Enter to proceed with PITR, or Ctrl+C to abort"
+  when: not (pitr_confirm | default(false) | bool)
+
+# ── Destructive operations wrapped in block/rescue ─────────────
+- name: Execute PITR with cleanup on failure
+  block:
+    - name: Pause ArgoCD before PITR
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.aap_argocd_manage
+      vars:
+        argocd_action: pause
+        argocd_context: "{{ target_context }}"
+
+    - name: Idle AAP before PITR
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.aap_platform_lifecycle
+      vars:
+        lifecycle_action: idle
+        lifecycle_context: "{{ target_context }}"
+
+    - name: Initiate PITR recovery
+      aap.hadr_ops.cnpg_backup_manage:
+        namespace: "{{ aap_namespace }}"
+        cluster_name: "{{ cluster_name }}"
+        context: "{{ target_context }}"
+        oc_binary: "{{ oc_binary }}"
+        operation: restore_pitr
+        target_time: "{{ pitr_target_time }}"
+        recovery_source: "{{ pitr_source_cluster | default('') }}"
+      register: _pitr_result
+
+    - name: Set PITR result fact
+      ansible.builtin.set_fact:
+        cnpg_backup_result: "{{ _pitr_result }}"
+
+    - name: Display PITR hibernation result
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "PITR Recovery Initiated"
+          - "Target time: {{ _pitr_result.target_time }}"
+          - "Recovery source: {{ _pitr_result.recovery_source }}"
+          - "Duration: {{ _pitr_result.duration_seconds | round(1) }}s"
+          - "Removing hibernation and waiting for recovery..."
+          - "=========================================="
+
+    - name: Remove hibernation annotation to start recovery
+      ansible.builtin.command:
+        argv:
+          - "{{ oc_binary }}"
+          - "--context={{ target_context }}"
+          - "annotate"
+          - "cluster"
+          - "{{ cluster_name }}"
+          - "-n"
+          - "{{ aap_namespace }}"
+          - "cnpg.io/hibernation-"
+      changed_when: true
+
+    - name: Wait for CNPG cluster to become healthy after PITR
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.cnpg_health_check
+      vars:
+        health_check_context: "{{ target_context }}"
+        health_mode: wait
+
+    - name: Get primary pod after recovery
+      ansible.builtin.set_fact:
+        _pitr_primary_pod: "{{ _cnpg_info.cluster_info.status.currentPrimary }}"
+
+    - name: Validate PITR recovery occurred
+      ansible.builtin.command:
+        argv:
+          - "{{ oc_binary }}"
+          - "--context={{ target_context }}"
+          - "exec"
+          - "-n"
+          - "{{ aap_namespace }}"
+          - "{{ _pitr_primary_pod }}"
+          - "--"
+          - "psql"
+          - "-U"
+          - "postgres"
+          - "-tAc"
+          - >-
+            SELECT json_build_object(
+              'pg_start_time', pg_postmaster_start_time(),
+              'in_recovery', pg_is_in_recovery(),
+              'timeline', (SELECT timeline_id FROM pg_control_checkpoint()),
+              'last_xact_time', (SELECT pg_last_xact_replay_timestamp())
+            )
+      register: _pitr_validation_raw
+      changed_when: false
+
+    - name: Parse PITR validation
+      ansible.builtin.set_fact:
+        _pitr_validation: "{{ _pitr_validation_raw.stdout | from_json }}"
+
+    - name: Display PITR validation
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "PITR Validation"
+          - "  Target time:     {{ pitr_target_time }}"
+          - "  PG start time:   {{ _pitr_validation.pg_start_time }}"
+          - "  Last replay:     {{ _pitr_validation.last_xact_time | default('N/A') }}"
+          - "  Timeline:        {{ _pitr_validation.timeline }}"
+          - "  In recovery:     {{ _pitr_validation.in_recovery }}"
+          - "=========================================="
+
+    - name: Activate AAP after PITR
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.aap_platform_lifecycle
+      vars:
+        lifecycle_action: activate
+        lifecycle_context: "{{ target_context }}"
+
+    - name: Resume ArgoCD after PITR
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.aap_argocd_manage
+      vars:
+        argocd_action: resume
+        argocd_context: "{{ target_context }}"
+        argocd_trigger_sync: true
+
+    - name: Display PITR primary recovery complete
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "PITR Recovery Complete on {{ target_site_id }}"
+          - "Target time: {{ _pitr_result.target_time }}"
+          - "Recovery source: {{ _pitr_result.recovery_source }}"
+          - "Restoring replication on replica cluster..."
+          - "=========================================="
+
+    - name: Set context mapping for restore replication
+      ansible.builtin.set_fact:
+        _site_to_context: >-
+          {{ { site_id_a: cluster_a_context,
+               site_id_b: cluster_b_context } }}
+
+    - name: Restore replication after PITR
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.cnpg_restore_replication
+      vars:
+        target_primary: "{{ target_site_id }}"
+
+    - name: Display PITR + replication complete
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "PITR + Replication Restore Complete"
+          - "Primary: {{ target_site_id }} (restored to {{ _pitr_result.target_time }})"
+          - "Replica: re-bootstrapped to follow new timeline"
+          - "CNPG phase: {{ cnpg_switchover_result.cnpg_phase | default('unknown') }}"
+          - "Streaming replicas: {{ cnpg_switchover_result.streaming_replicas | default('0') }}"
+          - "Re-bootstrapped: {{ cnpg_switchover_result.re_bootstrapped | default(false) }}"
+          - ""
+          - "REMAINING:"
+          - "  1. Verify data integrity on primary"
+          - "=========================================="
+
+  rescue:
+    - name: "RESCUE: Log PITR failure"
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "PITR FAILED — running cleanup"
+          - "Removing hibernation, activating AAP, resuming ArgoCD"
+          - "=========================================="
+
+    - name: "RESCUE: Remove hibernation annotation"
+      ansible.builtin.command:
+        argv:
+          - "{{ oc_binary }}"
+          - "--context={{ target_context }}"
+          - "annotate"
+          - "cluster"
+          - "{{ cluster_name }}"
+          - "-n"
+          - "{{ aap_namespace }}"
+          - "cnpg.io/hibernation-"
+          - "--overwrite"
+      changed_when: true
+      ignore_errors: true
+
+    - name: "RESCUE: Activate AAP"
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.aap_platform_lifecycle
+      vars:
+        lifecycle_action: activate
+        lifecycle_context: "{{ target_context }}"
+      ignore_errors: true
+
+    - name: "RESCUE: Resume ArgoCD"
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.aap_argocd_manage
+      vars:
+        argocd_action: resume
+        argocd_context: "{{ target_context }}"
+        argocd_trigger_sync: true
+      ignore_errors: true
+
+    - name: "RESCUE: Fail with original error"
+      ansible.builtin.fail:
+        msg: "PITR failed — cleanup completed. Check logs for the original error above."

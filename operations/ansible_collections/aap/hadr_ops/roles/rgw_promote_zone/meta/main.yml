@@ -1,0 +1,21 @@
+---
+galaxy_info:
+  author: AAP HA/DR Testing Team
+  description: Promote a surviving Ceph RGW zone to standalone realm master after a DR event
+  company: Red Hat
+  license: Apache-2.0
+  min_ansible_version: "2.9"
+  platforms:
+    - name: EL
+      versions:
+        - all
+  galaxy_tags:
+    - hadr
+    - ceph
+    - rook
+    - rgw
+    - multisite
+    - disaster_recovery
+    - ansible_automation_platform
+
+dependencies: []

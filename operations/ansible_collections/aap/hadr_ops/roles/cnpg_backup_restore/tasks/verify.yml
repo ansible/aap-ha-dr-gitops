@@ -1,0 +1,106 @@
+---
+# Verify backup catalog health: WAL archiver, recent backups, backup integrity.
+
+- name: Check WAL archiver health
+  ansible.builtin.include_tasks: _check_wal_archiver.yml
+
+- name: List all backups for verification
+  aap.hadr_ops.cnpg_backup_manage:
+    namespace: "{{ aap_namespace }}"
+    cluster_name: "{{ cluster_name }}"
+    context: "{{ target_context }}"
+    oc_binary: "{{ oc_binary }}"
+    operation: list
+  register: _backup_list
+
+- name: Verify at least one completed backup exists
+  ansible.builtin.assert:
+    that:
+      - _backup_list.backups | selectattr('phase', 'equalto', 'completed') | list | length > 0
+    fail_msg: "No completed backups found for cluster {{ cluster_name }}"
+
+- name: Get most recent completed backup details
+  aap.hadr_ops.cnpg_backup_manage:
+    namespace: "{{ aap_namespace }}"
+    cluster_name: "{{ cluster_name }}"
+    context: "{{ target_context }}"
+    oc_binary: "{{ oc_binary }}"
+    operation: status
+    backup_name: "{{ (_backup_list.backups | selectattr('phase', 'equalto', 'completed') | list | first).name }}"
+  register: _latest_backup
+
+- name: Get cluster recoverability point
+  ansible.builtin.command:
+    argv:
+      - "{{ oc_binary }}"
+      - "--context={{ target_context }}"
+      - "get"
+      - "cluster"
+      - "{{ cluster_name }}"
+      - "-n"
+      - "{{ aap_namespace }}"
+      - "-o"
+      - "jsonpath={.status.firstRecoverabilityPoint}"
+  register: _first_recoverable
+  changed_when: false
+  ignore_errors: true
+
+- name: Get recovery and timeline info
+  ansible.builtin.command:
+    argv:
+      - "{{ oc_binary }}"
+      - "--context={{ target_context }}"
+      - "exec"
+      - "-n"
+      - "{{ aap_namespace }}"
+      - "{{ _cnpg_info.cluster_info.status.currentPrimary }}"
+      - "--"
+      - "psql"
+      - "-U"
+      - "postgres"
+      - "-tAc"
+      - >-
+        SELECT json_build_object(
+          'timeline', (SELECT timeline_id FROM pg_control_checkpoint()),
+          'last_xact_replay', pg_last_xact_replay_timestamp(),
+          'pg_start_time', pg_postmaster_start_time(),
+          'first_recoverable', '{{ _first_recoverable.stdout | default("unknown") }}'
+        )
+  register: _recovery_info_raw
+  changed_when: false
+  ignore_errors: true
+
+- name: Parse recovery info
+  ansible.builtin.set_fact:
+    _recovery_info: "{{ _recovery_info_raw.stdout | default('{}') | from_json }}"
+  when: _recovery_info_raw is succeeded
+  ignore_errors: true
+
+- name: Set verification result fact
+  ansible.builtin.set_fact:
+    cnpg_backup_result:
+      operation: verify
+      wal_archiver_healthy: "{{ _wal_archiver_healthy | default(true) }}"
+      total_backups: "{{ _backup_list.backups | length }}"
+      completed_backups: "{{ _backup_list.backups | selectattr('phase', 'equalto', 'completed') | list | length }}"
+      failed_backups: "{{ _backup_list.backups | selectattr('phase', 'equalto', 'failed') | list | length }}"
+      latest_backup: "{{ _latest_backup.backup_details | default({}) }}"
+      latest_backup_name: "{{ _latest_backup.backup_name }}"
+      recovery_info: "{{ _recovery_info | default({}) }}"
+      message: "Backup catalog verification complete"
+
+- name: Display verification summary
+  ansible.builtin.debug:
+    msg:
+      - "=========================================="
+      - "Backup Catalog Verification"
+      - "WAL archiver healthy: {{ cnpg_backup_result.wal_archiver_healthy }}"
+      - "Total backups: {{ cnpg_backup_result.total_backups }}"
+      - "Completed: {{ cnpg_backup_result.completed_backups }}"
+      - "Failed: {{ cnpg_backup_result.failed_backups }}"
+      - "Latest backup: {{ cnpg_backup_result.latest_backup_name }}"
+      - "Recoverable from: {{ _recovery_info.first_recoverable | default('unknown') }}"
+      - "WAL timeline: {{ _recovery_info.timeline | default('unknown') }}"
+      - "Last PITR replay: {{ _recovery_info.last_xact_replay | default('none (no PITR performed)') }}"
+      - "PG start time: {{ _recovery_info.pg_start_time | default('unknown') }}"
+      - "=========================================="

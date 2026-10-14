@@ -1,0 +1,6 @@
+# Generated sanitized deployment snapshot.
+apiVersion: user.openshift.io/v1
+kind: Group
+metadata:
+  name: aap-hadr-example-admins
+users: []

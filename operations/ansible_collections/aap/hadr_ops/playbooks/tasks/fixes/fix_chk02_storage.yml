@@ -1,0 +1,61 @@
+---
+# Fix CHK-02: Storage — attempt WAL segment cleanup for disk space.
+# Only partially fixable: can free disk space but cannot fix unbound PVCs
+# or missing CSI drivers.
+#
+# Input: _check_key, _check_name, _check_detail
+# Output: _fix_result, _fix_detail
+
+- name: "FIX {{ _check_name }}: Check if disk space issue"
+  ansible.builtin.set_fact:
+    _chk02_disk_issue: "{{ 'disk usage' in (_check_detail | lower) or 'capacity' in (_check_detail | lower) }}"
+
+- name: "FIX {{ _check_name }}: Skip — infrastructure issue not auto-fixable"
+  when: not (_chk02_disk_issue | bool)
+  ansible.builtin.set_fact:
+    _fix_result: "skipped"
+    _fix_detail: "Storage issue (PVC/CSI) requires manual intervention"
+
+- name: "FIX {{ _check_name }}: Find CNPG primary pod"
+  when: _chk02_disk_issue | bool
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ aap_namespace | default('aap') }}"
+    context: "{{ cluster_a_context }}"
+    label_selectors:
+      - "cnpg.io/cluster={{ cluster_name }}"
+      - "role=primary"
+  register: _cnpg_primary_pods
+  failed_when: false
+
+- name: "FIX {{ _check_name }}: Attempt WAL cleanup on primary"
+  when:
+    - _chk02_disk_issue | bool
+    - _cnpg_primary_pods.resources | default([]) | length > 0
+  block:
+    - name: "FIX {{ _check_name }}: Switch WAL segment on primary"
+      kubernetes.core.k8s_exec:
+        pod: "{{ _cnpg_primary_pods.resources[0].metadata.name }}"
+        namespace: "{{ aap_namespace | default('aap') }}"
+        context: "{{ cluster_a_context }}"
+        command: psql -U postgres -c "SELECT pg_switch_wal();"
+      failed_when: false
+
+    - name: "FIX {{ _check_name }}: Record result"
+      ansible.builtin.set_fact:
+        _fix_result: "pending"
+        _fix_detail: "Triggered WAL segment rotation to free disk space"
+  rescue:
+    - name: "FIX {{ _check_name }}: Cleanup failed"
+      ansible.builtin.set_fact:
+        _fix_result: "failed"
+        _fix_detail: "WAL cleanup attempt failed"
+
+- name: "FIX {{ _check_name }}: No primary pod found"
+  when:
+    - _chk02_disk_issue | bool
+    - _cnpg_primary_pods.resources | default([]) | length == 0
+  ansible.builtin.set_fact:
+    _fix_result: "failed"
+    _fix_detail: "Could not find CNPG primary pod for WAL cleanup"

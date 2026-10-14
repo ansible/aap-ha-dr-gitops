@@ -1,0 +1,18 @@
+apiVersion: aap.ansible.com/v1alpha1
+kind: AnsibleAutomationPlatform
+metadata:
+  name: aap
+spec:
+  hub:
+    api:
+      resource_requirements:
+        requests: {cpu: "500m", memory: "2Gi"}
+        limits: {cpu: "2", memory: "4Gi"}
+    content:
+      resource_requirements:
+        requests: {cpu: "500m", memory: "2Gi"}
+        limits: {cpu: "2", memory: "4Gi"}
+    web:
+      resource_requirements:
+        requests: {cpu: "200m", memory: "1Gi"}
+        limits: {cpu: "1", memory: "2Gi"}

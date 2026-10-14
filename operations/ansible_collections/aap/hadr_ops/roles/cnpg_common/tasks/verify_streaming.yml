@@ -1,0 +1,49 @@
+---
+# Check streaming replication count from the primary pod.
+#
+# Required variables:
+#   _streaming_context:     Kubernetes context of the primary cluster
+#
+# Optional variables:
+#   _streaming_kubeconfig:  Path to kubeconfig (default: omitted)
+#   _streaming_retries:     Number of retries (default: 30)
+#   _streaming_delay:       Seconds between retries (default: 10)
+#
+# Output variables:
+#   _streaming_count:       Number of streaming replicas (int)
+
+- name: "verify_streaming | Find primary pod"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ aap_namespace }}"
+    label_selectors:
+      - "cnpg.io/cluster={{ cluster_name }}"
+      - "cnpg.io/instanceRole=primary"
+    field_selectors:
+      - status.phase=Running
+    context: "{{ _streaming_context }}"
+    kubeconfig: "{{ _streaming_kubeconfig | default(omit) }}"
+  register: _streaming_pod_list
+
+- name: "verify_streaming | Set primary pod name"
+  ansible.builtin.set_fact:
+    _streaming_pod: "{{ (_streaming_pod_list.resources | default([]) | first | default({})).metadata.name | default('') }}"
+
+- name: "verify_streaming | Query pg_stat_replication"
+  kubernetes.core.k8s_exec:
+    namespace: "{{ aap_namespace }}"
+    pod: "{{ _streaming_pod }}"
+    command: "/bin/sh -c \"psql -U postgres -t -c \\\"SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming';\\\"\""
+    context: "{{ _streaming_context }}"
+    kubeconfig: "{{ _streaming_kubeconfig | default(omit) }}"
+  register: _streaming_result
+  until: (_streaming_result.stdout | default('0') | trim | int) >= 1
+  retries: "{{ _streaming_retries | default(30) }}"
+  delay: "{{ _streaming_delay | default(10) }}"
+  ignore_errors: true
+  when: _streaming_pod | length > 0
+
+- name: "verify_streaming | Set count fact"
+  ansible.builtin.set_fact:
+    _streaming_count: "{{ _streaming_result.stdout | default('0') | trim | int if (_streaming_pod | default('') | length > 0) else 0 }}"

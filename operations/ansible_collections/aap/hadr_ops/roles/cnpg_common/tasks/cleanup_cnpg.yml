@@ -1,0 +1,81 @@
+---
+# Clean up CNPG resources on a cluster: force-delete pods, delete PVCs,
+# and optionally restart the CNPG operator.
+#
+# Required variables:
+#   _cleanup_context:           Kubernetes context name
+#
+# Optional variables:
+#   _cleanup_kubeconfig:        Path to kubeconfig (default: omitted)
+#   _cleanup_force_pods:        Force-delete CNPG pods (default: true)
+#   _cleanup_delete_pvcs:       Delete CNPG PVCs (default: true)
+#   _cleanup_restart_operator:  Restart cnpg-controller-manager (default: true)
+#
+# Output variables:
+#   _cleanup_done:              Set to true when cleanup completes
+
+- name: "cleanup_cnpg | Force-delete CNPG pods"
+  kubernetes.core.k8s:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ aap_namespace }}"
+    label_selectors:
+      - "cnpg.io/cluster={{ cluster_name }}"
+    context: "{{ _cleanup_context }}"
+    kubeconfig: "{{ _cleanup_kubeconfig | default(omit) }}"
+    state: absent
+    force: true
+    grace_period: 0
+  ignore_errors: true
+  when: _cleanup_force_pods | default(true) | bool
+
+- name: "cleanup_cnpg | Delete CNPG PVCs"
+  kubernetes.core.k8s:
+    api_version: v1
+    kind: PersistentVolumeClaim
+    namespace: "{{ aap_namespace }}"
+    label_selectors:
+      - "cnpg.io/cluster={{ cluster_name }}"
+    context: "{{ _cleanup_context }}"
+    kubeconfig: "{{ _cleanup_kubeconfig | default(omit) }}"
+    state: absent
+    wait: false
+  ignore_errors: true
+  when: _cleanup_delete_pvcs | default(true) | bool
+
+- name: "cleanup_cnpg | Restart CNPG operator"
+  kubernetes.core.k8s:
+    api_version: apps/v1
+    kind: Deployment
+    name: cnpg-controller-manager
+    namespace: "{{ aap_namespace }}"
+    context: "{{ _cleanup_context }}"
+    kubeconfig: "{{ _cleanup_kubeconfig | default(omit) }}"
+    definition:
+      spec:
+        template:
+          metadata:
+            annotations:
+              kubectl.kubernetes.io/restartedAt: "{{ ansible_facts.date_time.iso8601 }}"
+  when: _cleanup_restart_operator | default(true) | bool
+
+- name: "cleanup_cnpg | Wait for CNPG operator to be ready"
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: Deployment
+    name: cnpg-controller-manager
+    namespace: "{{ aap_namespace }}"
+    context: "{{ _cleanup_context }}"
+    kubeconfig: "{{ _cleanup_kubeconfig | default(omit) }}"
+  register: _cleanup_operator
+  until: >
+    _cleanup_operator.resources | length > 0 and
+    (_cleanup_operator.resources[0].status.readyReplicas | default(0) | int) >=
+    (_cleanup_operator.resources[0].spec.replicas | default(1) | int)
+  retries: 12
+  delay: 5
+  when: _cleanup_restart_operator | default(true) | bool
+
+- name: "cleanup_cnpg | Set completion fact"
+  ansible.builtin.set_fact:
+    _cleanup_done: true

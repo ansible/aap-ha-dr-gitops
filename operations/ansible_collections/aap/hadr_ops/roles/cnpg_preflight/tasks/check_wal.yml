@@ -1,0 +1,103 @@
+---
+# Validate WAL timelines and archiver health between two clusters
+#
+# Call this AFTER running main.yml for both clusters individually.
+# Requires both clusters to be healthy (skips if either is failed).
+#
+# Input:
+#   primary_context   — K8s context of the current primary
+#   replica_context   — K8s context of the current replica
+#   primary_site_id   — site ID of the primary (for logging)
+#   replica_site_id   — site ID of the replica (for logging)
+#   aap_namespace, cluster_name
+#
+# Output (set_fact):
+#   wal_check_result — dict with:
+#     primary_timeline, replica_timeline
+#     timelines_match: boolean
+#     wal_archive_healthy: boolean
+#     status: "ready" | "diverged" | "archiver_broken"
+#     error: description if not ready
+
+- name: Get WAL timeline on current primary
+  ansible.builtin.include_role:
+    name: aap.hadr_ops.cnpg_common
+    tasks_from: psql_query.yml
+  vars:
+    _query_context: "{{ primary_context }}"
+    _query_labels: "cnpg.io/cluster={{ cluster_name }},cnpg.io/instanceRole=primary"
+    _query: "SELECT timeline_id FROM pg_control_checkpoint();"
+
+- name: Save primary WAL timeline
+  ansible.builtin.set_fact:
+    _wal_primary_timeline: "{{ _query_result.stdout | trim | int }}"
+
+- name: Get WAL timeline on replica
+  ansible.builtin.include_role:
+    name: aap.hadr_ops.cnpg_common
+    tasks_from: pg_controldata_timeline.yml
+  vars:
+    _timeline_context: "{{ replica_context }}"
+    _timeline_labels: "cnpg.io/cluster={{ cluster_name }}"
+
+- name: Save replica WAL timeline
+  ansible.builtin.set_fact:
+    _wal_replica_timeline: "{{ _timeline_value | int }}"
+
+- name: Check WAL archiver health on primary
+  ansible.builtin.include_role:
+    name: aap.hadr_ops.cnpg_common
+    tasks_from: psql_query.yml
+  vars:
+    _query_context: "{{ primary_context }}"
+    _query_labels: "cnpg.io/cluster={{ cluster_name }},cnpg.io/instanceRole=primary"
+    _query: >-
+      SELECT row_to_json(a) FROM (
+        SELECT archived_count, failed_count,
+               last_archived_time, last_failed_time,
+               last_failed_wal
+        FROM pg_stat_archiver
+      ) a;
+
+- name: Parse WAL archiver data
+  ansible.builtin.set_fact:
+    _wal_archiver: "{{ _query_result.stdout | trim | from_json }}"
+
+- name: Evaluate WAL archiver health
+  ansible.builtin.set_fact:
+    _wal_archiver_healthy: >-
+      {{ (_wal_archiver.failed_count | int == 0) or
+         (_wal_archiver.last_archived_time is not none and
+          _wal_archiver.last_archived_time > (_wal_archiver.last_failed_time | default(''))) }}
+
+- name: Build WAL check result
+  ansible.builtin.set_fact:
+    wal_check_result:
+      primary_timeline: "{{ _wal_primary_timeline }}"
+      replica_timeline: "{{ _wal_replica_timeline }}"
+      timelines_match: "{{ _wal_primary_timeline == _wal_replica_timeline }}"
+      wal_archive_healthy: "{{ _wal_archiver_healthy }}"
+      archiver:
+        archived_count: "{{ _wal_archiver.archived_count }}"
+        failed_count: "{{ _wal_archiver.failed_count }}"
+        last_archived_time: "{{ _wal_archiver.last_archived_time | default('never') }}"
+        last_failed_time: "{{ _wal_archiver.last_failed_time | default('never') }}"
+        last_failed_wal: "{{ _wal_archiver.last_failed_wal | default('none') }}"
+      status: >-
+        {% if _wal_primary_timeline != _wal_replica_timeline %}diverged
+        {% elif not (_wal_archiver_healthy | bool) %}archiver_broken
+        {% else %}ready{% endif %}
+      error: >-
+        {% if _wal_primary_timeline != _wal_replica_timeline %}WAL timelines diverged (primary={{ _wal_primary_timeline }}, replica={{ _wal_replica_timeline }})
+        {% elif not (_wal_archiver_healthy | bool) %}WAL archiver failing on primary (failed_count={{ _wal_archiver.failed_count }})
+        {% else %}{% endif %}
+
+- name: Log WAL check result
+  ansible.builtin.debug:
+    msg:
+      - "WAL Check: {{ primary_site_id | default(primary_context) }} → {{ replica_site_id | default(replica_context) }}"
+      - "  Primary timeline: {{ wal_check_result.primary_timeline }}"
+      - "  Replica timeline: {{ wal_check_result.replica_timeline }}"
+      - "  Timelines match:  {{ wal_check_result.timelines_match }}"
+      - "  Archiver healthy: {{ wal_check_result.wal_archive_healthy }}"
+      - "  Status:           {{ wal_check_result.status | trim }}"

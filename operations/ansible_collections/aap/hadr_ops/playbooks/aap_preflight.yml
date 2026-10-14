@@ -1,0 +1,234 @@
+---
+# AAP Preflight Checks
+#
+# Standalone playbook that validates environment health before any
+# switchover or DR operation. Can also be imported by the switchover/DR
+# playbooks to gate execution.
+#
+# When no 'mode' parameter is provided, auto-detects the situation by
+# probing both clusters:
+#   - Both reachable → full assessment (graceful_switchover readiness)
+#   - Only one reachable → DR mode (evaluate surviving cluster)
+#   - Neither reachable → abort
+#
+# Usage (from the example repository root):
+#   ansible-playbook operations/ansible_collections/aap/hadr_ops/playbooks/aap_preflight.yml \
+#     -e @my-deployment/operations/clusters.yml
+#   ansible-playbook operations/ansible_collections/aap/hadr_ops/playbooks/aap_preflight.yml \
+#     -e @my-deployment/operations/clusters.yml -e mode=graceful_switchover
+#   ansible-playbook operations/ansible_collections/aap/hadr_ops/playbooks/aap_preflight.yml \
+#     -e @my-deployment/operations/clusters.yml -e mode=disaster_recovery -e target_primary=site-b
+#   ansible-playbook operations/ansible_collections/aap/hadr_ops/playbooks/aap_preflight.yml \
+#     -e @my-deployment/operations/clusters.yml -e preflight_debug=true -e cluster_set=02
+#
+# Requires: cluster topology via -e @<clusters file> (see the generated <deployment>/operations/clusters.yml)
+#
+# Variables:
+#   cluster_set: "01" (default) or "02"
+#   mode: "auto" (default) | "graceful_switchover" | "disaster_recovery" | "restore_replication"
+#   autofix: false (default) - if true, the playbook will attempt to fix issues found by calling relevant playbooks
+#   target_primary: site_id of intended primary (required for DR/restore)
+#   skip_checks: comma-separated list of checks to skip (e.g. "chk08,chk10")
+#   preflight_debug: false (default) — if true, log failures but don't abort
+#
+# Output (set_fact):
+#   preflight_decision — dict with action, reason, mode, checks summary
+
+- name: AAP Preflight Checks
+  hosts: localhost
+  gather_facts: true
+  vars:
+    # Preflight configuration
+    mode: "auto"
+    autofix: false
+    target_primary: ""
+    skip_checks: ""
+    preflight_debug: false
+
+    # Autofix configuration
+    autofix_max_retries: 2
+    autofix_retry_delay: 30
+    autofix_confirm: "no"
+
+    # Prometheus metrics
+    prometheus_pushgateway_url: ""
+    prometheus_preflight_job: "hadr_preflight"
+
+    # Autofix registry — maps each check to its fix task and recheck task
+    _autofix_registry:
+      chk01_connectivity:
+        fixable: false
+        reason: "Infrastructure — cannot autofix network connectivity"
+      chk02_storage:
+        fixable: true
+        fix_task: "fixes/fix_chk02_storage.yml"
+        recheck_task: "chk02_storage.yml"
+      chk03_cluster_health:
+        fixable: true
+        fix_task: "fixes/fix_chk03_health.yml"
+        recheck_task: "chk03_cluster_health.yml"
+      chk04_failover_loop:
+        fixable: true
+        fix_task: "fixes/fix_chk04_wait.yml"
+        recheck_task: "chk04_failover_loop.yml"
+      chk05_split_brain:
+        fixable: true
+        fix_task: "fixes/fix_chk05_split_brain.yml"
+        recheck_task: "chk05_split_brain.yml"
+      chk06_wal_timeline:
+        fixable: true
+        fix_task: "fixes/fix_chk06_wal.yml"
+        recheck_task: "chk06_08_wal.yml"
+      chk07_replication_slot:
+        fixable: true
+        fix_task: "fixes/fix_chk07_slot.yml"
+        recheck_task: "chk06_08_wal.yml"
+      chk08_wal_archiver:
+        fixable: true
+        fix_task: "fixes/fix_chk08_archiver.yml"
+        recheck_task: "chk06_08_wal.yml"
+      chk09_replication_lag:
+        fixable: true
+        fix_task: "fixes/fix_chk09_replication.yml"
+        recheck_task: "chk09_replication_lag.yml"
+      chk10_convergence:
+        fixable: true
+        fix_task: "fixes/fix_chk10_convergence.yml"
+        recheck_task: "chk10_convergence.yml"
+      chk11_aap_topology:
+        fixable: true
+        fix_task: "fixes/fix_chk11_topology.yml"
+        recheck_task: "chk11_topology.yml"
+      chk12_olm_csv:
+        fixable: true
+        fix_task: "fixes/fix_chk12_olm.yml"
+        recheck_task: "chk12_olm_csv.yml"
+      chk13_promotion_token:
+        fixable: true
+        fix_task: "fixes/fix_chk13_token.yml"
+        recheck_task: "chk13_promotion_token.yml"
+      chk14_argocd:
+        fixable: true
+        fix_task: "fixes/fix_chk14_argocd.yml"
+        recheck_task: "chk14_argocd.yml"
+      chk15_chaos_artifacts:
+        fixable: true
+        fix_task: "fixes/fix_chk15_chaos.yml"
+        recheck_task: "chk15_chaos_artifacts.yml"
+      chk16_api_liveness:
+        fixable: true
+        fix_task: "fixes/fix_chk16_zombie_pods.yml"
+        recheck_task: "chk16_api_liveness.yml"
+      chk17_migration_state:
+        fixable: false
+        reason: "A stale migration job requires manual AAP CR recreation"
+    # Thresholds
+    preflight_pvc_warn_threshold: 80
+    preflight_pvc_abort_threshold: 90
+    preflight_failover_event_window: 30
+    preflight_failover_warn_threshold: 3
+    preflight_failover_abort_threshold: 5
+    preflight_lag_proceed_threshold: 5
+    preflight_lag_abort_threshold: 60
+    preflight_convergence_sample_interval: 10
+
+  tasks:
+    - name: Load and validate configuration
+      ansible.builtin.import_role:
+        name: aap.hadr_ops.config_loader
+
+    # ── Banner ──────────────────────────────────────────────────────
+    - name: Display preflight parameters
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "AAP Preflight Checks"
+          - "Cluster Set: {{ cluster_set }}"
+          - "Mode: {{ mode }}"
+          - "Auto-fix: {{ autofix }}"
+          - "Debug: {{ preflight_debug }}"
+          - "Cluster-A: {{ cluster_a_context }} ({{ site_id_a }})"
+          - "Cluster-B: {{ cluster_b_context }} ({{ site_id_b }})"
+          - "Target Primary: {{ target_primary | default('auto-detect') }}"
+          - "Skip Checks: {{ skip_checks | default('none') }}"
+          - "=========================================="
+
+    - name: Initialize preflight results
+      ansible.builtin.set_fact:
+        _preflight_checks: {}
+        _autofix_stats:
+          fixes_attempted: 0
+          fixes_succeeded: 0
+          fixes_failed: 0
+          checks_unfixable: 0
+
+    # ════════════════════════════════════════════════════════════════
+    # GROUP 1: INFRASTRUCTURE
+    # ════════════════════════════════════════════════════════════════
+
+    - name: "CHK-01: Network Connectivity"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/chk01_connectivity.yml"
+
+    - name: "CHK-02: Storage Infrastructure"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/chk02_storage.yml"
+
+    # ════════════════════════════════════════════════════════════════
+    # GROUP 2: CNPG / DATABASE
+    # ════════════════════════════════════════════════════════════════
+
+    - name: "CHK-03: Cluster Health"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/chk03_cluster_health.yml"
+
+    - name: "CHK-04: Failover Loop Detection"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/chk04_failover_loop.yml"
+
+    - name: "CHK-05: Split-Brain Detection"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/chk05_split_brain.yml"
+
+    - name: "CHK-06/07/08: WAL Timeline, Replication Slot, Archiver"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/chk06_08_wal.yml"
+
+    - name: "CHK-09: Replication Lag"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/chk09_replication_lag.yml"
+
+    - name: "CHK-10: Recovery Convergence"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/chk10_convergence.yml"
+
+    # ════════════════════════════════════════════════════════════════
+    # GROUP 3: AAP PLATFORM
+    # ════════════════════════════════════════════════════════════════
+
+    - name: "Platform Checks: Collect results"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/platform_probe.yml"
+
+    - name: "CHK-11: AAP Topology"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/chk11_topology.yml"
+
+    - name: "CHK-12: OLM/CSV Health"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/chk12_olm_csv.yml"
+
+    - name: "CHK-13: Promotion Token"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/chk13_promotion_token.yml"
+
+    - name: "CHK-14: ArgoCD State"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/chk14_argocd.yml"
+
+    - name: "CHK-15: Chaos Artifacts"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/chk15_chaos_artifacts.yml"
+
+    - name: "CHK-16: API Liveness"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/chk16_api_liveness.yml"
+
+    - name: "CHK-17: Migration State"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/chk17_migration_state.yml"
+
+    - name: "CHK-18: Expected Recovery Time"
+      ansible.builtin.debug:
+        msg: "Expected full recovery time is approximately 10 minutes"
+
+    # ════════════════════════════════════════════════════════════════
+    # PREFLIGHT SUMMARY
+    # ════════════════════════════════════════════════════════════════
+
+    - name: "Preflight Summary"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/summary.yml"

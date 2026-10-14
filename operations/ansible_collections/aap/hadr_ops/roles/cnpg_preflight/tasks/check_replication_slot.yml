@@ -1,0 +1,93 @@
+---
+# Check replication slot status on the primary cluster
+#
+# Verifies that streaming replication slots exist and are active.
+# Without an active slot, WAL segments may be recycled before the
+# replica can consume them — causing irrecoverable replication lag.
+#
+# Input:
+#   preflight_context — K8s context of the PRIMARY cluster
+#   aap_namespace, cluster_name
+#
+# Output (set_fact):
+#   replication_slot_result — dict with status, slots, detail
+
+- name: Validate preflight_context is set
+  ansible.builtin.fail:
+    msg: "preflight_context must be set"
+  when: preflight_context | default('') == ''
+
+- name: Query pg_replication_slots on primary
+  block:
+    - name: Execute replication slot query
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.cnpg_common
+        tasks_from: psql_query.yml
+      vars:
+        _query_context: "{{ preflight_context }}"
+        _query_labels: "cnpg.io/cluster={{ cluster_name }},cnpg.io/instanceRole=primary"
+        _query: >-
+          SELECT row_to_json(s) FROM (
+            SELECT slot_name, active, restart_lsn, slot_type
+            FROM pg_replication_slots
+            WHERE slot_type = 'physical'
+          ) s;
+  rescue:
+    - name: Handle query failure gracefully
+      ansible.builtin.set_fact:
+        _query_result:
+          stdout: ""
+          stderr: "Query failed"
+          return_code: 1
+
+- name: Evaluate replication slot result
+  vars:
+    _query_ok: "{{ (_query_result.return_code | default(1) | int == 0) }}"
+    _raw_output: "{{ _query_result.stdout | default('') | trim }}"
+    _has_slots: "{{ _raw_output | length > 2 }}"
+  ansible.builtin.set_fact:
+    _rs_query_ok: "{{ _query_ok }}"
+    _rs_has_slots: "{{ _has_slots }}"
+    _rs_raw: "{{ _raw_output }}"
+
+- name: Parse slot data
+  when: _rs_query_ok | bool and _rs_has_slots | bool
+  ansible.builtin.set_fact:
+    _rs_slot: "{{ _rs_raw if (_rs_raw is mapping) else (_rs_raw | from_json) }}"
+
+- name: Set slot defaults when no data
+  when: not (_rs_query_ok | bool and _rs_has_slots | bool)
+  ansible.builtin.set_fact:
+    _rs_slot:
+      slot_name: ""
+      active: false
+      restart_lsn: null
+      slot_type: ""
+
+- name: Build replication slot result
+  ansible.builtin.set_fact:
+    replication_slot_result:
+      context: "{{ preflight_context }}"
+      status: >-
+        {% if not (_rs_query_ok | bool) %}fail
+        {% elif not (_rs_has_slots | bool) %}fail
+        {% elif (_rs_slot.active | default(false) | bool) %}pass
+        {% else %}fail{% endif %}
+      slot_name: "{{ _rs_slot.slot_name | default('none') }}"
+      active: "{{ _rs_slot.active | default(false) }}"
+      restart_lsn: "{{ _rs_slot.restart_lsn | default('null') }}"
+      detail: >-
+        {% if not (_rs_query_ok | bool) %}Cannot query replication slots on primary
+        {% elif not (_rs_has_slots | bool) %}No physical replication slot found — Cannot proceed, replication needs re-setup
+        {% elif (_rs_slot.active | default(false) | bool) %}Slot '{{ _rs_slot.slot_name }}' active, restart_lsn={{ _rs_slot.restart_lsn }}
+        {% else %}Slot '{{ _rs_slot.slot_name }}' INACTIVE — replica likely disconnected{% endif %}
+
+- name: Log replication slot result
+  ansible.builtin.debug:
+    msg:
+      - "Replication Slot Check: {{ preflight_context }}"
+      - "  Status:      {{ replication_slot_result.status | trim }}"
+      - "  Slot:        {{ replication_slot_result.slot_name }}"
+      - "  Active:      {{ replication_slot_result.active }}"
+      - "  Restart LSN: {{ replication_slot_result.restart_lsn }}"
+      - "  Detail:      {{ replication_slot_result.detail | trim }}"

@@ -1,0 +1,172 @@
+---
+# CloudNativePG PostgreSQL Cluster for AAP Plus (Production-Ready)
+# 3-node cluster with streaming replication and automatic failover
+# Based on best practices from: https://example.invalid/blog/post/2026-01-21-cloudnativepg-cluster-creation/view
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: aap-postgres
+  namespace: aap
+  labels:
+    cnpg.io/cluster: aap-postgres
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+spec:
+  # 3 instances = 1 primary + 2 replicas with streaming replication
+  instances: 3
+
+  # PostgreSQL version - AAP 2.7 requires 14+
+  imageName: ghcr.io/cloudnative-pg/postgresql:15.10
+
+  # Primary data storage (each instance gets its own PVC). The storage class
+  # is supplied by each environment overlay.
+  storage:
+    size: 2Ti
+    storageClass: MUST_BE_SET_BY_OVERLAY
+
+  # Separate WAL storage for better I/O performance and recovery. The storage
+  # class is supplied by each environment overlay.
+  walStorage:
+    size: 200Gi
+    storageClass: MUST_BE_SET_BY_OVERLAY
+
+  # PostgreSQL configuration optimized for AAP workloads with 2TB storage
+  postgresql:
+    parameters:
+      # AAP requirements
+      max_connections: "1024"
+
+      # Memory settings (for 32GB RAM pods) - 25% rule from OneUptime guide
+      shared_buffers: "8GB"                    # 25% of RAM
+      work_mem: "128MB"                        # For ~300 concurrent connections
+      maintenance_work_mem: "2GB"              # For VACUUM, CREATE INDEX on large tables
+      effective_cache_size: "24GB"             # 75% of RAM (query planner hint)
+
+      # Performance tuning for SSD/NVMe
+      random_page_cost: "1.1"
+      effective_io_concurrency: "200"
+
+      # WAL settings - production recommended (scaled for 2TB)
+      wal_level: "replica"                     # Required for streaming replication
+      wal_buffers: "32MB"
+      max_wal_size: "8GB"
+      min_wal_size: "2GB"
+      checkpoint_completion_target: "0.9"      # Smoother I/O distribution
+
+      # Autovacuum tuning - aggressive settings to prevent dead-tuple bloat
+      # Scale lab (Q2CY26) showed 83% throughput drop over 4 weeks with defaults;
+      # tuning to 2% scale factor + more workers produced 18x improvement at VU=30.
+      autovacuum_vacuum_scale_factor: "0.02"   # default 0.20; triggers vacuum sooner
+      autovacuum_analyze_scale_factor: "0.02"  # keep analyze in sync with vacuum
+      autovacuum_max_workers: "6"              # default 3; more parallelism for large DBs
+      autovacuum_vacuum_cost_delay: "2ms"      # default 2ms; explicit (can lower to 0 if needed)
+      log_autovacuum_min_duration: "250"        # log vacuum runs > 250ms for observability
+
+      # Query statistics — pg_stat_statements tracks aggregate stats in memory
+      # (~5MB overhead). Query via psql or the monitoring ConfigMap.
+      # shared_preload_libraries is managed by the CNPG operator (fixed parameter
+      # since CNPG 1.25+); pg_stat_statements is loaded by default.
+      pg_stat_statements.max: "5000"
+      pg_stat_statements.track: "top"
+
+      # Logging for debugging
+      log_statement: "ddl"
+      log_min_duration_statement: "1000"       # Log queries > 1s
+
+    # Use scram-sha-256 for secure authentication (best practice)
+    # Reference: OneUptime security recommendations
+    pg_hba:
+      - host all all all scram-sha-256
+
+  # TODO: Migrate all user creation from cnpg-init-sql + postInitApplicationSQL
+  # to CNPG managed.roles. Managed roles auto-create Kubernetes Secrets for
+  # passwords and support rotation. Applies to: automationcontroller,
+  # automationhub, automationgateway, automationeda, automationmetrics,
+  # automationmetrics_controller, and monitoring.
+
+  # Resource requests/limits for each PostgreSQL pod
+  # Scaled for 2TB dataset and high IOPS workload
+  resources:
+    requests:
+      memory: "16Gi"
+      cpu: "8"
+    limits:
+      memory: "32Gi"
+      cpu: "16"
+    ephemeralVolumeSource:
+      volumeClaimTemplate:
+        spec:
+          resources:
+            requests:
+              storage: 20Gi  # For temporary data
+
+  # Bootstrap: initialize cluster with AAP databases and users
+  #
+  # Passwords are stored in Secret: secrets/cnpg-init-sql.yaml (gitignored)
+  # CREATE USER statements with passwords are in the secret
+  # Everything else (CREATE DATABASE, GRANT, ALTER) is inline (no passwords)
+  bootstrap:
+    initdb:
+      database: postgres
+      owner: postgres
+      # Enable data checksums - MUST be set at initialization (cannot add later)
+      # Reference: OneUptime important gotchas
+      dataChecksums: true
+      # CREATE USER with passwords from Secret (keeps passwords out of git)
+      postInitSQLRefs:
+        secretRefs:
+          - name: cnpg-init-sql
+            key: init.sql
+      # CREATE DATABASE + GRANT + ALTER (no passwords, safe to commit)
+      postInitTemplateSQL:
+        - CREATE DATABASE automationcontroller;
+        - CREATE DATABASE automationhub;
+        - CREATE DATABASE automationgateway;
+        - CREATE DATABASE automationeda;
+        - CREATE DATABASE automationmetrics;
+        - GRANT ALL PRIVILEGES ON DATABASE automationcontroller TO automationcontroller;
+        - GRANT ALL PRIVILEGES ON DATABASE automationhub TO automationhub;
+        - GRANT ALL PRIVILEGES ON DATABASE automationgateway TO automationgateway;
+        - GRANT ALL PRIVILEGES ON DATABASE automationeda TO automationeda;
+        - GRANT ALL PRIVILEGES ON DATABASE automationmetrics TO automationmetrics;
+        - ALTER DATABASE automationcontroller OWNER TO automationcontroller;
+        - ALTER DATABASE automationhub OWNER TO automationhub;
+        - ALTER DATABASE automationgateway OWNER TO automationgateway;
+        - ALTER DATABASE automationeda OWNER TO automationeda;
+        - ALTER DATABASE automationmetrics OWNER TO automationmetrics;
+      postInitApplicationSQL:
+        - GRANT CONNECT ON DATABASE automationcontroller TO automationmetrics_controller;
+        - GRANT pg_read_all_data TO automationmetrics_controller;
+        - ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO automationmetrics_controller;
+        - GRANT pg_monitor TO monitoring;
+        - GRANT pg_read_server_files TO monitoring;
+        - GRANT CONNECT ON DATABASE automationgateway TO monitoring;
+        - GRANT CONNECT ON DATABASE automationcontroller TO monitoring;
+        - GRANT CONNECT ON DATABASE automationhub TO monitoring;
+        - GRANT CONNECT ON DATABASE automationeda TO monitoring;
+
+  # Enable monitoring with custom queries
+  # Reference: OneUptime monitoring setup
+  monitoring:
+    enablePodMonitor: true
+    defaultDatabase: postgres
+    customQueriesConfigMap:
+      - name: aap-postgres-monitoring
+        key: queries.yaml
+
+  # Tolerations: allow scheduling on dedicated postgres-tainted nodes
+  # Reference: MachineSet 05-machineset-cnpg-workers.yaml has taint dedicated=postgres:NoSchedule
+  affinity:
+    tolerations:
+      - key: dedicated
+        value: postgres
+        effect: NoSchedule
+    topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            cnpg.io/cluster: aap-postgres
+
+  enablePodAntiAffinity: true

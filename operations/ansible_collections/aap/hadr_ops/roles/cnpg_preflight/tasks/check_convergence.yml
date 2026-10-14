@@ -1,0 +1,127 @@
+---
+# Check replica recovery convergence (is the lag closing?)
+#
+# Takes two samples of the WAL replay gap on the replica, separated by
+# a configurable interval. Determines if the replica is converging
+# (catching up), stable, or diverging (falling behind).
+#
+# Input:
+#   preflight_context — K8s context of the REPLICA cluster
+#   aap_namespace, cluster_name
+#   preflight_convergence_sample_interval (default: 10) — seconds between samples
+#
+# Output (set_fact):
+#   convergence_result — dict with status, gap_sample_1, gap_sample_2, trend, detail
+
+- name: Validate preflight_context is set
+  ansible.builtin.fail:
+    msg: "preflight_context must be set"
+  when: preflight_context | default('') == ''
+
+- name: "Sample 1: Query WAL replay gap on replica"
+  block:
+    - name: "Sample 1: Execute gap query"
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.cnpg_common
+        tasks_from: psql_query.yml
+      vars:
+        _query_context: "{{ preflight_context }}"
+        _query_labels: "cnpg.io/cluster={{ cluster_name }}"
+        _query: >-
+          SELECT pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn())
+          AS replay_gap_bytes;
+  rescue:
+    - name: "Sample 1: Handle query failure"
+      ansible.builtin.set_fact:
+        _query_result:
+          stdout: "-1"
+          return_code: 1
+
+- name: Save sample 1
+  ansible.builtin.set_fact:
+    _conv_sample1: "{{ _query_result.stdout | default('-1') | trim | float }}"
+    _conv_query_ok: "{{ (_query_result.return_code | default(1) | int == 0) }}"
+
+- name: "Wait {{ preflight_convergence_sample_interval | default(10) }}s between samples"
+  when: _conv_query_ok | bool
+  ansible.builtin.pause:
+    seconds: "{{ preflight_convergence_sample_interval | default(10) | int }}"
+
+- name: "Sample 2: Query WAL replay gap on replica"
+  when: _conv_query_ok | bool
+  block:
+    - name: "Sample 2: Execute gap query"
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.cnpg_common
+        tasks_from: psql_query.yml
+      vars:
+        _query_context: "{{ preflight_context }}"
+        _query_labels: "cnpg.io/cluster={{ cluster_name }}"
+        _query: >-
+          SELECT pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn())
+          AS replay_gap_bytes;
+  rescue:
+    - name: "Sample 2: Handle query failure"
+      ansible.builtin.set_fact:
+        _query_result:
+          stdout: "-1"
+          return_code: 1
+
+- name: Save sample 2
+  when: _conv_query_ok | bool
+  ansible.builtin.set_fact:
+    _conv_sample2: "{{ _query_result.stdout | default('-1') | trim | float }}"
+
+- name: Set defaults when query failed
+  when: not (_conv_query_ok | bool)
+  ansible.builtin.set_fact:
+    _conv_sample2: "-1"
+
+- name: Evaluate convergence trend
+  vars:
+    _s1: "{{ _conv_sample1 | float }}"
+    _s2: "{{ _conv_sample2 | default(_conv_sample1) | float }}"
+    _delta: "{{ (_s2 | float) - (_s1 | float) }}"
+    _pct_change: "{{ ((_delta | float) / (_s1 | float) * 100) if (_s1 | float > 0) else 0 }}"
+  ansible.builtin.set_fact:
+    _conv_trend: >-
+      {% if not (_conv_query_ok | bool) %}unknown
+      {% elif (_s1 | float) <= 0 and (_s2 | float) <= 0 %}caught_up
+      {% elif (_delta | float) < -100 %}converging
+      {% elif (_delta | float) > 100 %}diverging
+      {% else %}stable{% endif %}
+    _conv_delta: "{{ _delta }}"
+    _conv_pct: "{{ _pct_change }}"
+
+- name: Build convergence result
+  ansible.builtin.set_fact:
+    convergence_result:
+      context: "{{ preflight_context }}"
+      status: >-
+        {% if not (_conv_query_ok | bool) %}fail
+        {% elif _conv_trend | trim == 'caught_up' %}pass
+        {% elif _conv_trend | trim == 'converging' %}pass
+        {% elif _conv_trend | trim == 'stable' %}warn
+        {% elif _conv_trend | trim == 'diverging' %}fail
+        {% else %}warn{% endif %}
+      gap_sample_1_bytes: "{{ _conv_sample1 | int }}"
+      gap_sample_2_bytes: "{{ _conv_sample2 | int }}"
+      delta_bytes: "{{ _conv_delta | int }}"
+      trend: "{{ _conv_trend | trim }}"
+      sample_interval: "{{ preflight_convergence_sample_interval | default(10) }}"
+      detail: >-
+        {% if not (_conv_query_ok | bool) %}Cannot query replay gap on replica
+        {% elif _conv_trend | trim == 'caught_up' %}Replica fully caught up (gap=0)
+        {% elif _conv_trend | trim == 'converging' %}Replica converging — gap shrinking ({{ _conv_sample1 | int }} → {{ _conv_sample2 | int }} bytes, delta={{ _conv_delta | int }}B)
+        {% elif _conv_trend | trim == 'stable' %}Replay gap stable ({{ _conv_sample1 | int }} → {{ _conv_sample2 | int }} bytes) — replica not catching up under current load
+        {% elif _conv_trend | trim == 'diverging' %}Replay gap INCREASING ({{ _conv_sample1 | int }} → {{ _conv_sample2 | int }} bytes) — replica falling further behind
+        {% else %}Cannot determine convergence trend{% endif %}
+
+- name: Log convergence result
+  ansible.builtin.debug:
+    msg:
+      - "Recovery Convergence Check: {{ preflight_context }}"
+      - "  Status:   {{ convergence_result.status | trim }}"
+      - "  Trend:    {{ convergence_result.trend }}"
+      - "  Gap:      {{ convergence_result.gap_sample_1_bytes }}B → {{ convergence_result.gap_sample_2_bytes }}B (delta={{ convergence_result.delta_bytes }}B over {{ convergence_result.sample_interval }}s)"
+      - "  Detail:   {{ convergence_result.detail | trim }}"

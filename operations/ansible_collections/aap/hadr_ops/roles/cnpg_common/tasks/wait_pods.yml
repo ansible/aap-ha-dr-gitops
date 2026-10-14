@@ -1,0 +1,38 @@
+---
+# Wait for CNPG pod count by label to reach a target.
+#
+# Required variables:
+#   _pods_context:        Kubernetes context name
+#   _pods_target_count:   Target pod count (0 = wait until gone, >=1 = wait until running)
+#
+# Optional variables:
+#   _pods_kubeconfig:     Path to kubeconfig (default: omitted)
+#   _pods_phase_filter:   Pod phase to count (default: "Running"; set to "" for any phase)
+#   _pods_retries:        Number of retries (default: 30)
+#   _pods_delay:          Seconds between retries (default: 10)
+#
+# Output variables:
+#   _pods_count:          Current pod count matching criteria
+#   _pods_result:         Raw k8s_info result
+
+- name: "wait_pods | Query CNPG pods"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ aap_namespace }}"
+    label_selectors:
+      - "cnpg.io/cluster={{ cluster_name }}"
+    field_selectors: "{{ ['status.phase=' + _pods_phase_filter] if (_pods_phase_filter | default('Running')) else omit }}"
+    context: "{{ _pods_context }}"
+    kubeconfig: "{{ _pods_kubeconfig | default(omit) }}"
+  register: _pods_result
+  until: >
+    (_pods_target_count | int == 0 and _pods_result.resources | length == 0) or
+    (_pods_target_count | int > 0 and _pods_result.resources | length >= _pods_target_count | int)
+  retries: "{{ _pods_retries | default(30) }}"
+  delay: "{{ _pods_delay | default(10) }}"
+  ignore_errors: true
+
+- name: "wait_pods | Set count fact"
+  ansible.builtin.set_fact:
+    _pods_count: "{{ _pods_result.resources | length }}"

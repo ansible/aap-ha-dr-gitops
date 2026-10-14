@@ -1,0 +1,34 @@
+---
+# CHK-09: Replication Lag
+# Queries pg_stat_replication on primary for replay lag.
+# Requires _dual_topology_ok (set by CHK-05).
+
+- name: "CHK-09: Check replication lag on primary"
+  when: _dual_topology_ok | bool
+  ansible.builtin.include_role:
+    name: aap.hadr_ops.cnpg_preflight
+    tasks_from: check_replication_lag.yml
+  vars:
+    preflight_context: "{{ _wal_primary_context }}"
+
+- name: "CHK-09: Skip if not applicable"
+  when: not (_dual_topology_ok | bool)
+  ansible.builtin.set_fact:
+    _chk09_status: "skip"
+    _chk09_detail: "Skipped — requires both clusters reachable with valid topology"
+
+- name: "CHK-09: Set status from result"
+  when: replication_lag_result is defined
+  ansible.builtin.set_fact:
+    _chk09_status: "{{ replication_lag_result.status | trim }}"
+    _chk09_detail: "{{ replication_lag_result.detail | trim }}"
+
+- name: "CHK-09: Finalize"
+  vars:
+    _check_key: "chk09_replication_lag"  # gitleaks:allow -- fixed check identifier, not a credential
+    _check_name: "CHK-09 Replication Lag"
+    _check_status: "{{ _chk09_status | trim }}"
+    _check_detail: "{{ _chk09_detail | trim }}"
+    _check_data:
+      lag_seconds: "{{ replication_lag_result.lag_seconds | default('N/A') }}"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/finalize_check.yml"

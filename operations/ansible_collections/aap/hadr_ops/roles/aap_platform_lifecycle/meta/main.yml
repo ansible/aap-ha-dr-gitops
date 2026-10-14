@@ -1,0 +1,11 @@
+---
+galaxy_info:
+  role_name: aap_platform_lifecycle
+  author: AAP HA/DR Testing Team
+  description: >-
+    Manage AAP platform lifecycle on a single cluster. Supports idle (scale down),
+    activate (scale up + verify deployments + health check), and status (read-only).
+  company: Red Hat
+  license: Apache-2.0
+  min_ansible_version: "2.15"
+dependencies: []

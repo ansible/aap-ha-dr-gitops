@@ -1,0 +1,10 @@
+---
+# Role-specific variables only.
+# Shared variables (aap_namespace, cluster_name, etc.) are provided by
+# the config_loader role — do not duplicate here.
+
+# Timing
+token_wait_timeout: 150
+cnpg_promotion_wait: 10
+cnpg_readiness_timeout: 300
+cnpg_readiness_poll_interval: 10

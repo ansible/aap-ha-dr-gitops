@@ -1,0 +1,202 @@
+---
+# Full cluster restore from backup - DESTRUCTIVE operation
+# Jira ticket: https://redhat.atlassian.net/browse/AAP-81368
+#
+# What restore_full does:
+# 1. Deletes the CNPG Cluster CR
+# 2. Deletes all PVCs in the namespace
+# 3. Deletes orphaned Released PVs (Ceph RBD) to prevent HEALTH_ERR
+# 4. Recreates the CNPG Cluster with a recovery bootstrap from barman backup
+# 5. Optionally bumps serverName (v1→v2→v3) to avoid WAL conflicts with "dirty bucket"
+#    - Disabled by default (safe for simple backup → restore workflow)
+#    - Enable with: -e auto_bump_servername=true (when bucket has conflicting WAL files from previous cluster)
+# 6. Waits for cluster healthy (instances ready = spec.instances)
+
+- name: Display full restore warning
+  ansible.builtin.debug:
+    msg:
+      - "=========================================="
+      - "FULL CLUSTER RESTORE"
+      - "Cluster: {{ cluster_name }}"
+      - "Namespace: {{ aap_namespace }}"
+      - "Context: {{ target_context }}"
+      - "Backup: {{ restore_backup_name | default('latest') }}"
+      - "Recovery source: {{ restore_source_cluster | default('self') }}"
+      - ""
+      - "WARNING: This will DELETE the cluster and ALL data."
+      - "The cluster will be recreated from backup."
+      - "All current connections will be terminated."
+      - "=========================================="
+
+- name: Pause for confirmation (skip with -e restore_confirm=true)
+  ansible.builtin.pause:
+    prompt: "Press Enter to proceed with FULL RESTORE, or Ctrl+C to abort"
+  when: not (restore_confirm | default(false) | bool)
+
+# ── Destructive operations wrapped in block/rescue ─────────────
+- name: Execute full restore with cleanup on failure
+  block:
+    - name: Pause ArgoCD before full restore
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.aap_argocd_manage
+      vars:
+        argocd_action: pause
+        argocd_context: "{{ target_context }}"
+
+    - name: Idle AAP before full restore
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.aap_platform_lifecycle
+      vars:
+        lifecycle_action: idle
+        lifecycle_context: "{{ target_context }}"
+
+    - name: Initiate full cluster restore
+      aap.hadr_ops.cnpg_backup_manage:
+        namespace: "{{ aap_namespace }}"
+        cluster_name: "{{ cluster_name }}"
+        context: "{{ target_context }}"
+        oc_binary: "{{ oc_binary }}"
+        operation: restore_full
+        backup_name: "{{ restore_backup_name | default('') }}"
+        recovery_source: "{{ restore_source_cluster | default('') }}"
+        auto_bump_servername: "{{ auto_bump_servername | default(false) | bool }}"
+        s3_bucket: "{{ s3_bucket | default('') }}"
+        s3_path: "{{ s3_path | default('') }}"
+        s3_endpoint: "{{ s3_endpoint | default('') }}"
+        s3_credentials_secret: "{{ s3_credentials_secret | default('') }}"
+      register: _restore_full_result
+
+    - name: Set restore result fact
+      ansible.builtin.set_fact:
+        cnpg_backup_result: "{{ _restore_full_result }}"
+
+    - name: Display restore progress
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "Full Restore Initiated"
+          - "Backup: {{ _restore_full_result.backup_name }}"
+          - "Recovery source: {{ _restore_full_result.recovery_source }}"
+          - "ServerName: {{ _restore_full_result.server_name_old }} → {{ _restore_full_result.server_name_new }}"
+          - "Duration: {{ _restore_full_result.duration_seconds | round(1) }}s"
+          - "Cluster ready: {{ _restore_full_result.cluster_ready }}"
+          - "Waiting for full cluster health..."
+          - "=========================================="
+
+    - name: Wait for CNPG cluster to become fully healthy
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.cnpg_health_check
+      vars:
+        health_check_context: "{{ target_context }}"
+        health_mode: wait
+
+    - name: Re-fetch cluster info after restore
+      aap.hadr_ops.cnpg_cluster_info:
+        namespace: "{{ aap_namespace }}"
+        cluster_name: "{{ cluster_name }}"
+        context: "{{ target_context }}"
+      register: _cnpg_info_restored
+
+    - name: Get primary pod after restore
+      ansible.builtin.set_fact:
+        _restore_primary_pod: "{{ _cnpg_info_restored.cluster_info.status.currentPrimary }}"
+
+    - name: Validate restore recovery occurred
+      ansible.builtin.command:
+        argv:
+          - "{{ oc_binary }}"
+          - "--context={{ target_context }}"
+          - "exec"
+          - "-n"
+          - "{{ aap_namespace }}"
+          - "{{ _restore_primary_pod }}"
+          - "--"
+          - "psql"
+          - "-U"
+          - "postgres"
+          - "-tAc"
+          - >-
+            SELECT json_build_object(
+              'pg_start_time', pg_postmaster_start_time(),
+              'in_recovery', pg_is_in_recovery(),
+              'timeline', (SELECT timeline_id FROM pg_control_checkpoint()),
+              'server_name', current_setting('cluster_name')
+            )
+      register: _restore_validation_raw
+      changed_when: false
+
+    - name: Parse restore validation
+      ansible.builtin.set_fact:
+        _restore_validation: "{{ _restore_validation_raw.stdout | from_json }}"
+
+    - name: Display restore validation
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "Full Restore Validation"
+          - "  Backup used:     {{ _restore_full_result.backup_name }}"
+          - "  PG start time:   {{ _restore_validation.pg_start_time }}"
+          - "  Timeline:        {{ _restore_validation.timeline }}"
+          - "  In recovery:     {{ _restore_validation.in_recovery }}"
+          - "  Server name:     {{ _restore_validation.server_name }}"
+          - "=========================================="
+
+    - name: Activate AAP after restore
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.aap_platform_lifecycle
+      vars:
+        lifecycle_action: activate
+        lifecycle_context: "{{ target_context }}"
+
+    - name: Resume ArgoCD after restore
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.aap_argocd_manage
+      vars:
+        argocd_action: resume
+        argocd_context: "{{ target_context }}"
+        argocd_trigger_sync: true
+
+    - name: Display full restore complete
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "Full Restore Complete on {{ target_site_id }}"
+          - "Backup: {{ _restore_full_result.backup_name }}"
+          - "Recovery source: {{ _restore_full_result.recovery_source }}"
+          - "ServerName: {{ _restore_full_result.server_name_new }}"
+          - ""
+          - "NEXT STEPS:"
+          - "  1. Verify data integrity on restored cluster"
+          - "  2. If multi-cluster setup, restore replication with:"
+          - "     ansible-playbook aap_restore_replication.yml -e target_primary={{ target_site_id }}"
+          - "=========================================="
+
+  rescue:
+    - name: "RESCUE: Log full restore failure"
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "FULL RESTORE FAILED — running cleanup"
+          - "Activating AAP, resuming ArgoCD"
+          - "=========================================="
+
+    - name: "RESCUE: Activate AAP"
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.aap_platform_lifecycle
+      vars:
+        lifecycle_action: activate
+        lifecycle_context: "{{ target_context }}"
+      ignore_errors: true
+
+    - name: "RESCUE: Resume ArgoCD"
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.aap_argocd_manage
+      vars:
+        argocd_action: resume
+        argocd_context: "{{ target_context }}"
+        argocd_trigger_sync: true
+      ignore_errors: true
+
+    - name: "RESCUE: Fail with original error"
+      ansible.builtin.fail:
+        msg: "Full restore failed — cleanup completed. Check logs for the original error above."

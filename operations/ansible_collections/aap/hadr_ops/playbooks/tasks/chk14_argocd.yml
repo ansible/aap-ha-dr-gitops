@@ -1,0 +1,20 @@
+---
+# CHK-14: ArgoCD application state.
+
+- name: "CHK-14: Finalize ArgoCD result"
+  vars:
+    _argocd_statuses:
+      - "{{ _platform_result_a.argocd.status | default('skip') | trim }}"
+      - "{{ _platform_result_b.argocd.status | default('skip') | trim }}"
+    _argocd_status: >-
+      {% if 'fail' in _argocd_statuses %}fail
+      {% elif 'warn' in _argocd_statuses %}warn
+      {% else %}pass{% endif %}
+    _check_key: "chk14_argocd"
+    _check_name: "CHK-14 ArgoCD State"
+    _check_status: "{{ _argocd_status | trim }}"
+    _check_detail: "a={{ _platform_result_a.argocd.detail | default('skip', true) | trim }}, b={{ _platform_result_b.argocd.detail | default('skip', true) | trim }}"
+    _check_data:
+      cluster_a: "{{ _platform_result_a.argocd | default({'status': 'skip'}) }}"
+      cluster_b: "{{ _platform_result_b.argocd | default({'status': 'skip'}) }}"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/finalize_check.yml"

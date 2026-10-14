@@ -1,0 +1,83 @@
+---
+# Read-only AAP status check on a single cluster
+#
+# Checks AAP CR state, deployment readiness, and health endpoints
+# without modifying anything. Safe for testing.
+#
+# Output (set_fact):
+#   lifecycle_result — dict with status, deployments, health details
+
+- name: Get AAP CR status on {{ lifecycle_context }}
+  kubernetes.core.k8s_info:
+    api_version: aap.ansible.com/v1alpha1
+    kind: AnsibleAutomationPlatform
+    name: "{{ aap_name }}"
+    namespace: "{{ aap_namespace }}"
+    context: "{{ lifecycle_context }}"
+  register: _aap_cr
+  ignore_errors: true
+
+- name: Get deployment status on {{ lifecycle_context }}
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: Deployment
+    namespace: "{{ aap_namespace }}"
+    context: "{{ lifecycle_context }}"
+  register: _aap_deploys
+  ignore_errors: true
+
+- name: Get AAP route on {{ lifecycle_context }}
+  kubernetes.core.k8s_info:
+    api_version: route.openshift.io/v1
+    kind: Route
+    name: aap
+    namespace: "{{ aap_namespace }}"
+    context: "{{ lifecycle_context }}"
+  register: _aap_route
+  ignore_errors: true
+
+- name: Check gateway health
+  when: (_aap_route.resources | default([]) | length > 0) and (_aap_route.resources[0].spec.host | default('') != '')
+  ansible.builtin.uri:
+    url: "https://{{ _aap_route.resources[0].spec.host }}/api/gateway/v1/ping/"
+    validate_certs: false
+    status_code: [200, 503, 502, 404]
+  register: _gw_check
+  ignore_errors: true
+
+- name: Set lifecycle result
+  vars:
+    _cr_exists: "{{ (_aap_cr.resources | default([]) | length > 0) }}"
+    _idle: "{{ _aap_cr.resources[0].spec.idle_aap | default(false) if _cr_exists else 'unknown' }}"
+    _deploy_ready: >-
+      {{ _aap_deploys.resources | default([]) |
+         selectattr('metadata.name', 'in', aap_key_deployments) |
+         selectattr('status.readyReplicas', 'defined') |
+         rejectattr('status.readyReplicas', 'eq', 0) |
+         list | length }}
+    _gw_status: "{{ _gw_check.status | default(0) | int }}"
+  ansible.builtin.set_fact:
+    lifecycle_result:
+      context: "{{ lifecycle_context }}"
+      action: "status"
+      cr_exists: "{{ _cr_exists }}"
+      idle_aap: "{{ _idle }}"
+      status: >-
+        {% if not (_cr_exists | bool) %}no_cr
+        {% elif _idle | bool %}idle
+        {% elif (_gw_status | int) == 200 %}healthy
+        {% elif (_deploy_ready | int) > 0 %}degraded
+        {% else %}unhealthy{% endif %}
+      gateway_status: "{{ _gw_status }}"
+      deployments_ready: "{{ _deploy_ready }}/{{ aap_key_deployments | length }}"
+      error: ""
+
+- name: Log AAP lifecycle status
+  ansible.builtin.debug:
+    msg:
+      - "AAP Lifecycle Status: {{ lifecycle_context }}"
+      - "  CR exists:     {{ lifecycle_result.cr_exists }}"
+      - "  idle_aap:      {{ lifecycle_result.idle_aap }}"
+      - "  Status:        {{ lifecycle_result.status | trim }}"
+      - "  Gateway:       HTTP {{ lifecycle_result.gateway_status }}"
+      - "  Deployments:   {{ lifecycle_result.deployments_ready }} ready"

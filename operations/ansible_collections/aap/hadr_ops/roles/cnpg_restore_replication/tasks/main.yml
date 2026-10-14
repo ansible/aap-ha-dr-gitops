@@ -1,0 +1,808 @@
+---
+# CloudNativePG Restore Replication
+#
+# Restores a former primary cluster back to replica status after a disaster
+# recovery force-promotion.  The cluster identified by target_primary stays
+# primary; the other cluster is demoted, AAP is idled on it, and CNPG
+# replication is re-established.
+#
+# When the replica is on a diverged WAL timeline (different fork, not just
+# behind), the role forces a full re-bootstrap: deletes the CNPG Cluster CR,
+# cleans up PVCs, and lets ArgoCD recreate it via pg_basebackup from the
+# current primary.
+#
+# Required variables:
+#   target_primary:  CNPG site ID of the cluster that should REMAIN primary (from vars/clusters.yml)
+#   hadr_pair_id and hadr_environment_id_a/b: ApplicationSet inventory identities
+#
+# Key optional variables (see defaults/main.yml for full list):
+#   cluster_a_context, cluster_b_context, aap_namespace, cluster_name, force_reclone
+#
+# Output fact:
+#   cnpg_switchover_result  — dict consumed by the calling playbook
+
+# ============================================================================
+# STEP 1: Validate inputs
+# ============================================================================
+
+- name: Validate target_primary is set
+  assert:
+    that:
+      - target_primary is defined
+      - target_primary in _site_to_context
+    fail_msg: >
+      restore_replication requires -e target_primary=<site_id>
+      (valid values: {{ _site_to_context.keys() | list | join(', ') }})
+      to specify which cluster should REMAIN primary.
+      The other cluster will be demoted to replica.
+
+# ============================================================================
+# STEP 2: Resolve topology facts
+# ============================================================================
+
+- name: Set restore topology facts from target_primary
+  vars:
+    _other_site: "{{ (_site_to_context.keys() | list | difference([target_primary]))[0] }}"
+  set_fact:
+    restore_primary_name: "{{ target_primary }}"
+    restore_primary_ctx: "{{ _site_to_context[target_primary] }}"
+    restore_primary_environment_id: "{{ hadr_environment_id_a if _site_to_context[target_primary] == cluster_a_context else hadr_environment_id_b }}"
+    restore_primary_kubeconfig: "{{ cluster_a_kubeconfig if _site_to_context[target_primary] == cluster_a_context else cluster_b_kubeconfig }}"
+    restore_old_primary_name: "{{ _other_site }}"
+    restore_old_primary_ctx: "{{ _site_to_context[_other_site] }}"
+    restore_old_primary_environment_id: "{{ hadr_environment_id_a if _site_to_context[_other_site] == cluster_a_context else hadr_environment_id_b }}"
+    restore_old_primary_kubeconfig: "{{ cluster_a_kubeconfig if _site_to_context[_other_site] == cluster_a_context else cluster_b_kubeconfig }}"
+
+- name: Display restore plan
+  debug:
+    msg:
+      - "=========================================="
+      - "Restore Replication"
+      - "Keep as primary: {{ restore_primary_name }} ({{ restore_primary_ctx }})"
+      - "Demote to replica: {{ restore_old_primary_name }} ({{ restore_old_primary_ctx }})"
+      - "=========================================="
+
+# ============================================================================
+# STEP 3: Wait for primary health (safety gate with retry)
+# ============================================================================
+# After a DR force-promotion the primary may still be settling (e.g.
+# "Setting up primary" or "Creating a new replica"). Instead of failing
+# immediately, poll until the primary reaches healthy state.
+
+- name: Wait for CNPG cluster on primary to become healthy
+  cnpg_cluster_info:
+    namespace: "{{ aap_namespace }}"
+    cluster_name: "{{ cluster_name }}"
+    context: "{{ restore_primary_ctx }}"
+    kubeconfig: "{{ restore_primary_kubeconfig }}"
+  register: _primary_health_check
+  failed_when: false
+  until: >-
+    _primary_health_check.cluster_info.status.phase is defined and
+    'healthy' in (_primary_health_check.cluster_info.status.phase | lower)
+  retries: "{{ restore_primary_health_retries | default(18) }}"
+  delay: "{{ restore_primary_health_delay | default(10) }}"
+
+- name: Fail if primary did not become healthy
+  assert:
+    that:
+      - _primary_health_check.cluster_info.status.phase is defined
+      - "'healthy' in _primary_health_check.cluster_info.status.phase | lower"
+    fail_msg: >
+      Primary cluster {{ restore_primary_name }} ({{ restore_primary_ctx }}) did not become healthy
+      within {{ (restore_primary_health_retries | default(18)) * (restore_primary_health_delay | default(10)) }}s.
+      Phase: {{ _primary_health_check.cluster_info.status.phase | default('unknown') }}.
+      Cannot re-bootstrap replica from an unhealthy primary.
+      Fix the primary first, then re-run this role.
+
+# ============================================================================
+# STEP 4: Discover old primary state
+# ============================================================================
+
+- name: Check if CNPG cluster CR exists on old primary
+  kubernetes.core.k8s_info:
+    api_version: postgresql.cnpg.io/v1
+    kind: Cluster
+    name: "{{ cluster_name }}"
+    namespace: "{{ aap_namespace }}"
+    context: "{{ restore_old_primary_ctx }}"
+    kubeconfig: "{{ restore_old_primary_kubeconfig | default(omit, true) }}"
+  register: _cnpg_cr_lookup
+  ignore_errors: true
+
+- name: Check for orphaned CNPG pods on old primary
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ aap_namespace }}"
+    label_selectors:
+      - "cnpg.io/cluster={{ cluster_name }}"
+    context: "{{ restore_old_primary_ctx }}"
+    kubeconfig: "{{ restore_old_primary_kubeconfig | default(omit, true) }}"
+  register: _cnpg_pods_lookup
+  ignore_errors: true
+
+- name: Check for orphaned CNPG PVCs on old primary
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: PersistentVolumeClaim
+    namespace: "{{ aap_namespace }}"
+    label_selectors:
+      - "cnpg.io/cluster={{ cluster_name }}"
+    context: "{{ restore_old_primary_ctx }}"
+    kubeconfig: "{{ restore_old_primary_kubeconfig | default(omit, true) }}"
+  register: _cnpg_pvcs_lookup
+  ignore_errors: true
+
+- name: Check CNPG cluster health on old primary
+  when: _cnpg_cr_lookup.resources | default([]) | length > 0
+  cnpg_cluster_info:
+    namespace: "{{ aap_namespace }}"
+    cluster_name: "{{ cluster_name }}"
+    context: "{{ restore_old_primary_ctx }}"
+    kubeconfig: "{{ restore_old_primary_kubeconfig }}"
+  register: discovery_health_check
+  failed_when: false
+
+- name: Check streaming replication on old primary
+  when: _cnpg_cr_lookup.resources | default([]) | length > 0
+  include_role:
+    name: cnpg_common
+    tasks_from: psql_query.yml
+  vars:
+    _query_context: "{{ restore_old_primary_ctx }}"
+    _query_kubeconfig: "{{ restore_old_primary_kubeconfig }}"
+    _query_labels: "cnpg.io/cluster={{ cluster_name }},cnpg.io/instanceRole=replica"
+    _query: "SELECT CASE WHEN pg_is_in_recovery() AND EXISTS(SELECT 1 FROM pg_stat_wal_receiver WHERE status = 'streaming') THEN 1 ELSE 0 END;"
+
+- name: Set state facts
+  set_fact:
+    cnpg_cr_exists: "{{ _cnpg_cr_lookup.resources | default([]) | length > 0 }}"
+    orphan_pods_exist: "{{ _cnpg_pods_lookup.resources | default([]) | length > 0 }}"
+    orphan_pvcs_exist: "{{ _cnpg_pvcs_lookup.resources | default([]) | length > 0 }}"
+    needs_full_reclone: false
+    _discovery_replica_primary: "{{ (_cnpg_cr_lookup.resources[0].spec.replica.primary | default('')) if (_cnpg_cr_lookup.resources | default([]) | length > 0) else '' }}"
+    _discovery_replication_count: "{{ _query_result.stdout | default('0') | trim | int if (_query_result is defined) else 0 }}"
+    _old_primary_phase: "{{ discovery_health_check.cluster_info.status.phase | default('') | lower if (discovery_health_check is defined and discovery_health_check.cluster_info is defined) else '' }}"
+
+# ============================================================================
+# STEP 4b: Resume detection — rebuild already in progress
+# ============================================================================
+# If the CR exists but is not yet healthy AND is already pointing to the
+# correct primary, a previous run started the rebuild (pg_basebackup still
+# running). Skip all destructive steps and jump directly to monitoring.
+
+- name: Detect rebuild in progress
+  set_fact:
+    rebuild_in_progress: >-
+      {{ (cnpg_cr_exists | bool) and
+         (_old_primary_phase | length > 0) and
+         ('healthy' not in _old_primary_phase) and
+         (_discovery_replica_primary == restore_primary_name) }}
+
+- name: Set re-bootstrap facts on resume (prior run already initiated the rebuild)
+  when: rebuild_in_progress | bool
+  set_fact:
+    wal_diverged: true
+    needs_full_reclone: false
+
+- name: Log rebuild-in-progress detection
+  when: rebuild_in_progress | bool
+  debug:
+    msg:
+      - "=========================================="
+      - "REBUILD IN PROGRESS — RESUMING MONITORING"
+      - "CNPG Cluster CR exists but is not yet healthy."
+      - "Phase: {{ _old_primary_phase }}"
+      - "Replica already pointing to: {{ _discovery_replica_primary }}"
+      - "wal_diverged: true (rebuild in progress implies timeline divergence)"
+      - "Skipping steps 5-11, jumping to health monitoring (step 12)."
+      - "=========================================="
+
+# ============================================================================
+# STEP 4c: Check if already in desired state
+# ============================================================================
+
+- name: Get primary WAL timeline before healthy-state early exit
+  include_role:
+    name: cnpg_common
+    tasks_from: psql_query.yml
+  vars:
+    _query_context: "{{ restore_primary_ctx }}"
+    _query_kubeconfig: "{{ restore_primary_kubeconfig }}"
+    _query_labels: "cnpg.io/cluster={{ cluster_name }},cnpg.io/instanceRole=primary"
+    _query: "SELECT timeline_id FROM pg_control_checkpoint();"
+
+- name: Save precheck primary timeline
+  set_fact:
+    _precheck_primary_timeline: "{{ _query_result.stdout | default('') | trim }}"
+
+- name: Get old primary WAL timeline before healthy-state early exit
+  when: cnpg_cr_exists | bool
+  include_role:
+    name: cnpg_common
+    tasks_from: pg_controldata_timeline.yml
+  vars:
+    _timeline_context: "{{ restore_old_primary_ctx }}"
+    _timeline_kubeconfig: "{{ restore_old_primary_kubeconfig }}"
+    _timeline_labels: "cnpg.io/cluster={{ cluster_name }}"
+
+- name: Save precheck old primary timeline
+  set_fact:
+    _precheck_old_primary_timeline: "{{ _timeline_value | default('') | trim if (cnpg_cr_exists | bool) else '' }}"
+
+- name: Evaluate precheck WAL timelines
+  set_fact:
+    _precheck_timelines_available: >-
+      {{ (_precheck_primary_timeline | default('') | int > 0) and
+         (_precheck_old_primary_timeline | default('') | int > 0) }}
+    _precheck_wal_diverged: >-
+      {{ (_precheck_primary_timeline | default('') | int > 0) and
+         (_precheck_old_primary_timeline | default('') | int > 0) and
+         ((_precheck_old_primary_timeline | int) != (_precheck_primary_timeline | int)) }}
+
+- name: Evaluate if already in desired state
+  set_fact:
+    cnpg_is_healthy: >-
+      {{ (cnpg_cr_exists | bool) and
+         ('healthy' in _old_primary_phase) and
+         (_discovery_replica_primary == restore_primary_name) and
+         ((_discovery_replication_count | int) >= 1) and
+         (_precheck_timelines_available | bool) and
+         not (_precheck_wal_diverged | bool) }}
+
+- name: Log discovered state
+  debug:
+    msg:
+      - "=========================================="
+      - "Old primary state discovery ({{ restore_old_primary_name }})"
+      - "CNPG Cluster CR exists: {{ cnpg_cr_exists }}"
+      - "CNPG pods present: {{ _cnpg_pods_lookup.resources | default([]) | length }}"
+      - "CNPG PVCs present: {{ _cnpg_pvcs_lookup.resources | default([]) | length }}"
+      - "CNPG phase: {{ _old_primary_phase | default('N/A') }}"
+      - "Replica pointing to: {{ _discovery_replica_primary | default('N/A') }}"
+      - "Streaming replicas: {{ _discovery_replication_count | default('N/A') }}"
+      - "Primary timeline: {{ _precheck_primary_timeline | default('N/A') }}"
+      - "Old primary timeline: {{ _precheck_old_primary_timeline | default('N/A') }}"
+      - "WAL timelines available: {{ _precheck_timelines_available }}"
+      - "WAL diverged: {{ _precheck_wal_diverged }}"
+      - "Already in desired state: {{ cnpg_is_healthy }}"
+      - "Rebuild in progress: {{ rebuild_in_progress }}"
+      - "=========================================="
+
+- name: Skip restore — replication already healthy
+  when: cnpg_is_healthy | bool and not force_reclone | bool
+  block:
+    - name: Log early exit
+      debug:
+        msg: "CNPG cluster on {{ restore_old_primary_name }} is already a healthy replica of {{ restore_primary_name }} with active streaming replication — nothing to do"
+
+    - name: Set result fact (already healthy)
+      set_fact:
+        cnpg_switchover_result:
+          mode: "restore_replication"
+          old_primary: "{{ restore_old_primary_name }}"
+          new_primary: "{{ restore_primary_name }}"
+          cnpg_phase: "{{ discovery_health_check.cluster_info.status.phase | default('unknown') }}"
+          cnpg_pods_on_replica: "{{ _cnpg_pods_lookup.resources | default([]) | length }}"
+          streaming_replicas: "{{ _discovery_replication_count }}"
+          wal_diverged: false
+          re_bootstrapped: false
+          timelines_aligned: true
+          resumed_from_rebuild: false
+          total_duration_seconds: "0"
+          skipped: true
+
+    - name: End play early
+      meta: end_play
+
+# ============================================================================
+# STEPS 5-11: Demotion and re-bootstrap (SKIPPED when rebuild in progress)
+# ============================================================================
+# This entire block is skipped when a prior run already started the rebuild.
+# In that case, execution jumps directly to Step 12 (health monitoring).
+
+- name: "Demote and re-bootstrap (steps 5-11)"
+  when: not rebuild_in_progress | bool
+  block:
+
+    # ==========================================================================
+    # STEP 5: Clean up incomplete prior run (CR missing but orphans remain)
+    # ==========================================================================
+
+    - name: Clean up orphaned state from prior failed run
+      when:
+        - not cnpg_cr_exists | bool
+        - orphan_pods_exist | bool or orphan_pvcs_exist | bool
+      block:
+        - name: Log orphan cleanup
+          debug:
+            msg: "CNPG Cluster CR is missing but orphaned pods/PVCs found — cleaning up before proceeding"
+
+        - name: Clean up orphaned pods, PVCs, and restart operator
+          include_role:
+            name: cnpg_common
+            tasks_from: cleanup_cnpg.yml
+          vars:
+            _cleanup_context: "{{ restore_old_primary_ctx }}"
+            _cleanup_kubeconfig: "{{ restore_old_primary_kubeconfig }}"
+
+    - name: Mark full reclone needed when CR is missing
+      when: not cnpg_cr_exists | bool
+      set_fact:
+        needs_full_reclone: true
+
+    # ==========================================================================
+    # STEP 6: Pause ArgoCD on old primary (prevent selfHeal race)
+    # ==========================================================================
+
+    - name: Pause ArgoCD child app {{ item }} on old primary
+      argocd_application_update:
+        application_name: "{{ item }}"
+        namespace: "{{ argocd_namespace }}"
+        context: "{{ restore_old_primary_ctx }}"
+        kubeconfig: "{{ restore_old_primary_kubeconfig }}"
+        pause_automation: true
+      loop: "{{ argocd_application_names }}"
+
+    # ==========================================================================
+    # STEP 7: Demote old primary CNPG cluster to replica
+    # ==========================================================================
+
+    - name: Demote old primary to replica
+      when: cnpg_cr_exists | bool
+      block:
+        - name: Clear stale promotionToken from old primary (blocks demotion if present)
+          cnpg_switchover_step:
+            namespace: "{{ aap_namespace }}"
+            cluster_name: "{{ cluster_name }}"
+            context: "{{ restore_old_primary_ctx }}"
+            kubeconfig: "{{ restore_old_primary_kubeconfig }}"
+            operation: clear_promotion_token
+          ignore_errors: true
+
+        - name: Patch CNPG cluster CR to set replica.primary
+          cnpg_switchover_step:
+            namespace: "{{ aap_namespace }}"
+            cluster_name: "{{ cluster_name }}"
+            context: "{{ restore_old_primary_ctx }}"
+            kubeconfig: "{{ restore_old_primary_kubeconfig }}"
+            operation: demote
+            new_primary: "{{ restore_primary_name }}"
+          register: demote_result
+          retries: 12
+          delay: 10
+          until: demote_result is not failed
+
+        - name: Log demotion
+          debug:
+            msg: "Demoted {{ restore_old_primary_name }}: replica.primary set to {{ restore_primary_name }}"
+
+    # ==========================================================================
+    # STEP 8: Idle AAP on old primary
+    # ==========================================================================
+
+    - name: Set AAP idle on old primary
+      aap_platform_scale:
+        namespace: "{{ aap_namespace }}"
+        aap_name: "{{ aap_name }}"
+        context: "{{ restore_old_primary_ctx }}"
+        kubeconfig: "{{ restore_old_primary_kubeconfig }}"
+        scale_to: "idle"
+        direct_deployment_scale: false
+      register: idle_result
+      ignore_errors: true
+
+    # ==========================================================================
+    # STEP 9: WAL timeline comparison
+    # ==========================================================================
+
+    - name: Get WAL timeline on current primary
+      include_role:
+        name: cnpg_common
+        tasks_from: psql_query.yml
+      vars:
+        _query_context: "{{ restore_primary_ctx }}"
+        _query_kubeconfig: "{{ restore_primary_kubeconfig }}"
+        _query_labels: "cnpg.io/cluster={{ cluster_name }},cnpg.io/instanceRole=primary"
+        _query: "SELECT timeline_id FROM pg_control_checkpoint();"
+
+    - name: Save primary timeline
+      set_fact:
+        primary_timeline: "{{ _query_result.stdout | trim }}"
+
+    # Uses pg_controldata (binary) instead of SQL because the old primary may
+    # not be accepting connections after demotion. pg_controldata reads the
+    # on-disk control file directly. Both methods return the same timeline ID
+    # once a checkpoint completes after demotion.
+    - name: Get WAL timeline on old primary
+      when: cnpg_cr_exists | bool
+      include_role:
+        name: cnpg_common
+        tasks_from: pg_controldata_timeline.yml
+      vars:
+        _timeline_context: "{{ restore_old_primary_ctx }}"
+        _timeline_kubeconfig: "{{ restore_old_primary_kubeconfig }}"
+        _timeline_labels: "cnpg.io/cluster={{ cluster_name }},cnpg.io/instanceRole"
+
+    - name: Save old primary timeline
+      set_fact:
+        old_primary_timeline: "{{ _timeline_value | default('0') }}"
+
+    - name: Check timeline divergence
+      set_fact:
+        wal_diverged: >-
+          {{ needs_full_reclone | bool or
+             (old_primary_timeline | default('0') | string) != (primary_timeline | default('0') | string) }}
+
+    - name: Log timeline comparison
+      debug:
+        msg:
+          - "Primary timeline ({{ restore_primary_name }}): {{ primary_timeline }}"
+          - "Old primary timeline ({{ restore_old_primary_name }}): {{ old_primary_timeline | default('N/A — CR missing') }}"
+          - "WAL diverged (timelines differ): {{ wal_diverged }}"
+          - "Needs full reclone (CR was missing): {{ needs_full_reclone }}"
+
+    # ==========================================================================
+    # STEP 9b: Post-demotion streaming validation
+    # ==========================================================================
+    # Even if timelines appear to match numerically, streaming may not establish
+    # due to the replica being on a different fork. Wait briefly and check if
+    # pg_stat_wal_receiver shows active streaming. If not, escalate to re-bootstrap.
+    # Skipped when force_reclone or wal_diverged — re-bootstrap is already decided.
+
+    - name: Initialize streaming validation fact
+      set_fact:
+        _post_demotion_streaming: -1
+
+    - name: Post-demotion streaming validation
+      when:
+        - cnpg_cr_exists | bool
+        - not wal_diverged | bool
+        - not force_reclone | bool
+      block:
+        - name: Check WAL receiver on demoted replica
+          ansible.builtin.include_role:
+            name: aap.hadr_ops.cnpg_common
+            tasks_from: verify_wal_receiver.yml
+          vars:
+            _wal_receiver_context: "{{ restore_old_primary_ctx }}"
+            _wal_receiver_kubeconfig: "{{ restore_old_primary_kubeconfig }}"
+            _wal_receiver_retries: "{{ ((streaming_validation_timeout | int) / (streaming_validation_poll_interval | int)) | int }}"
+            _wal_receiver_delay: "{{ streaming_validation_poll_interval }}"
+
+        - name: Set streaming validation result
+          set_fact:
+            _post_demotion_streaming: "{{ _wal_receiver_active | int }}"
+
+        - name: Escalate to re-bootstrap if streaming failed
+          when: _post_demotion_streaming | int < 1
+          block:
+            - name: Log streaming validation failure
+              debug:
+                msg:
+                  - "=========================================="
+                  - "STREAMING VALIDATION FAILED — ESCALATING TO RE-BOOTSTRAP"
+                  - "After demotion, pg_stat_wal_receiver did not show active streaming"
+                  - "within {{ streaming_validation_timeout }}s. This indicates the replica"
+                  - "is on an incompatible WAL timeline fork and cannot resume streaming."
+                  - "Forcing full re-bootstrap via pg_basebackup."
+                  - "=========================================="
+
+            - name: Override wal_diverged to force re-bootstrap
+              set_fact:
+                wal_diverged: true
+
+    # ==========================================================================
+    # STEP 10: Conditional re-bootstrap (WAL diverged, force_reclone, or CR missing)
+    # ==========================================================================
+
+    - name: Re-bootstrap CNPG on old primary
+      when:
+        - (wal_diverged | default(false) | bool) or (force_reclone | bool)
+        - not needs_full_reclone | bool
+      block:
+        - name: Log re-bootstrap reason
+          debug:
+            msg:
+              - "WAL timelines diverged or force_reclone requested"
+              - "Deleting CNPG cluster CR on {{ restore_old_primary_name }} — ArgoCD will re-bootstrap from {{ restore_primary_name }}"
+
+        - name: Delete CNPG cluster CR on old primary
+          kubernetes.core.k8s:
+            api_version: postgresql.cnpg.io/v1
+            kind: Cluster
+            name: "{{ cluster_name }}"
+            namespace: "{{ aap_namespace }}"
+            context: "{{ restore_old_primary_ctx }}"
+            kubeconfig: "{{ restore_old_primary_kubeconfig | default(omit, true) }}"
+            state: absent
+            wait: true
+            wait_timeout: 120
+          ignore_errors: true
+
+        - name: Wait for CNPG pods to be cleaned up
+          include_role:
+            name: cnpg_common
+            tasks_from: wait_pods.yml
+          vars:
+            _pods_context: "{{ restore_old_primary_ctx }}"
+            _pods_kubeconfig: "{{ restore_old_primary_kubeconfig }}"
+            _pods_target_count: 0
+            _pods_phase_filter: ""
+            _pods_retries: 12
+            _pods_delay: 5
+
+        - name: Force-delete stuck CNPG pods if any remain
+          when: _pods_count | default(0) | int > 0
+          include_role:
+            name: cnpg_common
+            tasks_from: cleanup_cnpg.yml
+          vars:
+            _cleanup_context: "{{ restore_old_primary_ctx }}"
+            _cleanup_kubeconfig: "{{ restore_old_primary_kubeconfig }}"
+            _cleanup_force_pods: true
+            _cleanup_delete_pvcs: true
+            _cleanup_restart_operator: true
+
+    # ==========================================================================
+    # STEP 10b: Delete stale WAL OBC (prevents timeline mismatch on re-bootstrap)
+    # ==========================================================================
+
+    - name: Delete stale WAL OBC on old primary
+      when:
+        - (wal_diverged | default(false) | bool) or (force_reclone | bool)
+        - not needs_full_reclone | bool
+      block:
+        - name: Delete cnpg-wal-obc ObjectBucketClaim
+          kubernetes.core.k8s:
+            api_version: objectbucket.io/v1alpha1
+            kind: ObjectBucketClaim
+            name: cnpg-wal-obc
+            namespace: "{{ aap_namespace }}"
+            context: "{{ restore_old_primary_ctx }}"
+            kubeconfig: "{{ restore_old_primary_kubeconfig | default(omit, true) }}"
+            state: absent
+          ignore_errors: true
+
+        - name: Wait for WAL OBC deletion
+          kubernetes.core.k8s_info:
+            api_version: objectbucket.io/v1alpha1
+            kind: ObjectBucketClaim
+            name: cnpg-wal-obc
+            namespace: "{{ aap_namespace }}"
+            context: "{{ restore_old_primary_ctx }}"
+            kubeconfig: "{{ restore_old_primary_kubeconfig | default(omit, true) }}"
+          register: _wal_obc_status
+          until: _wal_obc_status.resources | default([]) | length == 0
+          retries: 12
+          delay: 5
+          ignore_errors: true
+
+        - name: Remove finalizers from stuck WAL OBC
+          when:
+            - _wal_obc_status.resources | default([]) | length > 0
+            - _wal_obc_status.resources[0].metadata.deletionTimestamp is defined
+          kubernetes.core.k8s:
+            api_version: objectbucket.io/v1alpha1
+            kind: ObjectBucketClaim
+            name: cnpg-wal-obc
+            namespace: "{{ aap_namespace }}"
+            context: "{{ restore_old_primary_ctx }}"
+            kubeconfig: "{{ restore_old_primary_kubeconfig | default(omit, true) }}"
+            state: present
+            definition:
+              metadata:
+                finalizers: []
+            merge_type: merge
+          ignore_errors: true
+
+        - name: Confirm WAL OBC deleted after finalizer removal
+          when:
+            - _wal_obc_status.resources | default([]) | length > 0
+          kubernetes.core.k8s_info:
+            api_version: objectbucket.io/v1alpha1
+            kind: ObjectBucketClaim
+            name: cnpg-wal-obc
+            namespace: "{{ aap_namespace }}"
+            context: "{{ restore_old_primary_ctx }}"
+            kubeconfig: "{{ restore_old_primary_kubeconfig | default(omit, true) }}"
+          register: _wal_obc_final
+          until: _wal_obc_final.resources | default([]) | length == 0
+          retries: 6
+          delay: 5
+          ignore_errors: true
+
+        - name: Log WAL OBC cleanup result
+          ansible.builtin.debug:
+            msg: >-
+              WAL OBC cleanup on {{ restore_old_primary_name }}:
+              {{ ((_wal_obc_final | default(_wal_obc_status)).resources | default([]) | length == 0)
+                 | bool
+                 | ternary('deleted successfully',
+                           'WARNING - OBC may still exist, ArgoCD sync may fail') }}
+
+    # ==========================================================================
+    # STEP 11: Resume fixed Applications after checking the committed pair state
+    # ============================================================================
+
+    - name: Resume fixed Applications on old primary as replica
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.aap_argocd_manage
+      vars:
+        argocd_action: resume
+        argocd_context: "{{ restore_old_primary_ctx }}"
+        argocd_pair_id: "{{ hadr_pair_id }}"
+        argocd_environment_id: "{{ restore_old_primary_environment_id }}"
+        argocd_expected_role: replica
+        argocd_trigger_sync: true
+
+    - name: Wait for CNPG cluster CR to be created by ArgoCD
+      when: (wal_diverged | default(false) | bool) or (force_reclone | bool) or (needs_full_reclone | bool)
+      kubernetes.core.k8s_info:
+        api_version: postgresql.cnpg.io/v1
+        kind: Cluster
+        name: "{{ cluster_name }}"
+        namespace: "{{ aap_namespace }}"
+        context: "{{ restore_old_primary_ctx }}"
+        kubeconfig: "{{ restore_old_primary_kubeconfig | default(omit, true) }}"
+      register: _cr_wait
+      until: _cr_wait.resources | default([]) | length > 0
+      retries: 30
+      delay: 10
+
+    # The fixed site ODF/RGW role is independent of CNPG primary/replica state.
+    # Replica rebuild verification continues with CNPG health and streaming checks.
+
+
+# ============================================================================
+# STEPS 12-16: Health monitoring and verification (ALWAYS runs)
+# ============================================================================
+# Whether we just performed the demotion + re-bootstrap (steps 5-11) or we're
+# resuming monitoring of a rebuild already in progress, these steps always
+# execute to wait for healthy state and verify replication.
+
+- name: Wait for CNPG cluster CR to exist before health monitoring
+  when: (wal_diverged | default(false) | bool) or (force_reclone | default(false) | bool) or (needs_full_reclone | default(false) | bool) or (rebuild_in_progress | default(false) | bool)
+  kubernetes.core.k8s_info:
+    api_version: postgresql.cnpg.io/v1
+    kind: Cluster
+    name: "{{ cluster_name }}"
+    namespace: "{{ aap_namespace }}"
+    context: "{{ restore_old_primary_ctx }}"
+    kubeconfig: "{{ restore_old_primary_kubeconfig | default(omit, true) }}"
+  register: _cr_precheck
+  until: _cr_precheck.resources | default([]) | length > 0
+  retries: 30
+  delay: 10
+
+# ============================================================================
+# STEP 12: Wait for CNPG healthy on old primary (now replica)
+# ============================================================================
+
+- name: Log health monitoring start
+  debug:
+    msg: "Waiting for CNPG cluster on {{ restore_old_primary_name }} to become healthy (timeout: {{ cnpg_restore_health_timeout }}s / {{ (cnpg_restore_health_timeout | int / 60) | int }}min)"
+
+- name: Wait for CNPG to become healthy on old primary
+  include_role:
+    name: cnpg_common
+    tasks_from: wait_healthy.yml
+  vars:
+    _healthy_context: "{{ restore_old_primary_ctx }}"
+    _healthy_kubeconfig: "{{ restore_old_primary_kubeconfig }}"
+    _healthy_timeout: "{{ cnpg_restore_health_timeout }}"
+    _healthy_poll_interval: "{{ cnpg_restore_poll_interval }}"
+
+- name: Save restore health result
+  set_fact:
+    restore_health_check: "{{ _healthy_result }}"
+
+- name: Assert CNPG cluster reached healthy state
+  assert:
+    that:
+      - restore_health_check.cluster_info.status.phase is defined
+      - "'healthy' in restore_health_check.cluster_info.status.phase | lower"
+    fail_msg: >
+      CNPG cluster on {{ restore_old_primary_name }} did NOT become healthy
+      within {{ cnpg_restore_health_timeout }}s ({{ (cnpg_restore_health_timeout | int / 60) | int }} min).
+      Current phase: {{ restore_health_check.cluster_info.status.phase | default('unknown') }}.
+      Check: oc --context={{ restore_old_primary_ctx }} get cluster {{ cluster_name }} -n {{ aap_namespace }} -o yaml
+
+# ============================================================================
+# STEP 13: Verify CNPG pods running on old primary (now replica)
+# ============================================================================
+
+- name: Verify CNPG pods running on old primary
+  include_role:
+    name: cnpg_common
+    tasks_from: wait_pods.yml
+  vars:
+    _pods_context: "{{ restore_old_primary_ctx }}"
+    _pods_kubeconfig: "{{ restore_old_primary_kubeconfig }}"
+    _pods_target_count: 1
+    _pods_retries: "{{ (cnpg_pod_ready_timeout | int / cnpg_pod_ready_poll_interval | int) | int }}"
+    _pods_delay: "{{ cnpg_pod_ready_poll_interval }}"
+
+# ============================================================================
+# STEP 14: Verify streaming replication from primary
+# ============================================================================
+
+- name: Verify streaming replication from primary
+  include_role:
+    name: cnpg_common
+    tasks_from: verify_streaming.yml
+  vars:
+    _streaming_context: "{{ restore_primary_ctx }}"
+    _streaming_kubeconfig: "{{ restore_primary_kubeconfig }}"
+    _streaming_retries: "{{ (replication_verify_timeout | int / replication_verify_poll_interval | int) | int }}"
+    _streaming_delay: "{{ replication_verify_poll_interval }}"
+
+# ============================================================================
+# STEP 15: Final WAL timeline verification
+# ============================================================================
+
+- name: Get final WAL timeline on primary
+  include_role:
+    name: cnpg_common
+    tasks_from: psql_query.yml
+  vars:
+    _query_context: "{{ restore_primary_ctx }}"
+    _query_kubeconfig: "{{ restore_primary_kubeconfig }}"
+    _query_labels: "cnpg.io/cluster={{ cluster_name }},cnpg.io/instanceRole=primary"
+    _query: "SELECT timeline_id FROM pg_control_checkpoint();"
+
+- name: Save final primary timeline
+  set_fact:
+    final_primary_timeline: "{{ _query_result.stdout | trim }}"
+
+- name: Get final WAL timeline on replica
+  include_role:
+    name: cnpg_common
+    tasks_from: psql_query.yml
+  vars:
+    _query_context: "{{ restore_old_primary_ctx }}"
+    _query_kubeconfig: "{{ restore_old_primary_kubeconfig }}"
+    _query_labels: "cnpg.io/cluster={{ cluster_name }},cnpg.io/instanceRole=replica"
+    _query: "SELECT timeline_id FROM pg_control_checkpoint();"
+
+- name: Save final replica timeline
+  set_fact:
+    final_replica_timeline: "{{ _query_result.stdout | default('0') | trim }}"
+
+- name: Log final timeline verification
+  debug:
+    msg:
+      - "=========================================="
+      - "Final WAL timeline verification"
+      - "Primary ({{ restore_primary_name }}): timeline {{ final_primary_timeline }}"
+      - "Replica ({{ restore_old_primary_name }}): timeline {{ final_replica_timeline }}"
+      - "Timelines match: {{ final_primary_timeline == final_replica_timeline }}"
+      - "=========================================="
+
+- name: Warn if timelines still differ after re-bootstrap
+  when: final_primary_timeline != final_replica_timeline
+  debug:
+    msg:
+      - "WARNING: WAL timelines still differ after restore."
+      - "This may resolve as the replica catches up via streaming."
+      - "If this persists, check replication connectivity and WAL archiver health."
+
+# ============================================================================
+# STEP 16: Set result fact for the calling playbook
+# ============================================================================
+
+- name: Set restore replication result
+  set_fact:
+    cnpg_switchover_result:
+      mode: "restore_replication"
+      old_primary: "{{ restore_old_primary_name }}"
+      new_primary: "{{ restore_primary_name }}"
+      cnpg_phase: "{{ restore_health_check.cluster_info.status.phase | default('unknown') }}"
+      cnpg_pods_on_replica: "{{ _pods_count | default('0') }}"
+      streaming_replicas: "{{ _streaming_count | default('0') }}"
+      wal_diverged: "{{ wal_diverged | default(false) }}"
+      re_bootstrapped: "{{ (wal_diverged | default(false) | bool) or (force_reclone | bool) or (needs_full_reclone | default(false) | bool) }}"
+      timelines_aligned: "{{ final_primary_timeline == final_replica_timeline }}"
+      resumed_from_rebuild: "{{ rebuild_in_progress | default(false) }}"
+      total_duration_seconds: "N/A"

@@ -1,0 +1,67 @@
+---
+# AAP Restore Replication
+#
+# Restores replication on the old primary after a disaster recovery event.
+# Keeps the specified cluster as primary and demotes the other back to replica.
+# May delete and re-bootstrap the CNPG cluster if WAL timelines have diverged.
+#
+# Usage (from the example repository root):
+#   ansible-playbook operations/ansible_collections/aap/hadr_ops/playbooks/aap_restore_replication.yml \
+#     -e @my-deployment/operations/clusters.yml -e target_primary=site-b -e confirm=yes
+#   ansible-playbook operations/ansible_collections/aap/hadr_ops/playbooks/aap_restore_replication.yml \
+#     -e @my-deployment/operations/clusters.yml -e cluster_set=02 -e target_primary=site-b -e confirm=yes
+#
+# Requires: cluster topology via -e @<clusters file> (see the generated <deployment>/operations/clusters.yml)
+#
+# Variables:
+#   target_primary: site_id of the cluster to keep as primary (required)
+#   confirm: "yes" to skip interactive confirmation prompt
+#   cluster_set: "01" (default) — selects which cluster pair to use
+
+- name: AAP Restore Replication
+  hosts: localhost
+  gather_facts: true
+  tasks:
+    - name: Load and validate configuration
+      ansible.builtin.import_role:
+        name: aap.hadr_ops.config_loader
+
+    - name: Validate target_primary
+      ansible.builtin.assert:
+        that:
+          - target_primary is defined
+          - target_primary in _site_to_context
+        fail_msg: >
+          restore_replication requires -e target_primary=<site_id>
+          (valid values: {{ _site_to_context.keys() | list | join(', ') }})
+
+    - name: Display restore replication info
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "Restore Replication"
+          - "Cluster Set: {{ cluster_set }}"
+          - "Keeping {{ target_primary }} as primary, demoting the other"
+          - "⚠️  This may delete and re-bootstrap the CNPG cluster if WAL timelines diverged"
+          - "=========================================="
+
+    - name: Pause for confirmation (skip with -e confirm=yes)
+      ansible.builtin.pause:
+        prompt: "Press Enter to continue with restore replication, or Ctrl+C to abort"
+      when: confirm | default('no') != 'yes'
+
+    - name: Execute restore replication role
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.cnpg_restore_replication
+
+    - name: Display restore results
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "Replication Restored"
+          - "Primary: {{ cnpg_switchover_result.new_primary }}"
+          - "Replica: {{ cnpg_switchover_result.old_primary }} (demoted, AAP idled)"
+          - "CNPG phase: {{ cnpg_switchover_result.cnpg_phase | default('unknown') }}"
+          - "Streaming replicas: {{ cnpg_switchover_result.streaming_replicas | default('0') }}"
+          - "Re-bootstrapped: {{ cnpg_switchover_result.re_bootstrapped | default(false) }}"
+          - "=========================================="
