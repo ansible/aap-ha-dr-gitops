@@ -1,0 +1,33 @@
+# Generated sanitized deployment snapshot.
+---
+# Install OpenShift GitOps operator
+# Apply this FIRST before creating any Argo CD Applications
+#
+# Usage:
+#   oc apply -f argocd/00-openshift-gitops-operator.yaml
+#
+# Wait for operator to be ready:
+#   oc get pods -n openshift-gitops --watch
+#
+# Get Argo CD URL:
+#   oc get route openshift-gitops-server -n openshift-gitops -o jsonpath='{.spec.host}'
+#
+# Get admin password:
+#   oc get secret openshift-gitops-cluster -n openshift-gitops -o jsonpath='{.data.admin\.password}' | base64 -d
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openshift-gitops-operator
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: openshift-gitops-operator
+  namespace: openshift-operators
+spec:
+  channel: latest
+  installPlanApproval: Automatic
+  name: openshift-gitops-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace

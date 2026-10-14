@@ -1,0 +1,90 @@
+---
+# =============================================================================
+# Ceph OSD Full Recovery Playbook
+# =============================================================================
+#
+# Automates recovery from Ceph OSD fullness by:
+#   1. Detecting OSD full conditions
+#   2. Temporarily raising full ratios
+#   3. Triggering cleanup operations
+#   4. Monitoring recovery to HEALTH_OK
+#   5. Restoring default ratios
+#
+# Usage:
+#   ansible-playbook operations/ansible_collections/aap/hadr_ops/playbooks/ceph_recovery.yml -e ceph_context=my-cluster-a
+#   # Or use topology-based resolution (target_site is 'a' or 'b' from cluster_sets):
+#   ansible-playbook operations/ansible_collections/aap/hadr_ops/playbooks/ceph_recovery.yml -e @my-deployment/operations/clusters.yml -e cluster_set=01 -e target_site=a
+#   # Example with cluster set 02:
+#   ansible-playbook operations/ansible_collections/aap/hadr_ops/playbooks/ceph_recovery.yml -e @my-deployment/operations/clusters.yml -e cluster_set=02 -e target_site=a
+#   ansible-playbook operations/ansible_collections/aap/hadr_ops/playbooks/ceph_recovery.yml \
+#     -e ceph_operation=set_ratios \
+#     -e ceph_context=my-cluster-a \
+#     -e ceph_full_ratio_target=0.85 \
+#     -e ceph_backfillfull_ratio_target=0.80 \
+#     -e ceph_nearfull_ratio_target=0.75
+#   # In set_ratios mode, omitting target values uses the same defaults above.
+#   # Omitting ceph_operation selects the full recover workflow.
+#
+# Related:
+#   - Make targets: make -C deployment ceph-recovery CONTEXT=my-cluster-a
+# =============================================================================
+
+- name: Recover from Ceph OSD fullness
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    ceph_operation: recover
+    # Cluster set and logical site variables (optional, for integration with other playbooks).
+    # When using target_site, cluster_sets must be provided via -e @clusters.yml
+    cluster_set: '01'
+    target_site: ''
+
+    # Context resolution: explicit ceph_context takes precedence over target_site.
+    # When target_site is provided, derive context from cluster_sets topology.
+    _derived_context: >-
+      {{
+        (cluster_sets is defined and cluster_set in cluster_sets and target_site in ['a', 'b'])
+        | ternary(cluster_sets[cluster_set].clusters[target_site].context, "")
+      }}
+
+  pre_tasks:
+    - name: Resolve Ceph context
+      ansible.builtin.set_fact:
+        resolved_ceph_context: '{{ ceph_context | default(_derived_context, true) }}'
+
+    - name: Validate context is specified
+      ansible.builtin.assert:
+        that:
+          - resolved_ceph_context | length > 0
+        fail_msg: |
+          Must specify either:
+            -e ceph_context=my-cluster-a
+          OR
+            -e target_site=a -e @clusters.yml (cluster selector: 'a' or 'b')
+
+          Note: target_site must be 'a' or 'b' (cluster selector key),
+          not your site_id value from the inventory (e.g., 'dc-east').
+
+    - name: Display recovery parameters
+      ansible.builtin.debug:
+        msg:
+          - '=========================================='
+          - 'Ceph OSD Full Recovery'
+          - '=========================================='
+          - 'Context: {{ resolved_ceph_context }}'
+          - 'Cluster Set: {{ cluster_set | default("not specified") }}'
+          - 'Target Site: {{ target_site | default("not specified") }}'
+          - 'Auto Cleanup: {{ ceph_auto_cleanup | default(true) }}'
+          - 'Auto Restore: {{ ceph_auto_restore_defaults | default(true) }}'
+          - 'Delete WAL OBC: {{ ceph_delete_wal_obc | default(false) }}'
+          - '=========================================='
+
+  tasks:
+    - name: Execute Ceph full ratio manager
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.ceph_full_ratio_manager
+      vars:
+        ceph_context: '{{ resolved_ceph_context }}'
+...

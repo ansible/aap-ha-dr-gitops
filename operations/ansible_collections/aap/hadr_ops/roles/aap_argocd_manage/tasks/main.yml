@@ -1,0 +1,29 @@
+---
+# aap_argocd_manage — Manage ArgoCD application on a single cluster
+#
+# Per-target-system role. Call once per cluster.
+# The playbook decides which clusters to call and in what order.
+#
+# Input:
+#   argocd_action  — "pause" | "resume" | "status"
+#   argocd_context — K8s context of the target cluster
+#   argocd_application_names, argocd_namespace
+#   argocd_pair_id, argocd_environment_id, argocd_expected_role — optional
+#     pair-state assertion for resume before automation is enabled
+#   argocd_trigger_sync  — (resume only) trigger sync after resume
+#
+# Output (status action only):
+#   argocd_status_result — dict with sync, health, and the root Application path
+
+- name: Validate inputs
+  ansible.builtin.fail:
+    msg: >-
+      argocd_action must be 'pause', 'resume', or 'status'
+      (got '{{ argocd_action | default('') }}')
+      and argocd_context must be set (got '{{ argocd_context | default('') }}')
+  when: >
+    argocd_action | default('') not in ['pause', 'resume', 'status'] or
+    argocd_context | default('') == ''
+
+- name: "ArgoCD {{ argocd_action }}: {{ argocd_context }}"
+  ansible.builtin.include_tasks: "{{ argocd_action }}.yml"

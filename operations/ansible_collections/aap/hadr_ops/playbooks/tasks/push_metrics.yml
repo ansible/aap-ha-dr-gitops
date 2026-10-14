@@ -1,0 +1,35 @@
+---
+# Push preflight results to Prometheus Pushgateway via HTTP POST.
+# Uses ansible.builtin.uri (no external collection dependency).
+# Skipped when prometheus_pushgateway_url is not set.
+
+- name: "Metrics: Build metrics payload"
+  ansible.builtin.set_fact:
+    _metrics_lines: |
+      # HELP hadr_preflight_check Preflight check result (1=pass, 0.5=warn, 0=fail)
+      # TYPE hadr_preflight_check gauge
+      {% for key, val in _preflight_checks.items() %}
+      hadr_preflight_check{check_id="{{ key }}",status="{{ val.status | default('skip') }}",cluster_set="{{ cluster_set }}",mode="{{ _effective_mode | default(mode) | trim }}",autofix="{{ autofix | string }}",fix_result="{{ val.fix_result | default('none') }}"} {{ 1 if val.status == 'pass' else 0 if val.status == 'fail' else 0.5 }}
+      {% endfor %}
+      # HELP hadr_preflight_run Preflight run summary
+      # TYPE hadr_preflight_run gauge
+      hadr_preflight_run{cluster_set="{{ cluster_set }}",mode="{{ _effective_mode | default(mode) | trim }}",decision="{{ preflight_decision.action | trim }}",autofix="{{ autofix | string }}"} 1
+
+      # HELP hadr_preflight_fixes_attempted Total number of autofixes attempted during preflight
+      # TYPE hadr_preflight_fixes_attempted counter
+      hadr_preflight_fixes_attempted{cluster_set="{{ cluster_set }}"} {{ _autofix_stats.fixes_attempted | default(0) }}
+
+      # HELP hadr_preflight_fixes_succeeded Total number of autofixes succeeded during preflight
+      # TYPE hadr_preflight_fixes_succeeded counter
+      hadr_preflight_fixes_succeeded{cluster_set="{{ cluster_set }}"} {{ _autofix_stats.fixes_succeeded | default(0) }}
+
+- name: "Metrics: Push to Pushgateway"
+  ansible.builtin.uri:
+    url: "{{ prometheus_pushgateway_url }}/metrics/job/{{ prometheus_preflight_job | default('hadr_preflight') }}"
+    method: POST
+    body: "{{ _metrics_lines }}"
+    body_format: raw
+    headers:
+      Content-Type: "text/plain"
+    status_code: [200, 202]
+  failed_when: false

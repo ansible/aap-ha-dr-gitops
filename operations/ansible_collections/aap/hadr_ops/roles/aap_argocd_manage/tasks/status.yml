@@ -1,0 +1,57 @@
+---
+# Read-only ArgoCD status check on a single cluster.
+# Queries the cluster root Application (argocd_parent_app_name) for overall health.
+#
+# Output (set_fact):
+#   argocd_status_result — dict with context, sync, health, root source_path, error
+
+- name: Assert parent app name is set
+  ansible.builtin.assert:
+    that: argocd_parent_app_name | length > 0
+    fail_msg: "argocd_parent_app_name must be set"
+
+- name: Query ArgoCD parent application on {{ argocd_context }}
+  kubernetes.core.k8s_info:
+    api_version: argoproj.io/v1alpha1
+    kind: Application
+    name: "{{ argocd_parent_app_name }}"
+    namespace: "{{ argocd_namespace }}"
+    context: "{{ argocd_context }}"
+  register: _argocd_app
+  ignore_errors: true
+
+- name: Set ArgoCD status result (found)
+  when: _argocd_app is succeeded and (_argocd_app.resources | default([]) | length > 0)
+  vars:
+    _app: "{{ _argocd_app.resources[0] }}"
+  ansible.builtin.set_fact:
+    argocd_status_result:
+      context: "{{ argocd_context }}"
+      status: "found"
+      sync: "{{ _app.status.sync.status | default('Unknown') }}"
+      health: "{{ _app.status.health.status | default('Unknown') }}"
+      source_path: "{{ _app.spec.source.path | default('unknown') }}"
+      error: ""
+
+- name: Set ArgoCD status result (not found)
+  when: _argocd_app is failed or (_argocd_app.resources | default([]) | length == 0)
+  ansible.builtin.set_fact:
+    argocd_status_result:
+      context: "{{ argocd_context }}"
+      status: "not_found"
+      sync: "unknown"
+      health: "unknown"
+      source_path: "unknown"
+      error: "{{ _argocd_app.msg | default('ArgoCD application not found') }}"
+
+- name: Log ArgoCD status
+  ansible.builtin.debug:
+    msg:
+      - "ArgoCD Status: {{ argocd_context }}"
+      - "  Parent app: {{ argocd_parent_app_name }}"
+      - "  Fixed Applications: {{ argocd_application_names | join(', ') }}"
+      - "  Status:  {{ argocd_status_result.status }}"
+      - "  Sync:    {{ argocd_status_result.sync }}"
+      - "  Health:  {{ argocd_status_result.health }}"
+      - "  Root path: {{ argocd_status_result.source_path }}"
+      - "  Error:   {{ argocd_status_result.error | default('none') | truncate(200) }}"

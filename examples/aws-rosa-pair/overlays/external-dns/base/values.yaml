@@ -1,0 +1,49 @@
+# Official upstream chart; ArgoCD owns the rendered resources.
+provider:
+  name: aws
+sources: [service]
+namespaced: true
+sourceNamespace: aap
+labelFilter: aap.redhat.com/external-dns=replication
+# Preserve the annotation keys already used by the CNPG Service.
+annotationPrefix: external-dns.alpha.kubernetes.io/
+policy: upsert-only
+registry: txt
+txtPrefix: external-dns-%{record_type}-
+interval: 10s
+triggerLoopOnEvent: true
+managedRecordTypes: [CNAME]
+extraArgs:
+  aws-prefer-cname: true
+  aws-zone-type: public
+  service-type-filter: LoadBalancer
+# One writer; do not overlap controller pods during upgrades.
+deploymentStrategy:
+  type: Recreate
+# OpenShift restricted-v2 SCC assigns namespace-specific UID/GID ranges.
+podSecurityContext:
+  fsGroup: null
+securityContext:
+  runAsUser: null
+  runAsGroup: null
+extraVolumes:
+  - name: aws-token
+    projected:
+      sources:
+        - serviceAccountToken:
+            audience: sts.amazonaws.com
+            expirationSeconds: 3600
+            path: token
+extraVolumeMounts:
+  - name: aws-token
+    mountPath: /var/run/secrets/aws
+    readOnly: true
+serviceMonitor:
+  enabled: true
+  interval: 15s
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi

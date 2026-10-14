@@ -1,0 +1,254 @@
+---
+# AAP Disaster Recovery — Force Promotion
+#
+# Force-promotes a specified cluster to primary WITHOUT coordination with the
+# old primary. Use ONLY when the other region is completely unreachable.
+# Manual intervention is required when the old primary recovers.
+#
+# Usage (from the example repository root):
+#   ansible-playbook operations/ansible_collections/aap/hadr_ops/playbooks/aap_disaster_recovery.yml \
+#     -e @my-deployment/operations/clusters.yml -e target_primary=site-b -e confirm=yes
+#
+# After recovery, restore replication:
+#   ansible-playbook operations/ansible_collections/aap/hadr_ops/playbooks/aap_restore_replication.yml \
+#     -e @my-deployment/operations/clusters.yml -e target_primary=site-b -e confirm=yes
+#
+# Requires: cluster topology via -e @<clusters file> (see the generated <deployment>/operations/clusters.yml)
+#
+# Variables:
+#   cluster_set: "01" (default) or "02" — selects cluster contexts and pair/environment IDs
+#   target_primary: site_id of the cluster to force-promote (required)
+#   confirm: "yes" to skip interactive confirmation prompt
+#   aap_namespace: AAP namespace (default: aap)
+#   cluster_name: CNPG cluster name (default: aap-postgres)
+
+- name: AAP Disaster Recovery
+  hosts: localhost
+  gather_facts: true
+  tasks:
+    - name: Load and validate configuration
+      ansible.builtin.import_role:
+        name: aap.hadr_ops.config_loader
+
+    # ── Validation ────────────────────────────────────────────────
+    - name: Validate target_primary
+      ansible.builtin.assert:
+        that:
+          - target_primary is defined
+          - target_primary in _site_to_context
+        fail_msg: >
+          disaster_recovery requires -e target_primary=<site_id>
+          (valid values: {{ _site_to_context.keys() | list | join(', ') }})
+
+    - name: Display disaster recovery warning
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "⚠️  DISASTER RECOVERY MODE"
+          - "⚠️  This will force-promote {{ target_primary }} to primary WITHOUT coordination"
+          - "⚠️  Use this ONLY when the other region is completely unreachable"
+          - "⚠️  Manual intervention required when the old primary recovers"
+          - "Cluster Set: {{ cluster_set }}"
+          - "Cluster-A: {{ cluster_a_context }} (site_id={{ site_id_a }})"
+          - "Cluster-B: {{ cluster_b_context }} (site_id={{ site_id_b }})"
+          - "Target Primary: {{ target_primary }}"
+          - "=========================================="
+
+    - name: Pause for confirmation (skip with -e confirm=yes)
+      ansible.builtin.pause:
+        prompt: "Press Enter to continue with disaster recovery, or Ctrl+C to abort"
+      when: confirm | default('no') != 'yes'
+
+    # ── Init ──────────────────────────────────────────────────────
+    - name: Record switchover start time
+      ansible.builtin.set_fact:
+        switchover_start_time: "{{ ansible_facts.date_time.epoch }}"
+        switchover_log_file: "{{ switchover_log_dir }}/cnpg-switchover-{{ ansible_facts.date_time.iso8601_basic_short }}.log"
+
+    - name: Determine target cluster for DR promotion
+      ansible.builtin.set_fact:
+        new_primary_context: "{{ _site_to_context[target_primary] | default(cluster_b_context) }}"
+        new_self: "{{ target_primary | default(site_id_b) }}"
+        new_primary_environment_id: "{{ hadr_environment_id_a if target_primary == site_id_a else hadr_environment_id_b }}"
+        old_self: "{{ (_site_to_context.keys() | list | difference([target_primary]))[0] | default(site_id_a) }}"
+        old_primary_context: "{{ _site_to_context[(_site_to_context.keys() | list | difference([target_primary]))[0]] | default(cluster_a_context) }}"
+
+    - name: Log disaster recovery initiation
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "CNPG Switchover Started"
+          - "Mode: DISASTER RECOVERY (force)"
+          - "⚠️  Promoting {{ new_self }} WITHOUT demotion token"
+          - "⚠️  Manual intervention required if {{ old_self }} recovers"
+          - "Namespace: {{ aap_namespace }}"
+          - "Cluster: {{ cluster_name }}"
+          - "Log file: {{ switchover_log_file }}"
+          - "=========================================="
+
+    # ── ArgoCD pause (new primary only — old primary is unreachable) ──
+    - name: Pause ArgoCD on new primary
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.aap_argocd_manage
+      vars:
+        argocd_action: pause
+        argocd_context: "{{ new_primary_context }}"
+
+    # ── Core CNPG force-promotion ─────────────────────────────────
+    - name: Force-promote new primary (DR without demotion token)
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.cnpg_switchover
+      vars:
+        switchover_action: force_promote
+        switchover_context: "{{ new_primary_context }}"
+        switchover_new_primary: "{{ new_self }}"
+
+    - name: Save promote result
+      ansible.builtin.set_fact:
+        promote_result: "{{ switchover_result }}"
+
+    - name: Guard — warn if promote did not fully succeed
+      when: (promote_result.status | default('') | trim) != 'success'
+      ansible.builtin.debug:
+        msg:
+          - "WARNING: Promote status is {{ promote_result.status | trim }} (not 'success')"
+          - "  Error: {{ promote_result.error | default('') | trim }}"
+          - "  Continuing with activation — cluster may be degraded"
+
+    # ── Workarounds ───────────────────────────────────────────────
+    - name: Apply post-switchover workarounds on new primary
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.switchover_workarounds
+      vars:
+        workaround_context: "{{ new_primary_context }}"
+
+    # ── Activate AAP on new primary ───────────────────────────────
+    # AAP (Controller, Gateway, EDA) needs CNPG to start. Its ApplicationSet
+    # source role follows pair state; ODF/RGW sources remain fixed per site.
+    - name: Activate AAP on new primary
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.aap_platform_lifecycle
+      vars:
+        lifecycle_action: activate
+        lifecycle_context: "{{ new_primary_context }}"
+
+    - name: Save activate result
+      ansible.builtin.set_fact:
+        scale_up_result: "{{ lifecycle_result }}"
+        switchover_health: "{{ lifecycle_result.status | trim }}"
+        gateway_healthy: "{{ lifecycle_result.gateway_healthy | default(false) }}"
+        controller_healthy: "{{ lifecycle_result.controller_healthy | default(false) }}"
+        aap_deployments_healthy: "{{ lifecycle_result.deployments_healthy | default(false) }}"
+
+    # RGW roles stay fixed per site during cluster failover. RGW disaster
+    # recovery is a separate, explicitly invoked storage operation.
+
+    # ── Post-switchover topology ──────────────────────────────────
+    - name: Get post-switchover topology cluster-a
+      aap.hadr_ops.cnpg_cluster_info:
+        namespace: "{{ aap_namespace }}"
+        cluster_name: "{{ cluster_name }}"
+        context: "{{ cluster_a_context }}"
+      register: post_cluster_a_info
+      ignore_errors: true
+
+    - name: Get post-switchover topology cluster-b
+      aap.hadr_ops.cnpg_cluster_info:
+        namespace: "{{ aap_namespace }}"
+        cluster_name: "{{ cluster_name }}"
+        context: "{{ cluster_b_context }}"
+      register: post_cluster_b_info
+      ignore_errors: true
+
+    - name: Display post-switchover topology
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "Post-Switchover Topology"
+          - "cluster-a: self={{ (post_cluster_a_info.cluster_info | default({})).spec.self | default('N/A') }} primary={{ (post_cluster_a_info.cluster_info | default({})).spec.primary | default('N/A') }} is_primary={{ (post_cluster_a_info.cluster_info | default({})).computed.is_primary | default(false) }}"
+          - "cluster-b: self={{ (post_cluster_b_info.cluster_info | default({})).spec.self | default('N/A') }} primary={{ (post_cluster_b_info.cluster_info | default({})).spec.primary | default('N/A') }} is_primary={{ (post_cluster_b_info.cluster_info | default({})).computed.is_primary | default(false) }}"
+          - "=========================================="
+
+    # ── ArgoCD resume (new primary only) ──────────────────────────
+    - name: Wait for the approved pair record to reach the surviving ApplicationSet
+      ansible.builtin.pause:
+        prompt: >-
+          Update deployment/argocd/pairs/{{ hadr_pair_id }}.yaml so
+          desired_primary_environment_id is {{ new_primary_environment_id }};
+          merge that Git change and wait for the CNPG/platform Applications
+          on {{ new_primary_context }} to show the new pair roles. Press Enter to continue.
+      when: not (pair_state_reconciled | bool)
+
+    - name: Resume ArgoCD on new primary
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.aap_argocd_manage
+      vars:
+        argocd_action: resume
+        argocd_context: "{{ new_primary_context }}"
+        argocd_pair_id: "{{ hadr_pair_id }}"
+        argocd_environment_id: "{{ new_primary_environment_id }}"
+        argocd_expected_role: primary
+        argocd_trigger_sync: true
+
+    # ── Results ───────────────────────────────────────────────────
+    - name: Calculate total duration
+      ansible.builtin.set_fact:
+        total_duration_seconds: "{{ promote_result.duration_seconds | float }}"
+
+    - name: Set switchover result
+      ansible.builtin.set_fact:
+        cnpg_switchover_result:
+          mode: "disaster_recovery_force_promote"
+          health: "{{ switchover_health | trim }}"
+          old_primary: "{{ old_self }} (unreachable)"
+          new_primary: "{{ new_self }}"
+          forced: true
+          promotion_duration_seconds: "{{ promote_result.duration_seconds }}"
+          total_duration_seconds: "{{ total_duration_seconds }}"
+          gateway_healthy: "{{ gateway_healthy }}"
+          controller_healthy: "{{ controller_healthy }}"
+          deployments_healthy: "{{ aap_deployments_healthy | default(false) }}"
+          topology_new_primary: "{{ (post_cluster_a_info if new_primary_context == cluster_a_context else post_cluster_b_info).cluster_info | default({}) }}"
+          topology_old_primary: "{{ (post_cluster_a_info if old_primary_context == cluster_a_context else post_cluster_b_info).cluster_info | default({}) }}"
+          warnings: "{{ promote_result.warnings | default([]) }}"
+          recovery_instructions: "When {{ old_self }} region recovers, manually delete CNPG cluster and re-bootstrap as replica"
+
+    - name: Display disaster recovery completion summary
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "Disaster Recovery Complete: {{ old_self }} → {{ new_self }}"
+          - "Health: {{ cnpg_switchover_result.health }}"
+          - "Total Duration: {{ total_duration_seconds }}s"
+          - "Promotion: {{ promote_result.duration_seconds }}s"
+          - "Gateway: {{ 'OK' if cnpg_switchover_result.gateway_healthy else 'FAILED' }} | Controller: {{ 'OK' if cnpg_switchover_result.controller_healthy else 'FAILED' }} | Deployments: {{ 'OK' if cnpg_switchover_result.deployments_healthy else 'DEGRADED' }}"
+          - "Log: {{ switchover_log_file }}"
+          - "Next: ansible-playbook operations/ansible_collections/aap/hadr_ops/playbooks/aap_restore_replication.yml -e @my-deployment/operations/clusters.yml -e target_primary={{ new_self }} -e confirm=yes"
+          - "=========================================="
+
+    - name: Write switchover log summary
+      ansible.builtin.copy:
+        content: |
+          CNPG Distributed Switchover Log
+          ================================
+          Timestamp: {{ ansible_facts.date_time.iso8601 }}
+          Mode: {{ cnpg_switchover_result.mode }}
+          Health: {{ cnpg_switchover_result.health }}
+          Direction: {{ old_self }} → {{ new_self }}
+          Total Duration: {{ total_duration_seconds }}s
+          Promotion Duration: {{ promote_result.duration_seconds }}s
+          AAP Health:
+            Gateway: {{ 'healthy' if cnpg_switchover_result.gateway_healthy else 'NOT RESPONDING' }}
+            Controller: {{ 'healthy' if cnpg_switchover_result.controller_healthy else 'NOT RESPONDING' }}
+            Deployments: {{ 'all key deployments ready' if cnpg_switchover_result.deployments_healthy else 'DEGRADED' }}
+          DISASTER RECOVERY WARNINGS:
+          {% for warning in cnpg_switchover_result.warnings %}
+          - {{ warning }}
+          {% endfor %}
+          RECOVERY INSTRUCTIONS:
+          {{ cnpg_switchover_result.recovery_instructions }}
+          Post-Switchover Topology:
+          cluster-a: {{ (post_cluster_a_info.cluster_info | default({})).spec.primary | default('N/A (unreachable)') }} (is_primary: {{ (post_cluster_a_info.cluster_info | default({})).computed.is_primary | default(false) }})
+          cluster-b: {{ (post_cluster_b_info.cluster_info | default({})).spec.primary | default('N/A (unreachable)') }} (is_primary: {{ (post_cluster_b_info.cluster_info | default({})).computed.is_primary | default(false) }})
+        dest: "{{ switchover_log_file }}"
+      delegate_to: localhost

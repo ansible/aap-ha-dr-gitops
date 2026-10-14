@@ -1,0 +1,20 @@
+---
+galaxy_info:
+  author: AAP HA/DR Testing Team
+  description: Restores CNPG replication on a former primary after disaster recovery force-promotion
+  company: Red Hat
+  license: GPL-3.0-or-later
+  min_ansible_version: "2.9"
+  platforms:
+    - name: EL
+      versions:
+        - all
+  galaxy_tags:
+    - hadr
+    - disaster_recovery
+    - cloudnativepg
+    - postgresql
+    - replication
+    - ansible_automation_platform
+
+dependencies: []

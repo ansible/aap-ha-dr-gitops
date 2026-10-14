@@ -1,0 +1,215 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+  name: aap
+---
+apiVersion: aap.ansible.com/v1alpha1
+kind: AnsibleAutomationPlatform
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "6"
+  name: aap
+  namespace: aap
+spec:
+  admin_password_secret: aap-admin-password
+  api:
+    log_level: INFO
+    replicas: 2
+    resource_requirements:
+      requests:
+        cpu: 500m
+        memory: 4Gi
+    topology_spread_constraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+  controller:
+    create_preload_data: false
+    disabled: false
+    ee_resource_requirements:
+      requests:
+        cpu: 100m
+        memory: 1Gi
+    init_container_resource_requirements:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+    postgres_configuration_secret: aap-controller-postgres-configuration
+    rsyslog_resource_requirements:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+    task_replicas: 2
+    task_resource_requirements:
+      requests:
+        cpu: 1000m
+        memory: 8Gi
+    task_topology_spread_constraints: |
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+    uwsgi_processes: 16
+    web_replicas: 2
+    web_resource_requirements:
+      requests:
+        cpu: 500m
+        memory: 8Gi
+    web_topology_spread_constraints: |
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+  database:
+    database_secret: aap-gateway-postgres-configuration
+    disabled: true
+  eda:
+    activation_worker:
+      replicas: 2
+      resource_requirements:
+        requests:
+          cpu: 500m
+          memory: 4Gi
+    api:
+      replicas: 2
+      resource_requirements:
+        requests:
+          cpu: 500m
+          memory: 4Gi
+    database:
+      database_secret: aap-eda-postgres-configuration
+      externally_managed: true
+    default_worker:
+      replicas: 2
+      resource_requirements:
+        requests:
+          cpu: 500m
+          memory: 4Gi
+    disabled: false
+    event_stream:
+      database_secret: aap-eda-event-stream-postgres-configuration
+      externally_managed: true
+    redis_storage_size: 1Gi
+    ui_disabled: true
+    worker:
+      replicas: 2
+      resource_requirements:
+        requests:
+          cpu: 500m
+          memory: 4Gi
+  extra_settings:
+  - setting: CSRF_TRUSTED_ORIGINS
+    value:
+    - https://proxy.aap-hadr-1.devcluster.openshift.com
+    - https://aap-aap.apps.rosa.i8m2i7h2m5l3g4j.ff74.p3.openshiftapps.com
+  gateway_timeouts:
+  - gateway_route_name: hub container registry
+    idle_timeout_seconds: 600
+    request_timeout_seconds: 600
+  - gateway_route_name: pulp content
+    idle_timeout_seconds: 600
+    request_timeout_seconds: 600
+  - gateway_route_name: galaxy api
+    idle_timeout_seconds: 600
+    request_timeout_seconds: 600
+  hub:
+    api:
+      replicas: 2
+      resource_requirements:
+        limits:
+          cpu: "2"
+          memory: 4Gi
+        requests:
+          cpu: 500m
+          memory: 2Gi
+    content:
+      replicas: 2
+      resource_requirements:
+        limits:
+          cpu: "2"
+          memory: 4Gi
+        requests:
+          cpu: 500m
+          memory: 2Gi
+    disabled: false
+    nginx_proxy_connect_timeout: 120s
+    nginx_proxy_read_timeout: 120s
+    nginx_proxy_send_timeout: 120s
+    object_storage_s3_secret: hub-rgw-s3-credentials
+    postgres_configuration_secret: aap-hub-postgres-configuration
+    pulp_settings:
+      analytics: false
+      redirect_to_object_storage: false
+      token_expiration_time: 86400
+    redis_storage_size: 1Gi
+    storage_type: s3
+    topology_spread_constraints: |
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+    web:
+      replicas: 2
+      resource_requirements:
+        limits:
+          cpu: "1"
+          memory: 2Gi
+        requests:
+          cpu: 200m
+          memory: 1Gi
+    worker:
+      replicas: 2
+      resource_requirements:
+        requests:
+          cpu: 250m
+          memory: 8Gi
+  idle_aap: false
+  image_pull_policy: IfNotPresent
+  lightspeed:
+    disabled: true
+  metrics:
+    disabled: true
+  no_log: true
+  public_base_url: https://proxy.aap-hadr-1.devcluster.openshift.com
+  redis: {}
+  redis_mode: standalone
+  route_annotations: |
+    haproxy.router.openshift.io/timeout: '600s'
+    haproxy.router.openshift.io/set-forwarded-headers: 'never'
+  route_tls_termination_mechanism: Edge
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+  name: aap-operator-group
+  namespace: aap
+spec:
+  targetNamespaces:
+  - aap
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "-3"
+  name: ansible-automation-platform-operator
+  namespace: aap
+spec:
+  channel: stable-2.7
+  installPlanApproval: Automatic
+  name: ansible-automation-platform-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace

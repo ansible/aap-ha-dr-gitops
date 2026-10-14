@@ -1,0 +1,35 @@
+---
+# Collect the platform state used by CHK-11 through CHK-16.
+# This is deliberately separate from evaluation so normal preflight probes
+# each cluster once while autofix can recheck one individual check.
+
+- name: "Platform probe: Clear previous results"
+  ansible.builtin.set_fact:
+    _platform_result_a: {}
+    _platform_result_b: {}
+
+- name: "Platform probe: Check on cluster-a"
+  when: _chk01_a_reachable | bool
+  block:
+    - name: "Platform probe: Run platform check on cluster-a"
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.cnpg_preflight
+        tasks_from: check_platform.yml
+      vars:
+        preflight_context: "{{ cluster_a_context }}"
+    - name: "Platform probe: Save cluster-a result"
+      ansible.builtin.set_fact:
+        _platform_result_a: "{{ platform_check_result }}"
+
+- name: "Platform probe: Check on cluster-b"
+  when: _chk01_b_reachable | bool
+  block:
+    - name: "Platform probe: Run platform check on cluster-b"
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.cnpg_preflight
+        tasks_from: check_platform.yml
+      vars:
+        preflight_context: "{{ cluster_b_context }}"
+    - name: "Platform probe: Save cluster-b result"
+      ansible.builtin.set_fact:
+        _platform_result_b: "{{ platform_check_result }}"

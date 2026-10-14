@@ -1,0 +1,129 @@
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: aap-set-cleanup-schedules
+  namespace: aap
+  annotations:
+    argocd.argoproj.io/sync-wave: "25"
+spec:
+  schedule: "0 */6 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      ttlSecondsAfterFinished: 300
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: set-cleanup
+            image: registry.access.redhat.com/ubi9/ubi:latest
+            command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              echo "Waiting for AAP gateway..."
+              READY=false
+              for i in $(seq 1 30); do
+                STATUS=$(curl -sk http://aap.aap.svc.cluster.local/api/gateway/v1/ping/ 2>/dev/null | grep -o '"status":"[^"]*"' | head -1)
+                if echo "$STATUS" | grep -q "good"; then
+                  echo "Gateway is ready"
+                  READY=true
+                  break
+                fi
+                echo "  attempt $i: $STATUS"
+                sleep 10
+              done
+              if [ "$READY" != "true" ]; then
+                echo "ERROR: Gateway not ready after 30 attempts"
+                exit 1
+              fi
+
+              API="http://aap.aap.svc.cluster.local/api/controller/v2"
+              DAYS="${CLEANUP_RETENTION_DAYS}"
+              INTERVAL="${CLEANUP_INTERVAL_HOURS}"
+              RRULE="DTSTART:20260101T000000Z RRULE:FREQ=HOURLY;INTERVAL=${INTERVAL}"
+
+              # Fetch all system job templates
+              TEMPLATES=$(curl -sk -u "$ADMIN_USER:$ADMIN_PASS" "$API/system_job_templates/")
+              if [ -z "$TEMPLATES" ] || ! echo "$TEMPLATES" | python3 -c "import json,sys; json.load(sys.stdin)" 2>/dev/null; then
+                echo "ERROR: failed to fetch system job templates"
+                exit 1
+              fi
+
+              for JOB_TYPE in cleanup_jobs cleanup_activitystream; do
+                echo ""
+                echo "=== $JOB_TYPE ==="
+
+                TEMPLATE_ID=$(echo "$TEMPLATES" | python3 -c "
+              import json, sys
+              data = json.load(sys.stdin)
+              for r in data.get('results', []):
+                  if r.get('job_type') == '$JOB_TYPE':
+                      print(r['id']); break
+              ")
+
+                if [ -z "$TEMPLATE_ID" ]; then
+                  echo "  SKIP: no template found"
+                  continue
+                fi
+                echo "  Template ID: $TEMPLATE_ID"
+
+                SCHEDULES=$(curl -sk -u "$ADMIN_USER:$ADMIN_PASS" "$API/system_job_templates/$TEMPLATE_ID/schedules/")
+
+                SCHED_LIST=$(echo "$SCHEDULES" | python3 -c "
+              import json, sys
+              data = json.load(sys.stdin)
+              for s in data.get('results', []):
+                  days = s.get('extra_data', {}).get('days', '?')
+                  print(f'{s[\"id\"]} {days}')
+              ")
+                if [ -z "$SCHED_LIST" ]; then
+                  echo "  No schedules found"
+                  continue
+                fi
+
+                echo "$SCHED_LIST" | while IFS= read -r line; do
+                  SCHED_ID=$(echo "$line" | awk '{print $1}')
+                  CURRENT_DAYS=$(echo "$line" | awk '{print $2}')
+
+                  if [ "$CURRENT_DAYS" = "$DAYS" ]; then
+                    echo "  Schedule $SCHED_ID already set to ${DAYS}d"
+                  else
+                    echo "  Updating schedule $SCHED_ID: ${CURRENT_DAYS}d -> ${DAYS}d, interval=${INTERVAL}h"
+                    HTTP_CODE=$(curl -sk -u "$ADMIN_USER:$ADMIN_PASS" \
+                      -X PATCH -H 'Content-Type: application/json' \
+                      -d "{\"extra_data\":{\"days\":\"$DAYS\"},\"rrule\":\"$RRULE\"}" \
+                      "$API/schedules/$SCHED_ID/" -o /dev/null -w "%{http_code}")
+                    echo "  HTTP $HTTP_CODE"
+                    if [ "$HTTP_CODE" -ge 400 ] 2>/dev/null; then
+                      echo "  ERROR: PATCH failed for schedule $SCHED_ID"
+                      echo "PATCH_FAILED" > /tmp/cleanup-patch-failed
+                    fi
+                  fi
+                done
+              done
+
+              if [ -f /tmp/cleanup-patch-failed ]; then
+                rm -f /tmp/cleanup-patch-failed
+                echo "ERROR: one or more schedule updates failed"
+                exit 1
+              fi
+              echo ""
+              echo "=== Done ==="
+            env:
+            - name: ADMIN_USER
+              value: admin
+            - name: ADMIN_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: aap-admin-password
+                  key: password
+            - name: CLEANUP_RETENTION_DAYS
+              value: "7"
+            - name: CLEANUP_INTERVAL_HOURS
+              value: "1"

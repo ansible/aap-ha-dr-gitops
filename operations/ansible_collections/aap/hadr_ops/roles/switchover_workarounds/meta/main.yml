@@ -1,0 +1,11 @@
+---
+galaxy_info:
+  role_name: switchover_workarounds
+  author: AAP HA/DR Testing Team
+  description: >-
+    Post-switchover workarounds for a single cluster. Handles known issues
+    like stale OAuth2 secrets (AAP-75811) that need cleanup after failover.
+  company: Red Hat
+  license: Apache-2.0
+  min_ansible_version: "2.15"
+dependencies: []

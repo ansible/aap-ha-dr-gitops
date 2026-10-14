@@ -1,0 +1,20 @@
+---
+# CHK-15: Leftover chaos artifacts.
+
+- name: "CHK-15: Finalize chaos artifact result"
+  vars:
+    _chaos_statuses:
+      - "{{ _platform_result_a.chaos_artifacts.status | default('skip') | trim }}"
+      - "{{ _platform_result_b.chaos_artifacts.status | default('skip') | trim }}"
+    _chaos_status: >-
+      {% if 'fail' in _chaos_statuses %}fail
+      {% elif 'warn' in _chaos_statuses %}warn
+      {% else %}pass{% endif %}
+    _check_key: "chk15_chaos_artifacts"  # gitleaks:allow -- fixed check identifier, not a credential
+    _check_name: "CHK-15 Chaos Artifacts"
+    _check_status: "{{ _chaos_status | trim }}"
+    _check_detail: "a={{ _platform_result_a.chaos_artifacts.detail | default('skip', true) | trim }}, b={{ _platform_result_b.chaos_artifacts.detail | default('skip', true) | trim }}"
+    _check_data:
+      cluster_a: "{{ _platform_result_a.chaos_artifacts | default({'status': 'skip'}) }}"
+      cluster_b: "{{ _platform_result_b.chaos_artifacts | default({'status': 'skip'}) }}"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/finalize_check.yml"

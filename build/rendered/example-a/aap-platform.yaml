@@ -1,0 +1,1342 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+  name: aap
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+  name: aap-create-remote-execution-instances
+  namespace: aap
+spec:
+  concurrencyPolicy: Forbid
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      template:
+        spec:
+          containers:
+          - command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+
+              if ! whoami &>/dev/null; then
+                echo "runner:x:$(id -u):0:runner:/tmp:/bin/bash" >> /etc/passwd 2>/dev/null || true
+              fi
+              export HOME=/tmp
+
+              AAP_URL="http://aap.aap.svc.cluster.local"
+
+              echo "Waiting for AAP gateway..."
+              for i in $(seq 1 30); do
+                STATUS=$(curl -sk "$AAP_URL/api/gateway/v1/ping/" 2>/dev/null | grep -o '"status":"[^"]*"' | head -1)
+                if echo "$STATUS" | grep -q "good"; then
+                  echo "Gateway is ready"
+                  break
+                fi
+                echo "  attempt $i: $STATUS"
+                sleep 10
+              done
+
+              # Set up SSH key — reformat single-line key to proper OpenSSH format
+              mkdir -p /tmp/.ssh
+              python3 -c "
+              import base64, sys
+              raw = open('/ssh-key/private').read().strip()
+              # Extract the base64 body between header/footer
+              body = raw.replace('-----BEGIN OPENSSH PRIVATE KEY-----','').replace('-----END OPENSSH PRIVATE KEY-----','').strip()
+              # Re-wrap at 70 chars
+              clean = ''.join(body.split())
+              lines = [clean[i:i+70] for i in range(0, len(clean), 70)]
+              print('-----BEGIN OPENSSH PRIVATE KEY-----')
+              print('\n'.join(lines))
+              print('-----END OPENSSH PRIVATE KEY-----')
+              " > /tmp/.ssh/id_ed25519
+              chmod 600 /tmp/.ssh/id_ed25519
+              SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -i /tmp/.ssh/id_ed25519"
+
+              configure_node() {
+                local HOST="$1" NODE_TYPE="$2"
+                echo ""
+                echo "=== Processing $NODE_TYPE node $HOST ==="
+
+                if [ "$NODE_TYPE" = "execution" ]; then
+                  # Install boot-time cleanup for persistent Podman runtime state.
+                  # This runs before the Receptor health check so existing nodes
+                  # receive the rule instead of being skipped below.
+                  ssh $SSH_OPTS ec2-user@$HOST "
+                    set -euo pipefail
+                    sudo install -d -m 0755 /etc/tmpfiles.d
+                    printf '%s\n' \
+                      '# Remove rootless Podman runtime state left across reboots' \
+                      'R! /tmp/storage-run-*/containers' \
+                      'R! /tmp/storage-run-*/libpod/tmp' |
+                      sudo tee /etc/tmpfiles.d/podman-boot-cleanup.conf >/dev/null
+                    sudo chmod 0644 /etc/tmpfiles.d/podman-boot-cleanup.conf
+                  "
+
+                  # Detect and remediate the known Podman boot-ID failure.
+                  # Cleanup is deferred whenever active job processes are present
+                  # or the node cannot be inspected safely.
+                  PODMAN_CHECK=$(ssh $SSH_OPTS ec2-user@$HOST \
+                    "sudo -u awx env HOME=/home/awx XDG_RUNTIME_DIR=/run/user/1001 podman info 2>&1" || true)
+                  if printf '%s\n' "$PODMAN_CHECK" | grep -Fq \
+                    "current system boot ID differs from cached boot ID"; then
+                    echo "Podman has stale boot-ID state on $HOST"
+
+                    JOB_CHECK=1
+                    if ssh $SSH_OPTS ec2-user@$HOST \
+                      "if ! command -v pgrep >/dev/null 2>&1; then exit 2; fi; \
+                       if pgrep -u awx -f 'conmon|podman|ansible-runner|ansible-playbook' >/dev/null 2>&1; then exit 0; fi; \
+                       exit 1" >/dev/null 2>&1; then
+                      JOB_CHECK=0
+                    else
+                      JOB_CHECK=$?
+                    fi
+                    case "$JOB_CHECK" in
+                      0|2)
+                        echo "Active execution processes or an incomplete inspection on $HOST; deferring Podman cleanup"
+                        REMEDIATION_DEFERRED=1
+                        return 0
+                        ;;
+                      1)
+                        echo "No active execution processes found on $HOST; cleaning stale Podman state"
+                        ssh $SSH_OPTS ec2-user@$HOST "
+                          set -euo pipefail
+                          sudo rm -rf /tmp/storage-run-*/containers /tmp/storage-run-*/libpod/tmp
+                          sudo -u awx env HOME=/home/awx XDG_RUNTIME_DIR=/run/user/1001 podman system migrate
+                        "
+                        ;;
+                      *)
+                        echo "Unable to inspect execution processes on $HOST; deferring Podman cleanup"
+                        REMEDIATION_DEFERRED=1
+                        return 0
+                        ;;
+                    esac
+                  fi
+                fi
+
+                # Step 1: Register instance in AAP if not exists
+                EXISTING=$(curl -sk -u "$ADMIN_USER:$ADMIN_PASS" \
+                  "$AAP_URL/api/controller/v2/instances/?hostname=$HOST" \
+                  | grep -o '"count":[0-9]*' | grep -o '[0-9]*')
+
+                if [ "$EXISTING" = "0" ] || [ -z "$EXISTING" ]; then
+                  echo "Registering instance $HOST in AAP..."
+                  RESPONSE=$(curl -sk -w "\n%{http_code}" -u "$ADMIN_USER:$ADMIN_PASS" \
+                    -H "Content-Type: application/json" \
+                    -X POST "$AAP_URL/api/controller/v2/instances/" \
+                    -d "{
+                      \"hostname\": \"$HOST\",
+                      \"node_type\": \"$NODE_TYPE\",
+                      \"listener_port\": 27199,
+                      \"peers_from_control_nodes\": true
+                    }")
+                  HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+                  if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+                    echo "Failed to register $HOST: HTTP $HTTP_CODE"
+                    return 1
+                  fi
+                  echo "Instance $HOST registered (HTTP $HTTP_CODE)"
+                else
+                  echo "Instance $HOST already registered"
+                fi
+
+                # Step 1.5: Verify basic SSH reachability before attempting configuration.
+                # Without this, an EIP with no instance behind it (e.g. hop nodes not yet
+                # provisioned) falls through to Step 2 as "not configured" and then fails
+                # silently through every remaining SSH step instead of reporting failure.
+                if ! ssh $SSH_OPTS ec2-user@$HOST "true" 2>/dev/null; then
+                  echo "ERROR: $HOST is not reachable via SSH -- skipping (instance may not exist yet)"
+                  return 1
+                fi
+
+                # Step 2: Ensure the installed receptor package is current before
+                # deciding whether configuration can be skipped. External execution
+                # nodes run receptor as a host systemd service, independently of the EE.
+                RECEPTOR_BEFORE=$(ssh $SSH_OPTS ec2-user@$HOST "rpm -q receptor --qf '%{VERSION}-%{RELEASE}.%{ARCH}' 2>/dev/null" || true)
+                if [ -n "$RECEPTOR_BEFORE" ]; then
+                  if ! ssh $SSH_OPTS ec2-user@$HOST "
+                    sudo subscription-manager repos --enable ansible-automation-platform-2.5-for-rhel-9-x86_64-rpms 2>/dev/null || \
+                      sudo subscription-manager repos --enable ansible-automation-platform-2.6-for-rhel-9-x86_64-rpms 2>/dev/null || true
+                    sudo dnf upgrade -y receptor
+                  "; then
+                    echo "ERROR: receptor upgrade failed on $HOST"
+                    return 1
+                  fi
+                  RECEPTOR_AFTER=$(ssh $SSH_OPTS ec2-user@$HOST "rpm -q receptor --qf '%{VERSION}-%{RELEASE}.%{ARCH}' 2>/dev/null" || true)
+                  echo "Receptor on $HOST: $RECEPTOR_BEFORE -> $RECEPTOR_AFTER"
+                  if [ "$RECEPTOR_BEFORE" != "$RECEPTOR_AFTER" ]; then
+                    ssh $SSH_OPTS ec2-user@$HOST "sudo systemctl restart receptor"
+                  fi
+                fi
+
+                # Step 3: Check if receptor is fully configured and connected.
+                # Accept either tcp-listener (execution/direct mode) or tcp-peer (hop mode).
+                if ssh $SSH_OPTS ec2-user@$HOST "systemctl is-active receptor && sudo test -f /etc/receptor/receptor.conf && (ss -tlnp | grep -q 27199 || sudo grep -q tcp-peer /etc/receptor/receptor.conf)" 2>/dev/null; then
+                  echo "Receptor running and configured on $HOST"
+                  return 0
+                fi
+
+                echo "Receptor not fully configured on $HOST, setting up..."
+
+                # Step 3: Register RHEL if not already registered
+                ssh $SSH_OPTS ec2-user@$HOST "sudo subscription-manager status" 2>/dev/null | grep -q "Current" || {
+                  echo "Registering RHEL on $HOST..."
+                  ssh $SSH_OPTS ec2-user@$HOST "
+                    sudo subscription-manager config --rhsm.manage_repos=1
+                    sudo subscription-manager register --username='$RHSM_USER' --password='$RHSM_PASS' --auto-attach || true
+                    "
+                }
+
+                # Step 4: Enable AAP repo and install receptor if needed
+                ssh $SSH_OPTS ec2-user@$HOST "rpm -q receptor" 2>/dev/null || {
+                  echo "Installing receptor on $HOST..."
+                  ssh $SSH_OPTS ec2-user@$HOST "
+                    sudo subscription-manager repos --enable ansible-automation-platform-2.5-for-rhel-9-x86_64-rpms 2>/dev/null || \
+                      sudo subscription-manager repos --enable ansible-automation-platform-2.6-for-rhel-9-x86_64-rpms 2>/dev/null || true
+                    sudo dnf install -y receptor
+                  "
+                }
+
+                # Step 5: Download install bundle from AAP, SCP to node, run there
+                INSTANCE_ID=$(curl -sk -u "$ADMIN_USER:$ADMIN_PASS" \
+                  "$AAP_URL/api/controller/v2/instances/?hostname=$HOST" \
+                  | python3 -c "import json,sys; r=json.load(sys.stdin); print(r['results'][0]['id'])" 2>/dev/null)
+
+                if [ -z "$INSTANCE_ID" ]; then
+                  echo "WARNING: Could not get instance ID for $HOST"
+                  return 1
+                fi
+
+                echo "Downloading install bundle for instance $INSTANCE_ID..."
+                BUNDLE=/tmp/install_bundle_${HOST}.tar.gz
+                if ! curl -sfk -u "$ADMIN_USER:$ADMIN_PASS" \
+                  "$AAP_URL/api/controller/v2/instances/$INSTANCE_ID/install_bundle/" \
+                  -o "$BUNDLE"; then
+                  echo "ERROR: failed to download install bundle for $HOST"
+                  return 1
+                fi
+
+                echo "Copying install bundle to $HOST..."
+                if ! scp $SSH_OPTS "$BUNDLE" ec2-user@$HOST:/tmp/install_bundle.tar.gz; then
+                  echo "ERROR: failed to copy install bundle to $HOST"
+                  return 1
+                fi
+
+                echo "Running install bundle on $HOST..."
+                if ! ssh $SSH_OPTS ec2-user@$HOST "
+                  set -euo pipefail
+                  sudo dnf install -y ansible-core openssl
+                  rm -rf /tmp/bundle_extract
+                  mkdir -p /tmp/bundle_extract
+                  tar xzf /tmp/install_bundle.tar.gz -C /tmp/bundle_extract
+                  BUNDLE_DIR=\$(find /tmp/bundle_extract -name 'install_receptor.yml' -type f -exec dirname {} \; | head -1)
+                  if [ -z \"\$BUNDLE_DIR\" ]; then
+                    echo 'ERROR: install_receptor.yml not found in bundle'
+                    ls -lR /tmp/bundle_extract
+                    exit 1
+                  fi
+                  cd \"\$BUNDLE_DIR\"
+                  # Rewrite inventory to run locally while keeping group_vars
+                  printf 'all:\\n  hosts:\\n    localhost:\\n      ansible_connection: local\\n      ansible_host: %s\\n' $HOST > inventory.yml
+                  sudo ansible-galaxy collection install -r requirements.yml
+                  sudo ansible-playbook -i inventory.yml install_receptor.yml -v
+                  rm -rf /tmp/bundle_extract /tmp/install_bundle.tar.gz
+                "; then
+                  echo "ERROR: install bundle run failed on $HOST"
+                  return 1
+                fi
+                echo "Install bundle applied on $HOST"
+              }
+
+              FAILED=0
+              REMEDIATION_DEFERRED=0
+
+              for HOST in $RECEPTOR_HOSTS; do
+                configure_node "$HOST" "execution" || FAILED=1
+              done
+
+              if [ -n "${HOP_NODE_IPS:-}" ]; then
+                HOP_FAILED=0
+                for HOST in $HOP_NODE_IPS; do
+                  configure_node "$HOST" "hop" || { FAILED=1; HOP_FAILED=1; }
+                done
+
+              if [ "$HOP_FAILED" = "1" ]; then
+                echo ""
+                echo "=== Skipping execution-node hop rewiring: one or more hop nodes failed to configure ==="
+              else
+              # ── Reconfigure execution nodes to route through hops ──────────
+              echo ""
+              echo "=== Reconfiguring execution nodes to peer through hops ==="
+
+              EE_HOSTS=$(curl -sk -u "$ADMIN_USER:$ADMIN_PASS" \
+                "$AAP_URL/api/controller/v2/instances/?node_type=execution&page_size=50" \
+                | python3 -c "import json,sys; print(' '.join(i['hostname'] for i in json.load(sys.stdin).get('results',[])))" 2>/dev/null || true)
+
+              if [ -z "$EE_HOSTS" ]; then
+                echo "No execution nodes found in AAP — skipping EE reconfiguration"
+              fi
+
+              EXPECTED_PEER_ADDRS=$(echo "$HOP_NODE_IPS" | tr ' ' '\n' | sort -u)
+
+              for EE_HOST in $EE_HOSTS; do
+                echo "--- EE $EE_HOST ---"
+
+                if ! CURRENT_PEER_ADDRS=$(ssh $SSH_OPTS ec2-user@$EE_HOST \
+                  "sudo awk '/^- tcp-peer:/{getline; print \$2}' /etc/receptor/receptor.conf 2>/dev/null | cut -d: -f1 | sort -u" 2>/dev/null); then
+                  echo "  ERROR: could not reach $EE_HOST to check peer config"
+                  FAILED=1
+                  continue
+                fi
+
+                if [ "$CURRENT_PEER_ADDRS" = "$EXPECTED_PEER_ADDRS" ]; then
+                  echo "  tcp-peer entries already match expected hop IPs — skipping receptor.conf update"
+                else
+                  echo "  Adding hop tcp-peer entries to $EE_HOST..."
+                  ssh $SSH_OPTS ec2-user@$EE_HOST "sudo cp /etc/receptor/receptor.conf /etc/receptor/receptor.conf.pre-hop 2>/dev/null || true"
+                  if ! ssh $SSH_OPTS ec2-user@$EE_HOST "
+                    sudo sed -i '/^- tcp-listener:/,/^- [a-z]/{/^- tcp-listener:/d;/^  /d;}' /etc/receptor/receptor.conf 2>/dev/null || true
+                    sudo sed -i '/^- tcp-peer:/,/^- [a-z]/{/^- tcp-peer:/d;/^  /d;}' /etc/receptor/receptor.conf 2>/dev/null || true
+                    sudo sed -i '/^\$/d' /etc/receptor/receptor.conf 2>/dev/null || true
+                    for HOP in $HOP_NODE_IPS; do
+                      echo '' | sudo tee -a /etc/receptor/receptor.conf > /dev/null
+                      echo \"- tcp-peer:\" | sudo tee -a /etc/receptor/receptor.conf > /dev/null
+                      echo \"    address: \${HOP}:27199\" | sudo tee -a /etc/receptor/receptor.conf > /dev/null
+                      echo \"    redial: true\" | sudo tee -a /etc/receptor/receptor.conf > /dev/null
+                      echo \"    tls: tls_client\" | sudo tee -a /etc/receptor/receptor.conf > /dev/null
+                    done
+                  "; then
+                    echo "  ERROR: failed to update receptor.conf on $EE_HOST"
+                    FAILED=1
+                    continue
+                  fi
+                  if ! ssh $SSH_OPTS ec2-user@$EE_HOST "sudo systemctl restart receptor" 2>/dev/null; then
+                    echo "  ERROR: receptor restart failed on $EE_HOST"
+                    FAILED=1
+                    continue
+                  fi
+                  echo "  receptor.conf updated and restarted"
+                fi
+
+                INST_ID=$(curl -sk -u "$ADMIN_USER:$ADMIN_PASS" \
+                  "$AAP_URL/api/controller/v2/instances/?hostname=$EE_HOST" \
+                  | python3 -c "import json,sys; r=json.load(sys.stdin); print(r['results'][0]['id'])" 2>/dev/null || echo "")
+
+                if [ -z "$INST_ID" ]; then
+                  echo "  ERROR: could not resolve instance id for $EE_HOST"
+                  FAILED=1
+                else
+                  PEERS_FLAG=$(curl -sk -u "$ADMIN_USER:$ADMIN_PASS" \
+                    "$AAP_URL/api/controller/v2/instances/$INST_ID/" \
+                    | python3 -c "import json,sys; print(json.load(sys.stdin).get('peers_from_control_nodes', ''))" 2>/dev/null || echo "")
+                  if [ "$PEERS_FLAG" != "False" ]; then
+                    if ! curl -sfk -u "$ADMIN_USER:$ADMIN_PASS" \
+                      -H "Content-Type: application/json" \
+                      -X PATCH "$AAP_URL/api/controller/v2/instances/$INST_ID/" \
+                      -d '{"peers_from_control_nodes": false}' > /dev/null; then
+                      echo "  ERROR: failed to set peers_from_control_nodes=false on $EE_HOST"
+                      FAILED=1
+                    else
+                      echo "  peers_from_control_nodes=false set"
+                    fi
+                  else
+                    echo "  peers_from_control_nodes already false"
+                  fi
+                fi
+              done
+              echo "EE reconfiguration complete"
+              fi
+              else
+                echo "HOP_NODE_IPS not set -- skipping hop node setup and EE peering reconfiguration"
+              fi
+
+              if [ "$FAILED" = "1" ]; then
+                exit 1
+              fi
+              if [ "$REMEDIATION_DEFERRED" = "1" ]; then
+                echo "Podman remediation deferred for at least one execution node; retrying on the next schedule"
+                exit 1
+              fi
+              echo "All remote execution and hop node instances configured"
+            env:
+            - name: HOP_NODE_IPS
+              value: 192.0.2.13 192.0.2.14
+            - name: RECEPTOR_HOSTS
+              value: 192.0.2.11 192.0.2.12
+            - name: ADMIN_USER
+              value: admin
+            - name: ADMIN_PASS
+              valueFrom:
+                secretKeyRef:
+                  key: password
+                  name: aap-admin-password
+            - name: RHSM_USER
+              valueFrom:
+                secretKeyRef:
+                  key: username
+                  name: registry-redhat-io-pull-secret
+            - name: RHSM_PASS
+              valueFrom:
+                secretKeyRef:
+                  key: password
+                  name: registry-redhat-io-pull-secret
+            image: quay.io/ansible/ansible-runner:latest
+            name: create-instances
+            resources:
+              limits:
+                cpu: 200m
+                memory: 128Mi
+              requests:
+                cpu: 50m
+                memory: 64Mi
+            volumeMounts:
+            - mountPath: /ssh-key
+              name: ssh-key
+              readOnly: true
+          restartPolicy: OnFailure
+          volumes:
+          - name: ssh-key
+            secret:
+              secretName: exec-node-ssh-key
+      ttlSecondsAfterFinished: 300
+  schedule: '*/5 * * * *'
+  successfulJobsHistoryLimit: 1
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "25"
+  name: aap-hub-ee-setup
+  namespace: aap
+spec:
+  concurrencyPolicy: Forbid
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      template:
+        spec:
+          containers:
+          - command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+
+              SRC_URL="registry.redhat.io"
+              DST_URL="aap.aap.svc.cluster.local"
+              IMAGE_LIST="ansible-automation-platform-25/ee-supported-rhel9 ansible-automation-platform-26/ee-supported-rhel9"
+              echo "Waiting for AAP gateway..."
+              GATEWAY_READY=0
+              for i in $(seq 1 60); do
+                STATUS=$(curl -sk http://aap.aap.svc.cluster.local/api/gateway/v1/ping/ 2>/dev/null | grep -o '"status":"[^"]*"' | head -1)
+                if echo "$STATUS" | grep -q "good"; then
+                  echo "Gateway is ready"
+                  GATEWAY_READY=1
+                  break
+                fi
+                echo "  attempt $i: $STATUS"
+                sleep 10
+              done
+              if [ "$GATEWAY_READY" = "0" ]; then
+                echo "ERROR: AAP gateway is not ready"
+                exit 1
+              fi
+
+              SRC_AUTHFILE="/tmp/src-auth.json"
+              DST_AUTHFILE="/tmp/dst-auth.json"
+
+              echo "Logging into source registry..."
+              skopeo login --authfile "${SRC_AUTHFILE}" -u "${SRC_USER}" -p "${SRC_PASS}" "${SRC_URL}"
+
+              echo "Logging into destination registry..."
+              skopeo login --authfile "${DST_AUTHFILE}" --tls-verify=false -u "${ADMIN_USER}" -p "${ADMIN_PASS}" "${DST_URL}"
+
+              # Wait for Hub API to be responsive (may be reconciling after CR change)
+              echo "Checking Hub container registry is ready..."
+              HUB_READY=0
+              for i in $(seq 1 60); do
+                HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
+                  -u "${ADMIN_USER}:${ADMIN_PASS}" \
+                  "http://${DST_URL}/v2/" 2>/dev/null || echo "000")
+                if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "401" ]; then
+                  echo "Hub container registry is ready (HTTP ${HTTP_CODE})"
+                  HUB_READY=1
+                  break
+                fi
+                echo "  attempt $i: HTTP ${HTTP_CODE} — waiting for Hub..."
+                sleep 10
+              done
+              if [ "$HUB_READY" = "0" ]; then
+                echo "ERROR: Hub container registry not ready after 10 minutes"
+                exit 1
+              fi
+
+              FAILED=0
+              for IMAGE in ${IMAGE_LIST}; do
+                echo ""
+                echo "=== Processing ${IMAGE} ==="
+
+                ALL_TAGS=$(skopeo list-tags --authfile "${SRC_AUTHFILE}" "docker://${SRC_URL}/${IMAGE}" 2>&1) || {
+                  echo "Failed to list tags for ${IMAGE}: ${ALL_TAGS}"
+                  FAILED=1
+                  continue
+                }
+
+                TAG_FORMAT='[0-9]\.[0-9]'
+                FILTERED_TAGS=$(echo "$ALL_TAGS" | sed 's/.*\[//;s/\].*//' | tr ',' '\n' | tr -d '" ' | grep -Eo "${TAG_FORMAT}" | sort -rVu || true)
+                TAG_LIST="latest
+                ${FILTERED_TAGS}"
+
+                echo -e "Tags to sync:\n${TAG_LIST}"
+
+                for TAG in ${TAG_LIST}; do
+                  echo "Copying ${IMAGE}:${TAG}..."
+                  COPY_OK=0
+                  for ATTEMPT in 1 2 3; do
+                    if skopeo copy --remove-signatures \
+                      --src-authfile "${SRC_AUTHFILE}" \
+                      --dest-authfile "${DST_AUTHFILE}" \
+                      --dest-tls-verify=false \
+                      "docker://${SRC_URL}/${IMAGE}:${TAG}" \
+                      "docker://${DST_URL}/${IMAGE}:${TAG}"; then
+                      COPY_OK=1
+                      break
+                    fi
+                    echo "  Attempt ${ATTEMPT}/3 failed, retrying in 30s..."
+                    sleep 30
+                  done
+                  if [ "$COPY_OK" = "0" ]; then
+                    echo "Failed to copy ${IMAGE}:${TAG} after 3 attempts"
+                    FAILED=1
+                  fi
+                done
+              done
+
+              echo ""
+              if [ "$FAILED" = "1" ]; then
+                echo "Some image copies failed"
+                exit 1
+              fi
+              echo "All execution environment images synced successfully"
+            env:
+            - name: ADMIN_USER
+              value: admin
+            - name: ADMIN_PASS
+              valueFrom:
+                secretKeyRef:
+                  key: password
+                  name: aap-admin-password
+            - name: SRC_USER
+              valueFrom:
+                secretKeyRef:
+                  key: username
+                  name: registry-redhat-io-pull-secret
+            - name: SRC_PASS
+              valueFrom:
+                secretKeyRef:
+                  key: password
+                  name: registry-redhat-io-pull-secret
+            image: registry.access.redhat.com/ubi9/skopeo:latest
+            name: hub-ee-setup
+            resources:
+              limits:
+                cpu: 500m
+                memory: 512Mi
+              requests:
+                cpu: 100m
+                memory: 128Mi
+          restartPolicy: OnFailure
+      ttlSecondsAfterFinished: 300
+  schedule: '*/45 * * * *'
+  successfulJobsHistoryLimit: 1
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "25"
+  name: aap-hub-remotes-setup
+  namespace: aap
+spec:
+  concurrencyPolicy: Forbid
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      template:
+        spec:
+          containers:
+          - command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+
+              HUB_API="http://aap.aap.svc.cluster.local/api/galaxy/pulp/api/v3"
+              AUTH_URL="https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token"
+              CERTIFIED_URL="https://console.redhat.com/api/automation-hub/content/published/"
+              VALIDATED_URL="https://console.redhat.com/api/automation-hub/content/validated/"
+
+              echo "Waiting for AAP gateway..."
+              GATEWAY_READY=0
+              for i in $(seq 1 60); do
+                STATUS=$(curl -sk http://aap.aap.svc.cluster.local/api/gateway/v1/ping/ 2>/dev/null | grep -o '"status":"[^"]*"' | head -1)
+                if echo "$STATUS" | grep -q "good"; then
+                  echo "Gateway is ready"
+                  GATEWAY_READY=1
+                  break
+                fi
+                echo "  attempt $i: $STATUS"
+                sleep 10
+              done
+              if [ "$GATEWAY_READY" = "0" ]; then
+                echo "ERROR: AAP gateway is not ready"
+                exit 1
+              fi
+
+              AUTH="-u ${ADMIN_USER}:${ADMIN_PASS}"
+              FAILED=0
+
+              # --- Helper: get remote by name ---
+              get_remote() {
+                curl -sk $AUTH "${HUB_API}/remotes/ansible/collection/?name=$1" \
+                  -H "Content-Type: application/json"
+              }
+
+              # --- Helper: get repository by name ---
+              get_repo() {
+                curl -sk $AUTH "${HUB_API}/repositories/ansible/ansible/?name=$1" \
+                  -H "Content-Type: application/json" || echo "get_repo failed"
+              }
+
+              # --- Helper: extract pulp_id from pulp_href ---
+              extract_pulp_id() {
+                echo "$1" | sed 's|/$||' | awk -F/ '{print $NF}'
+              }
+
+              # --- Helper: create a remote ---
+              create_remote() {
+                REMOTE_NAME="$1"
+                REMOTE_URL="$2"
+
+                echo "Creating remote '${REMOTE_NAME}'..."
+                RESPONSE=$(curl -sk -w "\n%{http_code}" $AUTH \
+                  -H "Content-Type: application/json" \
+                  -X POST "${HUB_API}/remotes/ansible/collection/" \
+                  -d "{
+                    \"name\": \"${REMOTE_NAME}\",
+                    \"url\": \"${REMOTE_URL}\",
+                    \"download_concurrency\": 10,
+                    \"policy\": \"immediate\",
+                    \"auth_url\": \"${AUTH_URL}\",
+                    \"token\": \"${OFFLINE_TOKEN}\"
+                  }")
+
+                HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+                BODY=$(echo "$RESPONSE" | sed '$d')
+
+                if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+                  echo "Remote '${REMOTE_NAME}' created successfully (HTTP ${HTTP_CODE})"
+                else
+                  echo "Failed to create remote '${REMOTE_NAME}': HTTP ${HTTP_CODE} - ${BODY}"
+                  return 1
+                fi
+              }
+
+              # --- Helper: update remote token ---
+              update_remote_token() {
+                REMOTE_NAME="$1"
+                PULP_ID="$2"
+
+                echo "Updating token for remote '${REMOTE_NAME}'..."
+                RESPONSE=$(curl -sk -w "\n%{http_code}" $AUTH \
+                  -H "Content-Type: application/json" \
+                  -X PATCH "${HUB_API}/remotes/ansible/collection/${PULP_ID}/" \
+                  -d "{
+                    \"token\": \"${OFFLINE_TOKEN}\"
+                  }")
+
+                HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+                BODY=$(echo "$RESPONSE" | sed '$d')
+
+                if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+                  echo "Token updated for remote '${REMOTE_NAME}' (HTTP ${HTTP_CODE})"
+                else
+                  echo "Failed to update token for remote '${REMOTE_NAME}': HTTP ${HTTP_CODE} - ${BODY}"
+                  return 1
+                fi
+              }
+
+              # --- Helper: associate remote with repository ---
+              associate_remote_to_repo() {
+                REPO_PULP_ID="$1"
+                REMOTE_HREF="$2"
+
+                echo "Associating remote with repository..."
+                RESPONSE=$(curl -sk -w "\n%{http_code}" $AUTH \
+                  -H "Content-Type: application/json" \
+                  -X PATCH "${HUB_API}/repositories/ansible/ansible/${REPO_PULP_ID}/" \
+                  -d "{
+                    \"remote\": \"${REMOTE_HREF}\"
+                  }")
+
+                HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+                BODY=$(echo "$RESPONSE" | sed '$d')
+
+                if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+                  echo "Remote associated with repository (HTTP ${HTTP_CODE})"
+                else
+                  echo "Failed to associate remote: HTTP ${HTTP_CODE} - ${BODY}"
+                  return 1
+                fi
+              }
+
+              # --- Helper: trigger repository sync ---
+              sync_repo() {
+                REPO_NAME="$1"
+                REPO_PULP_ID="$2"
+
+                echo "Triggering sync for repository '${REPO_NAME}'..."
+                RESPONSE=$(curl -sk -w "\n%{http_code}" $AUTH \
+                  -H "Content-Type: application/json" \
+                  -X POST "${HUB_API}/repositories/ansible/ansible/${REPO_PULP_ID}/sync/" \
+                  -d '{"optimize": true}')
+
+                HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+                BODY=$(echo "$RESPONSE" | sed '$d')
+
+                if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+                  TASK_HREF=$(echo "$BODY" | grep -o '"task":"[^"]*"' | head -1 | sed 's/"task":"//;s/"//')
+                  if [ -n "$TASK_HREF" ]; then
+                    echo "Sync started for '${REPO_NAME}', task: ${TASK_HREF}"
+                    echo "$TASK_HREF"
+                    return 0
+                  else
+                    echo "Sync accepted but no task href returned for '${REPO_NAME}'"
+                    return 1
+                  fi
+                else
+                  echo "Failed to trigger sync for '${REPO_NAME}': HTTP ${HTTP_CODE} - ${BODY}"
+                  return 1
+                fi
+              }
+
+              # --- Helper: wait for a Pulp task to complete ---
+              wait_for_task() {
+                TASK_HREF="$1"
+                REPO_NAME="$2"
+                MAX_WAIT=1800
+                INTERVAL=15
+                ELAPSED=0
+
+                echo "Waiting for '${REPO_NAME}' sync task to complete (timeout: ${MAX_WAIT}s)..."
+                while [ "$ELAPSED" -lt "$MAX_WAIT" ]; do
+                  TASK_DATA=$(curl -sk $AUTH "${HUB_API%/api/galaxy/pulp/api/v3}${TASK_HREF}" \
+                    -H "Content-Type: application/json")
+                  TASK_STATE=$(echo "$TASK_DATA" | grep -o '"state":"[^"]*"' | head -1 | sed 's/"state":"//;s/"//')
+
+                  case "$TASK_STATE" in
+                    completed)
+                      echo "Sync for '${REPO_NAME}' completed successfully"
+                      return 0
+                      ;;
+                    failed|canceled|cancelled)
+                      TASK_ERROR=$(echo "$TASK_DATA" | grep -o '"error":{[^}]*}' | head -1)
+                      echo "Sync for '${REPO_NAME}' ${TASK_STATE}: ${TASK_ERROR}"
+                      return 1
+                      ;;
+                    *)
+                      echo "  ${REPO_NAME}: state=${TASK_STATE}, elapsed=${ELAPSED}s"
+                      sleep "$INTERVAL"
+                      ELAPSED=$((ELAPSED + INTERVAL))
+                      ;;
+                  esac
+                done
+
+                echo "Timeout waiting for '${REPO_NAME}' sync after ${MAX_WAIT}s"
+                return 1
+              }
+
+              # ============================================================
+              # rh-certified: update offline token on existing remote
+              # ============================================================
+              echo ""
+              echo "=== Setting up rh-certified remote ==="
+              RH_CERT_DATA=$(get_remote "rh-certified")
+              RH_CERT_COUNT=$(echo "$RH_CERT_DATA" | grep -o '"count":[0-9]*' | grep -o '[0-9]*')
+
+              if [ "$RH_CERT_COUNT" != "0" ] && [ -n "$RH_CERT_COUNT" ]; then
+                PULP_HREF=$(echo "$RH_CERT_DATA" | grep -o '"pulp_href":"[^"]*"' | head -1 | sed 's/"pulp_href":"//;s/"//')
+                PULP_ID=$(extract_pulp_id "$PULP_HREF")
+                echo "Remote 'rh-certified' exists (pulp_id: ${PULP_ID}), updating token..."
+                if ! update_remote_token "rh-certified" "$PULP_ID"; then
+                  FAILED=1
+                fi
+              else
+                echo "Remote 'rh-certified' not found, creating..."
+                if ! create_remote "rh-certified" "$CERTIFIED_URL"; then
+                  FAILED=1
+                fi
+              fi
+
+              # ============================================================
+              # validated: create remote if missing, associate with repo
+              # ============================================================
+              echo ""
+              echo "=== Setting up validated remote ==="
+              VAL_DATA=$(get_remote "validated")
+              VAL_COUNT=$(echo "$VAL_DATA" | grep -o '"count":[0-9]*' | grep -o '[0-9]*')
+
+              if [ "$VAL_COUNT" != "0" ] && [ -n "$VAL_COUNT" ]; then
+                PULP_HREF=$(echo "$VAL_DATA" | grep -o '"pulp_href":"[^"]*"' | head -1 | sed 's/"pulp_href":"//;s/"//')
+                PULP_ID=$(extract_pulp_id "$PULP_HREF")
+                echo "Remote 'validated' already exists (pulp_id: ${PULP_ID}), updating token..."
+                if ! update_remote_token "validated" "$PULP_ID"; then
+                  FAILED=1
+                fi
+              else
+                echo "Remote 'validated' not found, creating..."
+                if ! create_remote "validated" "$VALIDATED_URL"; then
+                  FAILED=1
+                fi
+              fi
+
+              # Check if validated repository exists and needs remote association
+              echo "Checking validated repository..."
+              REPO_DATA=$(get_repo "validated")
+              REPO_COUNT=$(echo "$REPO_DATA" | grep -o '"count":[0-9]*' | grep -o '[0-9]*')
+
+              if [ "$REPO_COUNT" != "0" ] && [ -n "$REPO_COUNT" ]; then
+                REPO_REMOTE=$(echo "$REPO_DATA" | grep -o '"remote":"[^"]*"' | head -1 | sed 's/"remote":"//;s/"//')
+                REPO_REMOTE_NULL=$(echo "$REPO_DATA" | grep -o '"remote":null' || true)
+
+                if [ -n "$REPO_REMOTE_NULL" ] || [ -z "$REPO_REMOTE" ]; then
+                  echo "Repository 'validated' exists but has no remote associated"
+                  # Re-fetch the remote to get the pulp_href for association
+                  VAL_REMOTE_DATA=$(get_remote "validated")
+                  REMOTE_HREF=$(echo "$VAL_REMOTE_DATA" | grep -o '"pulp_href":"[^"]*"' | head -1 | sed 's/"pulp_href":"//;s/"//')
+                  REPO_HREF=$(echo "$REPO_DATA" | grep -o '"pulp_href":"[^"]*"' | head -1 | sed 's/"pulp_href":"//;s/"//')
+                  REPO_PULP_ID=$(extract_pulp_id "$REPO_HREF")
+
+                  if [ -n "$REMOTE_HREF" ] && [ -n "$REPO_PULP_ID" ]; then
+                    if ! associate_remote_to_repo "$REPO_PULP_ID" "$REMOTE_HREF"; then
+                      FAILED=1
+                    fi
+                  else
+                    echo "Could not determine remote href or repo pulp_id for association"
+                    FAILED=1
+                  fi
+                else
+                  echo "Repository 'validated' already has a remote associated, skipping"
+                fi
+              else
+                echo "Repository 'validated' not found, it will be created during sync"
+              fi
+
+              echo ""
+              if [ "$FAILED" = "1" ]; then
+                echo "Some remote setup operations failed, skipping sync"
+                exit 1
+              fi
+              echo "All hub remotes configured successfully"
+
+              # ============================================================
+              # Sync repositories
+              # ============================================================
+              echo ""
+              echo "=== Syncing repositories ==="
+              SYNC_FAILED=0
+
+              for REPO_NAME in rh-certified validated; do
+                echo ""
+                echo "--- Processing sync for '${REPO_NAME}' ---"
+                REPO_DATA=$(get_repo "$REPO_NAME")
+                REPO_COUNT=$(echo "$REPO_DATA" | grep -o '"count":[0-9]*' | grep -o '[0-9]*')
+
+                if [ "$REPO_COUNT" = "0" ] || [ -z "$REPO_COUNT" ]; then
+                  echo "Repository '${REPO_NAME}' not found, skipping sync"
+                  continue
+                fi
+
+                REPO_HREF=$(echo "$REPO_DATA" | grep -o '"pulp_href":"[^"]*"' | head -1 | sed 's/"pulp_href":"//;s/"//')
+                REPO_PULP_ID=$(extract_pulp_id "$REPO_HREF")
+                REPO_REMOTE=$(echo "$REPO_DATA" | grep -o '"remote":"[^"]*"' | head -1 | sed 's/"remote":"//;s/"//')
+                REPO_REMOTE_NULL=$(echo "$REPO_DATA" | grep -o '"remote":null' || true)
+
+                if [ -n "$REPO_REMOTE_NULL" ] || [ -z "$REPO_REMOTE" ]; then
+                  echo "Repository '${REPO_NAME}' has no remote associated, skipping sync"
+                  continue
+                fi
+
+                TASK_OUTPUT=$(sync_repo "$REPO_NAME" "$REPO_PULP_ID")
+                TASK_HREF=$(echo "$TASK_OUTPUT" | tail -1)
+
+                if [ -z "$TASK_HREF" ] || ! echo "$TASK_HREF" | grep -q "^/"; then
+                  echo "No valid task href for '${REPO_NAME}', sync may have failed"
+                  SYNC_FAILED=1
+                  continue
+                fi
+
+                if ! wait_for_task "$TASK_HREF" "$REPO_NAME"; then
+                  SYNC_FAILED=1
+                fi
+              done
+
+              echo ""
+              if [ "$SYNC_FAILED" = "1" ]; then
+                echo "Some sync operations failed"
+                exit 1
+              fi
+              echo "All repository syncs completed successfully"
+            env:
+            - name: ADMIN_USER
+              value: admin
+            - name: ADMIN_PASS
+              valueFrom:
+                secretKeyRef:
+                  key: password
+                  name: aap-admin-password
+            - name: OFFLINE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  key: token
+                  name: hadr-hub-token
+            image: registry.access.redhat.com/ubi9/ubi:latest
+            name: hub-remotes-setup
+            resources:
+              limits:
+                cpu: 200m
+                memory: 128Mi
+              requests:
+                cpu: 50m
+                memory: 64Mi
+          restartPolicy: OnFailure
+      ttlSecondsAfterFinished: 300
+  schedule: '*/45 * * * *'
+  successfulJobsHistoryLimit: 1
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "25"
+  name: aap-set-cleanup-schedules
+  namespace: aap
+spec:
+  concurrencyPolicy: Forbid
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      template:
+        spec:
+          containers:
+          - command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              echo "Waiting for AAP gateway..."
+              READY=false
+              for i in $(seq 1 30); do
+                STATUS=$(curl -sk http://aap.aap.svc.cluster.local/api/gateway/v1/ping/ 2>/dev/null | grep -o '"status":"[^"]*"' | head -1)
+                if echo "$STATUS" | grep -q "good"; then
+                  echo "Gateway is ready"
+                  READY=true
+                  break
+                fi
+                echo "  attempt $i: $STATUS"
+                sleep 10
+              done
+              if [ "$READY" != "true" ]; then
+                echo "ERROR: Gateway not ready after 30 attempts"
+                exit 1
+              fi
+
+              API="http://aap.aap.svc.cluster.local/api/controller/v2"
+              DAYS="${CLEANUP_RETENTION_DAYS}"
+              INTERVAL="${CLEANUP_INTERVAL_HOURS}"
+              RRULE="DTSTART:20260101T000000Z RRULE:FREQ=HOURLY;INTERVAL=${INTERVAL}"
+
+              # Fetch all system job templates
+              TEMPLATES=$(curl -sk -u "$ADMIN_USER:$ADMIN_PASS" "$API/system_job_templates/")
+              if [ -z "$TEMPLATES" ] || ! echo "$TEMPLATES" | python3 -c "import json,sys; json.load(sys.stdin)" 2>/dev/null; then
+                echo "ERROR: failed to fetch system job templates"
+                exit 1
+              fi
+
+              for JOB_TYPE in cleanup_jobs cleanup_activitystream; do
+                echo ""
+                echo "=== $JOB_TYPE ==="
+
+                TEMPLATE_ID=$(echo "$TEMPLATES" | python3 -c "
+              import json, sys
+              data = json.load(sys.stdin)
+              for r in data.get('results', []):
+                  if r.get('job_type') == '$JOB_TYPE':
+                      print(r['id']); break
+              ")
+
+                if [ -z "$TEMPLATE_ID" ]; then
+                  echo "  SKIP: no template found"
+                  continue
+                fi
+                echo "  Template ID: $TEMPLATE_ID"
+
+                SCHEDULES=$(curl -sk -u "$ADMIN_USER:$ADMIN_PASS" "$API/system_job_templates/$TEMPLATE_ID/schedules/")
+
+                SCHED_LIST=$(echo "$SCHEDULES" | python3 -c "
+              import json, sys
+              data = json.load(sys.stdin)
+              for s in data.get('results', []):
+                  days = s.get('extra_data', {}).get('days', '?')
+                  print(f'{s[\"id\"]} {days}')
+              ")
+                if [ -z "$SCHED_LIST" ]; then
+                  echo "  No schedules found"
+                  continue
+                fi
+
+                echo "$SCHED_LIST" | while IFS= read -r line; do
+                  SCHED_ID=$(echo "$line" | awk '{print $1}')
+                  CURRENT_DAYS=$(echo "$line" | awk '{print $2}')
+
+                  if [ "$CURRENT_DAYS" = "$DAYS" ]; then
+                    echo "  Schedule $SCHED_ID already set to ${DAYS}d"
+                  else
+                    echo "  Updating schedule $SCHED_ID: ${CURRENT_DAYS}d -> ${DAYS}d, interval=${INTERVAL}h"
+                    HTTP_CODE=$(curl -sk -u "$ADMIN_USER:$ADMIN_PASS" \
+                      -X PATCH -H 'Content-Type: application/json' \
+                      -d "{\"extra_data\":{\"days\":\"$DAYS\"},\"rrule\":\"$RRULE\"}" \
+                      "$API/schedules/$SCHED_ID/" -o /dev/null -w "%{http_code}")
+                    echo "  HTTP $HTTP_CODE"
+                    if [ "$HTTP_CODE" -ge 400 ] 2>/dev/null; then
+                      echo "  ERROR: PATCH failed for schedule $SCHED_ID"
+                      echo "PATCH_FAILED" > /tmp/cleanup-patch-failed
+                    fi
+                  fi
+                done
+              done
+
+              if [ -f /tmp/cleanup-patch-failed ]; then
+                rm -f /tmp/cleanup-patch-failed
+                echo "ERROR: one or more schedule updates failed"
+                exit 1
+              fi
+              echo ""
+              echo "=== Done ==="
+            env:
+            - name: ADMIN_USER
+              value: admin
+            - name: ADMIN_PASS
+              valueFrom:
+                secretKeyRef:
+                  key: password
+                  name: aap-admin-password
+            - name: CLEANUP_RETENTION_DAYS
+              value: "7"
+            - name: CLEANUP_INTERVAL_HOURS
+              value: "1"
+            image: registry.access.redhat.com/ubi9/ubi:latest
+            name: set-cleanup
+          restartPolicy: OnFailure
+      ttlSecondsAfterFinished: 300
+  schedule: 0 */6 * * *
+  successfulJobsHistoryLimit: 1
+---
+apiVersion: aap.ansible.com/v1alpha1
+kind: AnsibleAutomationPlatform
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "6"
+  name: aap
+  namespace: aap
+spec:
+  admin_password_secret: aap-admin-password
+  api:
+    log_level: INFO
+    node_selector:
+      dedicated: controlplane
+    replicas: 2
+    resource_requirements:
+      requests:
+        cpu: 500m
+        memory: 4Gi
+    tolerations:
+    - effect: NoSchedule
+      key: dedicated
+      operator: Equal
+      value: controlplane
+    topology_spread_constraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+  controller:
+    create_preload_data: false
+    disabled: false
+    ee_resource_requirements:
+      requests:
+        cpu: 100m
+        memory: 1Gi
+    extra_settings:
+    - setting: MAX_EVENT_RES_DATA
+      value: "100000000"
+    - setting: SYSTEM_TASK_ABS_MEM
+      value: '"6Gi"'
+    - setting: DEFAULT_EXECUTION_QUEUE_POD_SPEC_OVERRIDE
+      value: '{"spec":{"nodeSelector":{"dedicated":"executionplane"},"tolerations":[{"key":"dedicated","operator":"Equal","value":"executionplane","effect":"NoSchedule"}],"affinity":{"podAntiAffinity":{"preferredDuringSchedulingIgnoredDuringExecution":[{"weight":100,"podAffinityTerm":{"labelSelector":{"matchExpressions":[{"key":"app.kubernetes.io/name","operator":"In","values":["automation-controller-task","automation-platform"]}]},"topologyKey":"kubernetes.io/hostname"}}]}}}}'
+    init_container_resource_requirements:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+    node_selector: |
+      dedicated: controlplane
+    postgres_configuration_secret: aap-controller-postgres-configuration
+    rsyslog_resource_requirements:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+    task_replicas: 2
+    task_resource_requirements:
+      requests:
+        cpu: 1000m
+        memory: 8Gi
+    task_topology_spread_constraints: |
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+    tolerations: |
+      - key: dedicated
+        operator: Equal
+        value: controlplane
+        effect: NoSchedule
+    uwsgi_processes: 16
+    web_replicas: 2
+    web_resource_requirements:
+      requests:
+        cpu: 500m
+        memory: 8Gi
+    web_topology_spread_constraints: |
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+  database:
+    database_secret: aap-gateway-postgres-configuration
+    disabled: true
+    postgres_admin_secret: postgres-admin-credentials
+  eda:
+    activation_worker:
+      node_selector:
+        dedicated: executionplane
+      replicas: 2
+      resource_requirements:
+        requests:
+          cpu: 500m
+          memory: 4Gi
+      tolerations:
+      - effect: NoSchedule
+        key: dedicated
+        operator: Equal
+        value: executionplane
+    api:
+      node_selector:
+        dedicated: controlplane
+      replicas: 2
+      resource_requirements:
+        requests:
+          cpu: 500m
+          memory: 4Gi
+      tolerations:
+      - effect: NoSchedule
+        key: dedicated
+        operator: Equal
+        value: controlplane
+    database:
+      database_secret: aap-eda-postgres-configuration
+      externally_managed: true
+    default_worker:
+      node_selector:
+        dedicated: controlplane
+      replicas: 2
+      resource_requirements:
+        requests:
+          cpu: 500m
+          memory: 4Gi
+      tolerations:
+      - effect: NoSchedule
+        key: dedicated
+        operator: Equal
+        value: controlplane
+    disabled: false
+    event_stream:
+      database_secret: aap-eda-event-stream-postgres-configuration
+      externally_managed: true
+      node_selector:
+        dedicated: controlplane
+      tolerations:
+      - effect: NoSchedule
+        key: dedicated
+        operator: Equal
+        value: controlplane
+    redis_storage_size: 1Gi
+    ui_disabled: true
+    worker:
+      node_selector:
+        dedicated: controlplane
+      replicas: 2
+      resource_requirements:
+        requests:
+          cpu: 500m
+          memory: 4Gi
+      tolerations:
+      - effect: NoSchedule
+        key: dedicated
+        operator: Equal
+        value: controlplane
+  extra_settings:
+  - setting: CSRF_TRUSTED_ORIGINS
+    value:
+    - https://aap.example.com
+    - https://aap-aap.apps.cluster-a.example.com
+  gateway_timeouts:
+  - gateway_route_name: hub container registry
+    idle_timeout_seconds: 600
+    request_timeout_seconds: 600
+  - gateway_route_name: pulp content
+    idle_timeout_seconds: 600
+    request_timeout_seconds: 600
+  - gateway_route_name: galaxy api
+    idle_timeout_seconds: 600
+    request_timeout_seconds: 600
+  hub:
+    api:
+      replicas: 2
+      resource_requirements:
+        limits:
+          cpu: "2"
+          memory: 4Gi
+        requests:
+          cpu: 500m
+          memory: 2Gi
+    content:
+      replicas: 2
+      resource_requirements:
+        limits:
+          cpu: "2"
+          memory: 4Gi
+        requests:
+          cpu: 500m
+          memory: 2Gi
+    disabled: false
+    nginx_proxy_connect_timeout: 120s
+    nginx_proxy_read_timeout: 120s
+    nginx_proxy_send_timeout: 120s
+    node_selector: |
+      dedicated: controlplane
+    object_storage_s3_secret: hub-rgw-s3-credentials
+    postgres_configuration_secret: aap-hub-postgres-configuration
+    pulp_settings:
+      analytics: false
+      redirect_to_object_storage: false
+      token_expiration_time: 86400
+    redis_storage_size: 1Gi
+    storage_type: s3
+    tolerations: |
+      - key: dedicated
+        operator: Equal
+        value: controlplane
+        effect: NoSchedule
+    topology_spread_constraints: |
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+    web:
+      replicas: 2
+      resource_requirements:
+        limits:
+          cpu: "1"
+          memory: 2Gi
+        requests:
+          cpu: 200m
+          memory: 1Gi
+    worker:
+      replicas: 2
+      resource_requirements:
+        requests:
+          cpu: 250m
+          memory: 8Gi
+  idle_aap: false
+  image_pull_policy: IfNotPresent
+  lightspeed:
+    disabled: true
+  metrics:
+    database:
+      database_secret: aap-metrics-postgres-configuration
+      externally_managed_database: true
+      externally_managed_ms_awx_readonly_user: true
+      ms_awx_readonly_user_secret: aap-metrics-controller-postgres-configuration
+    disabled: true
+    name: aap-metrics
+  no_log: false
+  public_base_url: https://aap.example.com
+  redis:
+    node_selector:
+      dedicated: controlplane
+    tolerations:
+    - effect: NoSchedule
+      key: dedicated
+      operator: Equal
+      value: controlplane
+  redis_mode: standalone
+  route_annotations: |
+    haproxy.router.openshift.io/timeout: '600s'
+    haproxy.router.openshift.io/set-forwarded-headers: 'never'
+  route_tls_termination_mechanism: Edge
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+  name: aap-operator-group
+  namespace: aap
+spec:
+  targetNamespaces:
+  - aap
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "-3"
+  name: ansible-automation-platform-operator
+  namespace: aap
+spec:
+  channel: stable-2.7
+  installPlanApproval: Automatic
+  name: ansible-automation-platform-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace

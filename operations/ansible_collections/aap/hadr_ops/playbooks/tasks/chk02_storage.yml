@@ -1,0 +1,54 @@
+---
+# CHK-02: Storage Infrastructure
+# Runs check_storage.yml on each reachable cluster to evaluate PVC health
+# and disk usage. Combines results and gates on failure.
+
+- name: "CHK-02: Check storage on cluster-a"
+  when: _chk01_a_reachable | bool
+  block:
+    - name: "CHK-02: Run storage check on cluster-a"
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.cnpg_preflight
+        tasks_from: check_storage.yml
+      vars:
+        preflight_context: "{{ cluster_a_context }}"
+    - name: "CHK-02: Save cluster-a result"
+      ansible.builtin.set_fact:
+        _chk02_result_a: "{{ storage_check_result }}"
+
+- name: "CHK-02: Check storage on cluster-b"
+  when: _chk01_b_reachable | bool
+  block:
+    - name: "CHK-02: Run storage check on cluster-b"
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.cnpg_preflight
+        tasks_from: check_storage.yml
+      vars:
+        preflight_context: "{{ cluster_b_context }}"
+    - name: "CHK-02: Save cluster-b result"
+      ansible.builtin.set_fact:
+        _chk02_result_b: "{{ storage_check_result }}"
+
+- name: "CHK-02: Evaluate combined storage status"
+  vars:
+    _status_a: "{{ _chk02_result_a.status | default('skip') | trim }}"
+    _status_b: "{{ _chk02_result_b.status | default('skip') | trim }}"
+  ansible.builtin.set_fact:
+    _chk02_status: >-
+      {% if _status_a == 'fail' or _status_b == 'fail' %}fail
+      {% elif _status_a == 'warn' or _status_b == 'warn' %}warn
+      {% else %}pass{% endif %}
+    _chk02_detail: >-
+      a={{ _chk02_result_a.disk_percent | default('N/A') }}% ({{ _chk02_result_a.unbound_count | default(0) }} unbound),
+      b={{ _chk02_result_b.disk_percent | default('N/A') }}% ({{ _chk02_result_b.unbound_count | default(0) }} unbound)
+
+- name: "CHK-02: Finalize"
+  vars:
+    _check_key: "chk02_storage"
+    _check_name: "CHK-02 Storage Infrastructure"
+    _check_status: "{{ _chk02_status | trim }}"
+    _check_detail: "{{ _chk02_detail | trim }}"
+    _check_data:
+      cluster_a: "{{ _chk02_result_a | default({'status': 'skip'}) }}"
+      cluster_b: "{{ _chk02_result_b | default({'status': 'skip'}) }}"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/finalize_check.yml"

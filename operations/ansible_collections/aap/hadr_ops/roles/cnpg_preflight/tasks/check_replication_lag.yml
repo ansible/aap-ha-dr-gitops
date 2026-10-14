@@ -1,0 +1,86 @@
+---
+# Check replication lag on the primary cluster
+#
+# Queries pg_stat_replication for the streaming replica's replay lag.
+# Evaluates against configurable thresholds to determine if the replica
+# is close enough for a safe switchover.
+#
+# Input:
+#   preflight_context — K8s context of the PRIMARY cluster
+#   aap_namespace, cluster_name
+#   preflight_lag_proceed_threshold (default: 5) — seconds
+#   preflight_lag_abort_threshold (default: 60) — seconds
+#
+# Output (set_fact):
+#   replication_lag_result — dict with status, lag_seconds, detail
+
+- name: Validate preflight_context is set
+  ansible.builtin.fail:
+    msg: "preflight_context must be set"
+  when: preflight_context | default('') == ''
+
+- name: Query pg_stat_replication for replay lag
+  block:
+    - name: Execute replication lag query
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.cnpg_common
+        tasks_from: psql_query.yml
+      vars:
+        _query_context: "{{ preflight_context }}"
+        _query_labels: "cnpg.io/cluster={{ cluster_name }},cnpg.io/instanceRole=primary"
+        _query: >-
+          SELECT COALESCE(
+            EXTRACT(EPOCH FROM max(replay_lag))::numeric,
+            -1
+          ) as lag_seconds
+          FROM pg_stat_replication;
+  rescue:
+    - name: Handle query failure gracefully
+      ansible.builtin.set_fact:
+        _query_result:
+          stdout: ""
+          stderr: "Query failed"
+          return_code: 1
+
+- name: Parse lag value
+  vars:
+    _query_ok: "{{ (_query_result.return_code | default(1) | int == 0) }}"
+    _raw: "{{ _query_result.stdout | default('') | trim }}"
+  ansible.builtin.set_fact:
+    _rl_query_ok: "{{ _query_ok }}"
+    _rl_lag_seconds: >-
+      {{ _raw | float if (_query_ok | bool and _raw | length > 0 and _raw != '')
+         else -1 }}
+
+- name: Build replication lag result
+  vars:
+    _lag: "{{ _rl_lag_seconds | float }}"
+    _proceed_threshold: "{{ preflight_lag_proceed_threshold | default(5) | float }}"
+    _abort_threshold: "{{ preflight_lag_abort_threshold | default(60) | float }}"
+  ansible.builtin.set_fact:
+    replication_lag_result:
+      context: "{{ preflight_context }}"
+      status: >-
+        {% if not (_rl_query_ok | bool) %}fail
+        {% elif (_lag | float) < 0 %}fail
+        {% elif (_lag | float) <= (_proceed_threshold | float) %}pass
+        {% elif (_lag | float) <= (_abort_threshold | float) %}warn
+        {% else %}fail{% endif %}
+      lag_seconds: "{{ _lag }}"
+      proceed_threshold: "{{ _proceed_threshold }}"
+      abort_threshold: "{{ _abort_threshold }}"
+      detail: >-
+        {% if not (_rl_query_ok | bool) %}Cannot query replication lag on primary
+        {% elif (_lag | float) < 0 %}Cannot measure lag — no active streaming replica found
+        {% elif (_lag | float) <= (_proceed_threshold | float) %}Lag {{ _lag }}s within proceed threshold ({{ _proceed_threshold }}s)
+        {% elif (_lag | float) <= (_abort_threshold | float) %}Lag {{ _lag }}s exceeds proceed threshold ({{ _proceed_threshold }}s) but below abort ({{ _abort_threshold }}s)
+        {% else %}Lag {{ _lag }}s exceeds abort threshold ({{ _abort_threshold }}s) — too much potential data loss{% endif %}
+
+- name: Log replication lag result
+  ansible.builtin.debug:
+    msg:
+      - "Replication Lag Check: {{ preflight_context }}"
+      - "  Status:    {{ replication_lag_result.status | trim }}"
+      - "  Lag:       {{ replication_lag_result.lag_seconds }}s"
+      - "  Threshold: proceed={{ replication_lag_result.proceed_threshold }}s, abort={{ replication_lag_result.abort_threshold }}s"
+      - "  Detail:    {{ replication_lag_result.detail | trim }}"

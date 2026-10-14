@@ -1,0 +1,5 @@
+# Install in the same Python environment used by ansible-playbook.
+ansible-core>=2.16,<2.20
+kubernetes>=24.2.0
+PyYAML==6.0.3
+jsonpatch>=1.32

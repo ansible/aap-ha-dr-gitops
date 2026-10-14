@@ -1,0 +1,21 @@
+---
+galaxy_info:
+  author: AAP HA/DR Testing Team
+  description: Bootstrap RGW multisite active-active replication across two Ceph clusters
+  company: Red Hat
+  license: Apache-2.0
+  min_ansible_version: "2.9"
+  platforms:
+    - name: EL
+      versions:
+        - all
+  galaxy_tags:
+    - hadr
+    - ceph
+    - rook
+    - rgw
+    - multisite
+    - replication
+    - ansible_automation_platform
+
+dependencies: []

@@ -1,0 +1,20 @@
+---
+# CHK-16: AAP API liveness.
+
+- name: "CHK-16: Finalize API liveness result"
+  vars:
+    _api_statuses:
+      - "{{ _platform_result_a.api_liveness.status | default('skip') | trim }}"
+      - "{{ _platform_result_b.api_liveness.status | default('skip') | trim }}"
+    _api_status: >-
+      {% if 'fail' in _api_statuses %}fail
+      {% elif 'warn' in _api_statuses %}warn
+      {% else %}pass{% endif %}
+    _check_key: "chk16_api_liveness"  # gitleaks:allow -- fixed check identifier, not a credential
+    _check_name: "CHK-16 API Liveness"
+    _check_status: "{{ _api_status | trim }}"
+    _check_detail: "a={{ _platform_result_a.api_liveness.detail | default('skip', true) | trim }}, b={{ _platform_result_b.api_liveness.detail | default('skip', true) | trim }}"
+    _check_data:
+      cluster_a: "{{ _platform_result_a.api_liveness | default({'status': 'skip'}) }}"
+      cluster_b: "{{ _platform_result_b.api_liveness | default({'status': 'skip'}) }}"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/finalize_check.yml"

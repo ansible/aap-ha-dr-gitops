@@ -1,0 +1,18 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: aap-hadr-example-b
+  namespace: openshift-gitops
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/ansible-automation-platform/aap-ha-dr-gitops/
+    targetRevision: main
+    path: examples/aws-rosa-pair/bootstrap/example-b
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: openshift-gitops
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

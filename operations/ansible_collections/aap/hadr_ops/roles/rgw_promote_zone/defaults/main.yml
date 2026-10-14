@@ -1,0 +1,17 @@
+---
+rgw_namespace: openshift-storage
+rgw_realm: hub-realm
+rgw_zonegroup: hub-zonegroup
+
+# Seconds to wait for RGW pods to come back after restart
+rgw_restart_wait_seconds: 120
+
+# Period commit retry loop — used if the first commit attempt fails
+# (e.g., radosgw-admin still holding a stale master reference)
+rgw_period_commit_retries: 5
+rgw_period_commit_delay: 10
+
+# Required variables — must be set by the caller:
+#   surviving_context:  k8s context of the cluster being promoted
+#   surviving_zone:     CephObjectZone name on the surviving cluster (matches site_id)
+#   dead_zone:          CephObjectZone name of the lost cluster (to remove from zonegroup)

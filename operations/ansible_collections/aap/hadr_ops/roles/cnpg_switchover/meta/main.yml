@@ -1,0 +1,12 @@
+---
+galaxy_info:
+  role_name: cnpg_switchover
+  author: AAP HA/DR Testing Team
+  description: >-
+    Core CNPG demotion and promotion operations. Supports demote (graceful with
+    token), promote (with token), force_promote (DR without token), and status
+    (read-only). Waits for CNPG cluster health after promotion.
+  company: Red Hat
+  license: Apache-2.0
+  min_ansible_version: "2.15"
+dependencies: []

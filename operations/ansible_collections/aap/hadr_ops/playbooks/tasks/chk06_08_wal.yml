@@ -1,0 +1,102 @@
+---
+# CHK-06/07/08: WAL Timeline, Replication Slot, and WAL Archiver
+# Runs check_wal.yml which validates timeline alignment AND archiver health
+# in a single pass. Also checks replication slot status on the primary.
+# Requires _dual_topology_ok (set by CHK-05).
+
+- name: "CHK-06/08: Run WAL check"
+  when: _dual_topology_ok | bool
+  ansible.builtin.include_role:
+    name: aap.hadr_ops.cnpg_preflight
+    tasks_from: check_wal.yml
+  vars:
+    primary_context: "{{ _wal_primary_context }}"
+    replica_context: "{{ _wal_replica_context }}"
+    primary_site_id: "{{ _wal_primary_site }}"
+    replica_site_id: "{{ _wal_replica_site }}"
+
+- name: "CHK-06/08: Skip if not applicable"
+  when: not (_dual_topology_ok | bool)
+  ansible.builtin.set_fact:
+    _chk06_status: "skip"
+    _chk06_detail: "Skipped — requires both clusters reachable with valid topology"
+    _chk08_status: "skip"
+    _chk08_detail: "Skipped — requires both clusters reachable with valid topology"
+
+# ── CHK-06: WAL Timeline ────────────────────────────────────────
+
+- name: "CHK-06: Evaluate WAL timeline result"
+  when: wal_check_result is defined
+  ansible.builtin.set_fact:
+    _chk06_status: >-
+      {% if (wal_check_result.timelines_match | bool) %}pass
+      {% else %}fail{% endif %}
+    _chk06_detail: >-
+      {% if (wal_check_result.timelines_match | bool) %}Timelines aligned (primary={{ wal_check_result.primary_timeline }}, replica={{ wal_check_result.replica_timeline }})
+      {% else %}Cannot proceed — WAL timelines diverged (primary={{ wal_check_result.primary_timeline }}, replica={{ wal_check_result.replica_timeline }}){% endif %}
+
+- name: "CHK-06: Finalize"
+  vars:
+    _check_key: "chk06_wal_timeline"
+    _check_name: "CHK-06 WAL Timeline"
+    _check_status: "{{ _chk06_status | trim }}"
+    _check_detail: "{{ _chk06_detail | trim }}"
+    _check_data:
+      primary_timeline: "{{ wal_check_result.primary_timeline | default('N/A') }}"
+      replica_timeline: "{{ wal_check_result.replica_timeline | default('N/A') }}"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/finalize_check.yml"
+
+# ── CHK-07: Replication Slot ────────────────────────────────────
+
+- name: "CHK-07: Check replication slot on primary"
+  when: _dual_topology_ok | bool
+  ansible.builtin.include_role:
+    name: aap.hadr_ops.cnpg_preflight
+    tasks_from: check_replication_slot.yml
+  vars:
+    preflight_context: "{{ _wal_primary_context }}"
+
+- name: "CHK-07: Skip if not applicable"
+  when: not (_dual_topology_ok | bool)
+  ansible.builtin.set_fact:
+    _chk07_status: "skip"
+    _chk07_detail: "Skipped — requires both clusters reachable with valid topology"
+
+- name: "CHK-07: Set status from result"
+  when: replication_slot_result is defined
+  ansible.builtin.set_fact:
+    _chk07_status: "{{ replication_slot_result.status | trim }}"
+    _chk07_detail: "{{ replication_slot_result.detail | trim }}"
+
+- name: "CHK-07: Finalize"
+  vars:
+    _check_key: "chk07_replication_slot"  # gitleaks:allow -- fixed check identifier, not a credential
+    _check_name: "CHK-07 Replication Slot"
+    _check_status: "{{ _chk07_status | trim }}"
+    _check_detail: "{{ _chk07_detail | trim }}"
+    _check_data:
+      slot_name: "{{ replication_slot_result.slot_name | default('N/A') }}"
+      active: "{{ replication_slot_result.active | default(false) }}"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/finalize_check.yml"
+
+# ── CHK-08: WAL Archiver ────────────────────────────────────────
+
+- name: "CHK-08: Evaluate archiver result"
+  when: wal_check_result is defined
+  ansible.builtin.set_fact:
+    _chk08_status: >-
+      {% if (wal_check_result.wal_archive_healthy | bool) %}pass
+      {% else %}fail{% endif %}
+    _chk08_detail: >-
+      {% if (wal_check_result.wal_archive_healthy | bool) %}Archiver healthy (archived={{ wal_check_result.archiver.archived_count }}, failed={{ wal_check_result.archiver.failed_count }})
+      {% else %}Cannot proceed — WAL archiver failing (failed_count={{ wal_check_result.archiver.failed_count }}, last_failed={{ wal_check_result.archiver.last_failed_time }}){% endif %}
+
+- name: "CHK-08: Finalize"
+  vars:
+    _check_key: "chk08_wal_archiver"
+    _check_name: "CHK-08 WAL Archiver"
+    _check_status: "{{ _chk08_status | trim }}"
+    _check_detail: "{{ _chk08_detail | trim }}"
+    _check_data:
+      archiver: "{{ wal_check_result.archiver | default({}) }}"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/finalize_check.yml"

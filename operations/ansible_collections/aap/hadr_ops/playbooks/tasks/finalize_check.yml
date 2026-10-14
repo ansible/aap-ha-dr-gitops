@@ -1,0 +1,46 @@
+---
+# Finalize a preflight check: record result, log, and run abort gate.
+#
+# Replaces the repeated 3-task tail in every check file:
+#   1. Merge check result into _preflight_checks
+#   2. Log a one-line summary
+#   3. Set gate input + call abort_gate.yml
+#
+# Input (set as facts before calling):
+#   _check_key:    dict key for _preflight_checks (e.g. "chk02_storage")
+#   _check_name:   display name (e.g. "CHK-02 Storage Infrastructure")
+#   _check_status: "pass" | "warn" | "fail" | "skip"
+#   _check_detail: human-readable summary
+#   _check_data:   dict with check-specific fields to store (optional, default {})
+
+- name: "{{ _check_name }}: Record result"
+  ansible.builtin.set_fact:
+    _preflight_checks: >-
+      {{ _preflight_checks | combine({
+        _check_key: (_check_data | default({})) | combine({
+          'status': _check_status | trim,
+          'detail': _check_detail | trim,
+          'fix_result': _fix_result | default('none') | trim
+        })
+      }) }}
+
+- name: "{{ _check_name }}: Log"
+  ansible.builtin.debug:
+    msg: "  {{ _check_name }} ...... {{ _check_status | trim | upper }}  ({{ _check_detail | trim }})"
+
+- name: "{{ _check_name }}: Set gate input"
+  ansible.builtin.set_fact:
+    _current_check_name: "{{ _check_name }}"
+    _current_check_status: "{{ _check_status | trim }}"
+    _current_check_detail: "{{ _check_detail | trim }}"
+
+- name: "{{ _check_name }}: Autofix gate"
+  when:
+    - autofix | default(false) | bool
+    - (_check_status | trim) == 'fail'
+    - not (_recheck_only | default(false) | bool)
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/autofix_gate.yml"
+
+- name: "{{ _check_name }}: Abort gate"
+  when: not (_recheck_only | default(false) | bool)
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/abort_gate.yml"

@@ -1,0 +1,31 @@
+---
+# RGW Multisite Setup — Role Defaults
+#
+# Bootstrap active-active Ceph RGW replication across two OpenShift clusters.
+# These names match the Rook/ODF CRs deployed by the AAP manifests.
+
+# Namespace where Rook/ODF runs
+rgw_namespace: openshift-storage
+
+# Ceph RGW realm/zonegroup names (fixed in the AAP manifests)
+rgw_realm: hub-realm
+rgw_zonegroup: hub-zonegroup
+
+# Name of the S3 bucket used by Automation Hub
+rgw_bucket: automation-hub-content
+
+# UID of the RGW system user used for zone replication
+rgw_system_uid: hub-realm-system-user
+
+# Secret name where ESO writes the RGW access/secret keys
+rgw_realm_secret_name: hub-realm-keys
+
+# OpenShift Route name for the RGW S3 replication endpoint
+rgw_route_name: rgw-s3-replication
+
+# Seconds to wait for RGW pods to become healthy after restart
+rgw_restart_wait_seconds: 120
+
+# Period pull retry count and delay (seconds) on the replica cluster
+rgw_period_pull_retries: 3
+rgw_period_pull_delay: 10

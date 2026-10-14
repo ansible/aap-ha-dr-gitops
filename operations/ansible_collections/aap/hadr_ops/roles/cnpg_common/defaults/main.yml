@@ -1,0 +1,7 @@
+---
+# Role-specific variables only.
+# Shared variables (aap_namespace, cluster_name, etc.) are provided by
+# the config_loader role — do not duplicate here.
+#
+# This role has no role-specific defaults; all variables it uses
+# (aap_namespace, cluster_name) come from config_loader.

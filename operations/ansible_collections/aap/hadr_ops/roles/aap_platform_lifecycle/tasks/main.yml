@@ -1,0 +1,25 @@
+---
+# aap_platform_lifecycle — Manage AAP platform state on a single cluster
+#
+# Per-target-system role. Call once per cluster.
+#
+# Input:
+#   lifecycle_action  — "idle" | "activate" | "status"
+#   lifecycle_context — K8s context of the target cluster
+#   aap_namespace, aap_name
+#
+# Output:
+#   lifecycle_result — dict with action, status, deployments, health details
+
+- name: Validate inputs
+  ansible.builtin.fail:
+    msg: >-
+      lifecycle_action must be 'idle', 'activate', or 'status'
+      (got '{{ lifecycle_action | default('') }}')
+      and lifecycle_context must be set (got '{{ lifecycle_context | default('') }}')
+  when: >
+    lifecycle_action | default('') not in ['idle', 'activate', 'status'] or
+    lifecycle_context | default('') == ''
+
+- name: "AAP {{ lifecycle_action }}: {{ lifecycle_context }}"
+  ansible.builtin.include_tasks: "{{ lifecycle_action }}.yml"

@@ -1,0 +1,43 @@
+---
+# Demote a CNPG primary to replica (graceful switchover)
+#
+# Clears any stale promotion token, then demotes with token generation.
+#
+# Input:
+#   switchover_context — context of the current primary to demote
+#   switchover_new_primary — site ID of the target new primary
+#
+# Output:
+#   switchover_result — includes demotion_token for the promote step
+
+- name: Clear stale promotionToken on {{ switchover_context }}
+  aap.hadr_ops.cnpg_switchover_step:
+    namespace: "{{ aap_namespace }}"
+    cluster_name: "{{ cluster_name }}"
+    context: "{{ switchover_context }}"
+    operation: "clear_promotion_token"
+  ignore_errors: true
+
+- name: Demote to replica on {{ switchover_context }}
+  aap.hadr_ops.cnpg_switchover_step:
+    namespace: "{{ aap_namespace }}"
+    cluster_name: "{{ cluster_name }}"
+    context: "{{ switchover_context }}"
+    operation: "demote"
+    new_primary: "{{ switchover_new_primary }}"
+    token_wait_timeout: "{{ token_wait_timeout }}"
+  register: _demote_result
+
+- name: Set switchover result (demote)
+  ansible.builtin.set_fact:
+    switchover_result:
+      context: "{{ switchover_context }}"
+      action: "demote"
+      status: "{{ 'success' if _demote_result is succeeded else 'failed' }}"
+      duration_seconds: "{{ _demote_result.duration_seconds | default(0) }}"
+      demotion_token: "{{ _demote_result.demotion_token | default('') }}"
+      error: "{{ _demote_result.msg | default('') if _demote_result is failed else '' }}"
+
+- name: Log demotion result
+  ansible.builtin.debug:
+    msg: "CNPG demote on {{ switchover_context }}: {{ switchover_result.status }} ({{ switchover_result.duration_seconds }}s)"

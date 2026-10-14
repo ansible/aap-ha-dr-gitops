@@ -1,0 +1,316 @@
+---
+# AAP Graceful Switchover
+#
+# Performs a coordinated primary/replica swap across geographically distributed
+# CNPG clusters. Both clusters must be healthy and WAL timelines aligned.
+#
+# Usage (from the example repository root):
+#   ansible-playbook operations/ansible_collections/aap/hadr_ops/playbooks/aap_graceful_switchover.yml \
+#     -e @my-deployment/operations/clusters.yml
+#   ansible-playbook operations/ansible_collections/aap/hadr_ops/playbooks/aap_graceful_switchover.yml \
+#     -e @my-deployment/operations/clusters.yml -e cluster_set=02
+#
+# Requires: cluster topology via -e @<clusters file> (see the generated <deployment>/operations/clusters.yml)
+#
+# Variables:
+#   cluster_set: "01" (default) — selects cluster contexts and pair inventory IDs
+#   aap_namespace: AAP namespace (default: aap)
+#   cluster_name: CNPG cluster name (default: aap-postgres)
+
+- name: AAP Graceful Switchover
+  hosts: localhost
+  gather_facts: true
+  tasks:
+    - name: Load and validate configuration
+      ansible.builtin.import_role:
+        name: aap.hadr_ops.config_loader
+
+    - name: Display switchover parameters
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "AAP Graceful Switchover"
+          - "Cluster Set: {{ cluster_set }}"
+          - "Cluster-A: {{ cluster_a_context }} (site_id={{ site_id_a }})"
+          - "Cluster-B: {{ cluster_b_context }} (site_id={{ site_id_b }})"
+          - "HADR Pair: {{ hadr_pair_id }}"
+          - "Namespace: {{ aap_namespace }}"
+          - "=========================================="
+
+    # ── Init ──────────────────────────────────────────────────────
+    - name: Record switchover start time
+      ansible.builtin.set_fact:
+        switchover_start_time: "{{ ansible_facts.date_time.epoch }}"
+        switchover_log_file: "{{ switchover_log_dir }}/cnpg-switchover-{{ ansible_facts.date_time.iso8601_basic_short }}.log"
+
+    - name: Log switchover initiation
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "CNPG Switchover Started"
+          - "Mode: GRACEFUL SWITCHOVER"
+          - "Namespace: {{ aap_namespace }}"
+          - "Cluster: {{ cluster_name }}"
+          - "Log file: {{ switchover_log_file }}"
+          - "=========================================="
+
+    # ── Preflight ─────────────────────────────────────────────────
+    - name: Preflight cluster-a
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.cnpg_preflight
+      vars:
+        preflight_context: "{{ cluster_a_context }}"
+
+    - name: Save cluster-a preflight
+      ansible.builtin.set_fact:
+        _pf_a: "{{ preflight_result }}"
+
+    - name: Preflight cluster-b
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.cnpg_preflight
+      vars:
+        preflight_context: "{{ cluster_b_context }}"
+
+    - name: Save cluster-b preflight
+      ansible.builtin.set_fact:
+        _pf_b: "{{ preflight_result }}"
+
+    - name: Determine primary and replica from preflight
+      ansible.builtin.set_fact:
+        old_primary_context: "{{ cluster_a_context if (_pf_a.role | trim) == 'primary' else cluster_b_context }}"
+        new_primary_context: "{{ cluster_b_context if (_pf_a.role | trim) == 'primary' else cluster_a_context }}"
+        old_self: "{{ _pf_a.site_id if (_pf_a.role | trim) == 'primary' else _pf_b.site_id }}"
+        new_self: "{{ _pf_b.site_id if (_pf_a.role | trim) == 'primary' else _pf_a.site_id }}"
+        old_primary_environment_id: "{{ hadr_environment_id_a if (_pf_a.role | trim) == 'primary' else hadr_environment_id_b }}"
+        new_primary_environment_id: "{{ hadr_environment_id_b if (_pf_a.role | trim) == 'primary' else hadr_environment_id_a }}"
+
+    - name: Validate both clusters are healthy
+      ansible.builtin.fail:
+        msg: >-
+          Cannot perform graceful switchover —
+          {{ _pf_a.context }}: {{ _pf_a.status | trim }},
+          {{ _pf_b.context }}: {{ _pf_b.status | trim }}
+      when: (_pf_a.status | trim) != 'healthy' or (_pf_b.status | trim) != 'healthy'
+
+    - name: Run WAL check
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.cnpg_preflight
+        tasks_from: check_wal.yml
+      vars:
+        primary_context: "{{ old_primary_context }}"
+        replica_context: "{{ new_primary_context }}"
+        primary_site_id: "{{ old_self }}"
+        replica_site_id: "{{ new_self }}"
+
+    - name: Fail if WAL check not ready
+      ansible.builtin.fail:
+        msg: "{{ wal_check_result.error | trim }}"
+      when: (wal_check_result.status | trim) != 'ready'
+
+    # ── ArgoCD pause ──────────────────────────────────────────────
+    - name: Pause ArgoCD on old primary
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.aap_argocd_manage
+      vars:
+        argocd_action: pause
+        argocd_context: "{{ old_primary_context }}"
+
+    - name: Pause ArgoCD on new primary
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.aap_argocd_manage
+      vars:
+        argocd_action: pause
+        argocd_context: "{{ new_primary_context }}"
+
+    # ── AAP idle on old primary ───────────────────────────────────
+    - name: Idle AAP on old primary
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.aap_platform_lifecycle
+      vars:
+        lifecycle_action: idle
+        lifecycle_context: "{{ old_primary_context }}"
+
+    - name: Save idle result
+      ansible.builtin.set_fact:
+        scale_down_result: "{{ lifecycle_result }}"
+
+    # ── Core CNPG switchover ──────────────────────────────────────
+    - name: Demote old primary
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.cnpg_switchover
+      vars:
+        switchover_action: demote
+        switchover_context: "{{ old_primary_context }}"
+        switchover_new_primary: "{{ new_self }}"
+
+    - name: Save demote result
+      ansible.builtin.set_fact:
+        demote_result: "{{ switchover_result }}"
+
+    - name: Guard — abort if demote failed
+      when: (demote_result.status | default('') | trim) != 'success'
+      ansible.builtin.fail:
+        msg: >-
+          Demote failed on {{ old_self }} (status={{ demote_result.status | trim }}).
+          Cannot proceed with promote — no valid demotion token.
+          Error: {{ demote_result.error | default('unknown') | trim }}
+
+    - name: Promote new primary (with demotion token)
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.cnpg_switchover
+      vars:
+        switchover_action: promote
+        switchover_context: "{{ new_primary_context }}"
+        switchover_new_primary: "{{ new_self }}"
+        switchover_promotion_token: "{{ demote_result.demotion_token }}"
+
+    - name: Save promote result
+      ansible.builtin.set_fact:
+        promote_result: "{{ switchover_result }}"
+
+    - name: Guard — warn if promote did not fully succeed
+      when: (promote_result.status | default('') | trim) != 'success'
+      ansible.builtin.debug:
+        msg:
+          - "WARNING: Promote status is {{ promote_result.status | trim }} (not 'success')"
+          - "  Error: {{ promote_result.error | default('') | trim }}"
+          - "  Continuing with activation — cluster may be degraded"
+
+    # ── Workarounds ───────────────────────────────────────────────
+    - name: Apply post-switchover workarounds on new primary
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.switchover_workarounds
+      vars:
+        workaround_context: "{{ new_primary_context }}"
+
+    # ── Post-switchover topology ──────────────────────────────────
+    - name: Get post-switchover topology cluster-a
+      aap.hadr_ops.cnpg_cluster_info:
+        namespace: "{{ aap_namespace }}"
+        cluster_name: "{{ cluster_name }}"
+        context: "{{ cluster_a_context }}"
+      register: post_cluster_a_info
+      ignore_errors: true
+
+    - name: Get post-switchover topology cluster-b
+      aap.hadr_ops.cnpg_cluster_info:
+        namespace: "{{ aap_namespace }}"
+        cluster_name: "{{ cluster_name }}"
+        context: "{{ cluster_b_context }}"
+      register: post_cluster_b_info
+      ignore_errors: true
+
+    - name: Display post-switchover topology
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "Post-Switchover Topology"
+          - "cluster-a: self={{ post_cluster_a_info.cluster_info.spec.self | default('N/A') }} primary={{ post_cluster_a_info.cluster_info.spec.primary | default('N/A') }} is_primary={{ post_cluster_a_info.cluster_info.computed.is_primary | default(false) }}"
+          - "cluster-b: self={{ post_cluster_b_info.cluster_info.spec.self | default('N/A') }} primary={{ post_cluster_b_info.cluster_info.spec.primary | default('N/A') }} is_primary={{ post_cluster_b_info.cluster_info.computed.is_primary | default(false) }}"
+          - "=========================================="
+
+    # ── Activate AAP on new primary ───────────────────────────────
+    - name: Activate AAP on new primary
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.aap_platform_lifecycle
+      vars:
+        lifecycle_action: activate
+        lifecycle_context: "{{ new_primary_context }}"
+
+    - name: Save activate result
+      ansible.builtin.set_fact:
+        scale_up_result: "{{ lifecycle_result }}"
+        switchover_health: "{{ lifecycle_result.status | trim }}"
+        gateway_healthy: "{{ lifecycle_result.gateway_healthy | default(false) }}"
+        controller_healthy: "{{ lifecycle_result.controller_healthy | default(false) }}"
+        aap_deployments_healthy: "{{ lifecycle_result.deployments_healthy | default(false) }}"
+
+    # ── ArgoCD resume ─────────────────────────────────────────────
+    - name: Wait for the approved pair record to reach both ApplicationSets
+      ansible.builtin.pause:
+        prompt: >-
+          Update deployment/argocd/pairs/{{ hadr_pair_id }}.yaml so
+          desired_primary_environment_id is {{ new_primary_environment_id }};
+          merge that Git change and wait for the CNPG/platform Applications
+          on both clusters to show the new pair roles. Press Enter to continue.
+      when: not (pair_state_reconciled | bool)
+
+    - name: Resume ArgoCD on old primary as replica
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.aap_argocd_manage
+      vars:
+        argocd_action: resume
+        argocd_context: "{{ old_primary_context }}"
+        argocd_pair_id: "{{ hadr_pair_id }}"
+        argocd_environment_id: "{{ old_primary_environment_id }}"
+        argocd_expected_role: replica
+        argocd_trigger_sync: true
+
+    - name: Resume ArgoCD on new primary
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.aap_argocd_manage
+      vars:
+        argocd_action: resume
+        argocd_context: "{{ new_primary_context }}"
+        argocd_pair_id: "{{ hadr_pair_id }}"
+        argocd_environment_id: "{{ new_primary_environment_id }}"
+        argocd_expected_role: primary
+        argocd_trigger_sync: true
+
+    # ── Results ───────────────────────────────────────────────────
+    - name: Calculate total duration
+      ansible.builtin.set_fact:
+        total_duration_seconds: "{{ (demote_result.duration_seconds | float) + (promote_result.duration_seconds | float) }}"
+
+    - name: Set switchover result
+      ansible.builtin.set_fact:
+        cnpg_switchover_result:
+          mode: "graceful_switchover"
+          health: "{{ switchover_health | trim }}"
+          old_primary: "{{ old_self }}"
+          new_primary: "{{ new_self }}"
+          demotion_token: "{{ demote_result.demotion_token }}"
+          demotion_duration_seconds: "{{ demote_result.duration_seconds }}"
+          promotion_duration_seconds: "{{ promote_result.duration_seconds }}"
+          total_duration_seconds: "{{ total_duration_seconds }}"
+          gateway_healthy: "{{ gateway_healthy }}"
+          controller_healthy: "{{ controller_healthy }}"
+          deployments_healthy: "{{ aap_deployments_healthy | default(false) }}"
+          topology_cluster_a: "{{ post_cluster_a_info.cluster_info | default({}) }}"
+          topology_cluster_b: "{{ post_cluster_b_info.cluster_info | default({}) }}"
+
+    - name: Display switchover completion summary
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "Switchover Complete: {{ old_self }} → {{ new_self }}"
+          - "Health: {{ cnpg_switchover_result.health }}"
+          - "Total Duration: {{ total_duration_seconds }}s"
+          - "Demotion: {{ cnpg_switchover_result.demotion_duration_seconds }}s | Promotion: {{ promote_result.duration_seconds }}s"
+          - "Gateway: {{ 'OK' if cnpg_switchover_result.gateway_healthy else 'FAILED' }} | Controller: {{ 'OK' if cnpg_switchover_result.controller_healthy else 'FAILED' }} | Deployments: {{ 'OK' if cnpg_switchover_result.deployments_healthy else 'DEGRADED' }}"
+          - "Log: {{ switchover_log_file }}"
+          - "Next: Run this playbook again to switch back"
+          - "=========================================="
+
+    - name: Write switchover log summary
+      ansible.builtin.copy:
+        content: |
+          CNPG Distributed Switchover Log
+          ================================
+          Timestamp: {{ ansible_facts.date_time.iso8601 }}
+          Mode: {{ cnpg_switchover_result.mode }}
+          Health: {{ cnpg_switchover_result.health }}
+          Direction: {{ old_self }} → {{ new_self }}
+          Total Duration: {{ total_duration_seconds }}s
+          Demotion Token: {{ cnpg_switchover_result.demotion_token }}
+          Demotion Duration: {{ cnpg_switchover_result.demotion_duration_seconds }}s
+          Promotion Duration: {{ promote_result.duration_seconds }}s
+          AAP Health:
+            Gateway: {{ 'healthy' if cnpg_switchover_result.gateway_healthy else 'NOT RESPONDING' }}
+            Controller: {{ 'healthy' if cnpg_switchover_result.controller_healthy else 'NOT RESPONDING' }}
+            Deployments: {{ 'all key deployments ready' if cnpg_switchover_result.deployments_healthy else 'DEGRADED' }}
+          Post-Switchover Topology:
+          cluster-a: {{ post_cluster_a_info.cluster_info.spec.primary | default('N/A') }} (is_primary: {{ post_cluster_a_info.cluster_info.computed.is_primary | default(false) }})
+          cluster-b: {{ post_cluster_b_info.cluster_info.spec.primary | default('N/A') }} (is_primary: {{ post_cluster_b_info.cluster_info.computed.is_primary | default(false) }})
+        dest: "{{ switchover_log_file }}"
+      delegate_to: localhost

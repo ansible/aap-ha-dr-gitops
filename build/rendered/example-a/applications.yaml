@@ -1,0 +1,445 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  annotations:
+    argocd.argoproj.io/compare-options: IgnoreExtraneous
+    argocd.argoproj.io/sync-options: Prune=false
+  labels:
+    aap.hadr.redhat.com/environment: example-pair-a
+    aap.hadr.redhat.com/pair: example-pair
+  name: aap-eso
+  namespace: openshift-gitops
+spec:
+  destination:
+    namespace: aap
+    server: https://kubernetes.default.svc
+  ignoreDifferences:
+  - group: external-secrets.io
+    jqPathExpressions:
+    - .spec.data[]?.remoteRef.conversionStrategy
+    - .spec.data[]?.remoteRef.decodingStrategy
+    - .spec.data[]?.remoteRef.metadataPolicy
+    kind: ExternalSecret
+  - group: '*'
+    jsonPointers:
+    - /status
+    kind: '*'
+  project: default
+  source:
+    path: examples/aws-rosa-pair/overlays/hadr-eso-appset
+    repoURL: https://github.com/ansible-automation-platform/aap-ha-dr-gitops/
+    targetRevision: main
+    kustomize:
+      patches:
+      - target:
+          version: v1
+          kind: ConfigMap
+          name: eso-irsa-config
+        patch: |-
+          - op: replace
+            path: /data/roleArn
+            value: "arn:aws:iam::000000000000:role/example-eso-secrets-reader"
+      - target:
+          group: batch
+          version: v1
+          kind: CronJob
+          name: eso-irsa-annotation-repair
+        patch: |-
+          - op: replace
+            path: /spec/jobTemplate/spec/template/spec/containers/0/env/0/value
+            value: "arn:aws:iam::000000000000:role/example-eso-secrets-reader"
+      - target:
+          group: external-secrets.io
+          version: v1
+          kind: ClusterSecretStore
+          name: cluster-cross-account-secret-store
+        patch: |-
+          - op: replace
+            path: /spec/provider/aws/region
+            value: "us-east-1"
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    retry:
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+      limit: 5
+    syncOptions:
+    - CreateNamespace=true
+    - SkipDryRunOnMissingResource=true
+    - ApplyOutOfSyncOnly=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  annotations:
+    argocd.argoproj.io/compare-options: IgnoreExtraneous
+    argocd.argoproj.io/sync-options: Prune=false
+  labels:
+    aap.hadr.redhat.com/environment: example-pair-a
+    aap.hadr.redhat.com/pair: example-pair
+    aap.hadr.redhat.com/rgw-role: primary
+  name: aap-odf
+  namespace: openshift-gitops
+spec:
+  destination:
+    namespace: aap
+    server: https://kubernetes.default.svc
+  ignoreDifferences:
+  - group: '*'
+    jsonPointers:
+    - /status
+    kind: '*'
+  project: default
+  source:
+    path: examples/aws-rosa-pair/overlays/hadr-odf-primary
+    repoURL: https://github.com/ansible-automation-platform/aap-ha-dr-gitops/
+    targetRevision: main
+    kustomize:
+      patches:
+      - target:
+          group: ceph.rook.io
+          version: v1
+          kind: CephObjectZone
+          name: zone-template
+        patch: |-
+          - op: replace
+            path: /metadata/name
+            value: "example-a"
+          - op: replace
+            path: /spec/customEndpoints/0
+            value: "https://rgw.cluster-a.example.com"
+      - target:
+          group: ceph.rook.io
+          version: v1
+          kind: CephObjectStore
+          name: hub-objectstore
+        patch: |-
+          - op: replace
+            path: /spec/zone/name
+            value: "example-a"
+      - target:
+          group: ocs.openshift.io
+          version: v1
+          kind: StorageCluster
+          name: ocs-storagecluster
+        patch: |-
+          - op: replace
+            path: /spec/storageDeviceSets/0/dataPVCTemplate/spec/storageClassName
+            value: "gp3-csi"
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    retry:
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+      limit: 5
+    syncOptions:
+    - CreateNamespace=true
+    - SkipDryRunOnMissingResource=true
+    - ApplyOutOfSyncOnly=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  annotations:
+    argocd.argoproj.io/compare-options: IgnoreExtraneous
+    argocd.argoproj.io/sync-options: Prune=false
+  labels:
+    aap.hadr.redhat.com/desired-role: primary
+    aap.hadr.redhat.com/environment: example-pair-a
+    aap.hadr.redhat.com/pair: example-pair
+  name: aap-cnpg
+  namespace: openshift-gitops
+spec:
+  destination:
+    namespace: aap
+    server: https://kubernetes.default.svc
+  ignoreDifferences:
+  - group: apps
+    jsonPointers:
+    - /spec/replicas
+    kind: Deployment
+  - group: postgresql.cnpg.io
+    jsonPointers:
+    - /spec/bootstrap
+    - /spec/replica/promotionToken
+    - /spec/affinity
+    - /spec/monitoring/customQueriesConfigMap
+    - /spec/monitoring/disableDefaultQueries
+    - /spec/monitoring/enablePodMonitor
+    - /spec/postgresGID
+    - /spec/postgresUID
+    - /spec/smartShutdownTimeout
+    - /spec/startDelay
+    - /spec/resources/claims
+    - /spec/enablePodAntiAffinity
+    - /spec/topologySpreadConstraints
+    - /spec/probes
+    - /spec/minSyncReplicas
+    - /spec/maxSyncReplicas
+    - /spec/primaryUpdateStrategy
+    - /spec/primaryUpdateMethod
+    - /spec/replicationSlots
+    - /spec/failoverDelay
+    - /spec/logLevel
+    - /spec/enablePDB
+    - /spec/enableSuperuserAccess
+    - /spec/storage/resizeInUseVolumes
+    - /spec/walStorage/resizeInUseVolumes
+    - /spec/monitoring
+    - /spec/postgresql
+    - /spec/resources/ephemeralVolumeSource
+    - /spec/backup/target
+    kind: Cluster
+  - group: '*'
+    jsonPointers:
+    - /status
+    kind: '*'
+  project: default
+  source:
+    kustomize:
+      patches:
+      - patch: |
+          - op: replace
+            path: /spec/replica/self
+            value: 'example-a'
+          - op: replace
+            path: /spec/replica/primary
+            value: 'example-a'
+          - op: replace
+            path: /spec/replica/source
+            value: 'example-b'
+          - op: replace
+            path: /spec/storage/storageClass
+            value: 'gp3-csi'
+          - op: replace
+            path: /spec/storage/size
+            value: '2Ti'
+          - op: replace
+            path: /spec/walStorage/size
+            value: '200Gi'
+          - op: replace
+            path: /spec/instances
+            value: 2
+          - op: replace
+            path: /spec/walStorage/storageClass
+            value: 'gp3-csi'
+          - op: replace
+            path: /spec/backup/retentionPolicy
+            value: 2d
+          - op: replace
+            path: /spec/backup/barmanObjectStore/destinationPath
+            value: 's3://cnpg-wal/example-a/'
+          - op: replace
+            path: /spec/externalClusters/0/name
+            value: 'example-a'
+          - op: replace
+            path: /spec/externalClusters/0/barmanObjectStore/destinationPath
+            value: 's3://cnpg-wal/example-a/'
+          - op: replace
+            path: /spec/externalClusters/0/connectionParameters/host
+            value: 'postgres-repl.cluster-a.example.com'
+          - op: replace
+            path: /spec/externalClusters/1/name
+            value: 'example-b'
+          - op: replace
+            path: /spec/externalClusters/1/barmanObjectStore/destinationPath
+            value: 's3://cnpg-wal/example-b/'
+          - op: replace
+            path: /spec/externalClusters/1/connectionParameters/host
+            value: 'postgres-repl.cluster-b.example.com'
+
+          - op: replace
+            path: /spec/bootstrap/initdb/database
+            value: postgres
+        target:
+          group: postgresql.cnpg.io
+          kind: Cluster
+          name: aap-postgres
+          version: v1
+      - patch: |-
+          - op: replace
+            path: /metadata/annotations/external-dns.alpha.kubernetes.io~1hostname
+            value: 'postgres-repl.cluster-a.example.com'
+        target:
+          kind: Service
+          name: aap-postgres-replication
+          version: v1
+      - patch: |-
+          - op: replace
+            path: /spec/data/0/remoteRef/property
+            value: 'example-a-server.crt'
+          - op: replace
+            path: /spec/data/1/remoteRef/property
+            value: 'example-a-server.key'
+        target:
+          group: external-secrets.io
+          kind: ExternalSecret
+          name: cnpg-server-tls
+          version: v1
+      - patch: |-
+          - op: replace
+            path: /spec/data/0/remoteRef/property
+            value: 'example-a-replication.crt'
+          - op: replace
+            path: /spec/data/1/remoteRef/property
+            value: 'example-a-replication.key'
+        target:
+          group: external-secrets.io
+          kind: ExternalSecret
+          name: cnpg-replication-tls
+          version: v1
+    path: examples/aws-rosa-pair/overlays/hadr-cnpg
+    repoURL: https://github.com/ansible-automation-platform/aap-ha-dr-gitops/
+    targetRevision: main
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    retry:
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+      limit: 5
+    syncOptions:
+    - CreateNamespace=true
+    - SkipDryRunOnMissingResource=true
+    - ApplyOutOfSyncOnly=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  annotations:
+    argocd.argoproj.io/compare-options: IgnoreExtraneous
+    argocd.argoproj.io/sync-options: Prune=false
+  labels:
+    aap.hadr.redhat.com/desired-role: primary
+    aap.hadr.redhat.com/environment: example-pair-a
+    aap.hadr.redhat.com/pair: example-pair
+  name: aap-platform
+  namespace: openshift-gitops
+spec:
+  destination:
+    namespace: aap
+    server: https://kubernetes.default.svc
+  ignoreDifferences:
+  - group: apps
+    jsonPointers:
+    - /spec/replicas
+    kind: Deployment
+  - group: aap.ansible.com
+    jsonPointers:
+    - /spec/database
+    kind: AnsibleAutomationPlatform
+  - group: '*'
+    jsonPointers:
+    - /status
+    kind: '*'
+  project: default
+  source:
+    path: examples/aws-rosa-pair/overlays/hadr-platform-primary
+    repoURL: https://github.com/ansible-automation-platform/aap-ha-dr-gitops/
+    targetRevision: main
+    kustomize:
+      patches:
+      - target:
+          group: aap.ansible.com
+          version: v1alpha1
+          kind: AnsibleAutomationPlatform
+          name: aap
+        patch: |-
+          - op: replace
+            path: /spec/public_base_url
+            value: "https://aap.example.com"
+          - op: replace
+            path: /spec/extra_settings
+            value:
+              - setting: CSRF_TRUSTED_ORIGINS
+                value:
+                  - "https://aap.example.com"
+                  - "https://aap-aap.apps.cluster-a.example.com"
+      - target:
+          group: batch
+          version: v1
+          kind: CronJob
+          name: aap-create-remote-execution-instances
+        patch: |-
+          - op: move
+            from: /spec/jobTemplate/spec/template/spec/containers/0/env/1
+            path: /spec/jobTemplate/spec/template/spec/containers/0/env/0
+          - op: replace
+            path: /spec/jobTemplate/spec/template/spec/containers/0/env/0/value
+            value: "192.0.2.13 192.0.2.14"
+          - op: replace
+            path: /spec/jobTemplate/spec/template/spec/containers/0/env/1/value
+            value: "192.0.2.11 192.0.2.12"
+      - target:
+          group: batch
+          version: v1
+          kind: CronJob
+          name: receptor-devel-patch
+        patch: |-
+          - op: replace
+            path: /spec/jobTemplate/spec/template/spec/containers/0/env/1/value
+            value: "192.0.2.11 192.0.2.12 192.0.2.13 192.0.2.14"
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    retry:
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+      limit: 5
+    syncOptions:
+    - CreateNamespace=true
+    - SkipDryRunOnMissingResource=true
+    - ApplyOutOfSyncOnly=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  annotations:
+    argocd.argoproj.io/compare-options: IgnoreExtraneous
+    argocd.argoproj.io/sync-options: Prune=false
+  name: aap-dns
+  namespace: openshift-gitops
+spec:
+  destination:
+    namespace: external-dns
+    server: https://kubernetes.default.svc
+  project: default
+  sources:
+  - chart: external-dns
+    helm:
+      releaseName: external-dns
+      skipCrds: true
+      valueFiles:
+      - $values/examples/aws-rosa-pair/overlays/external-dns/base/values.yaml
+      - $values/examples/aws-rosa-pair/overlays/external-dns/overlays/example-a/values.yaml
+    repoURL: https://kubernetes-sigs.github.io/external-dns/
+    targetRevision: 1.22.0
+  - path: examples/aws-rosa-pair/overlays/external-dns/overlays/example-a
+    ref: values
+    repoURL: https://github.com/ansible-automation-platform/aap-ha-dr-gitops/
+    targetRevision: main
+  syncPolicy:
+    retry:
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+      limit: 5
+    syncOptions:
+    - CreateNamespace=true
+    - SkipDryRunOnMissingResource=true
+    - ApplyOutOfSyncOnly=true

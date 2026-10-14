@@ -1,0 +1,18 @@
+---
+# Role-specific variables only.
+# Shared variables (aap_namespace, cluster_name, etc.) are provided by
+# the config_loader role — do not duplicate here.
+
+# Which cluster should REMAIN primary.
+# The other cluster will be demoted to replica.
+# Required — must be a valid site_id from vars/clusters.yml.
+target_primary: ""
+
+# Force a full re-bootstrap (pg_basebackup) even if WAL timelines match
+force_reclone: false
+
+# Post-demotion streaming validation: after demoting the old primary, wait up
+# to this long for streaming replication to establish. If it does not, treat
+# as timeline divergence and escalate to full re-bootstrap.
+streaming_validation_timeout: 120
+streaming_validation_poll_interval: 10

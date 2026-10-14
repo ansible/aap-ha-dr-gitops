@@ -1,0 +1,70 @@
+---
+# CHK-05: Split-Brain Detection
+# Uses role data from CHK-01 probes to detect if both clusters report as
+# primary (split-brain). Only applicable when both clusters are reachable.
+# In restore_replication mode, both-primary is expected if target_primary is set.
+#
+# Also sets shared topology facts used by CHK-06 through CHK-10:
+#   _dual_topology_ok — both reachable + valid primary/replica assignment
+#   _wal_primary_context / _wal_replica_context / _wal_primary_site / _wal_replica_site
+
+- name: "CHK-05: Evaluate split-brain"
+  when: (_chk01_a_reachable | bool) and (_chk01_b_reachable | bool)
+  vars:
+    _role_a: "{{ _chk01_result_a.role | trim }}"
+    _role_b: "{{ _chk01_result_b.role | trim }}"
+    _both_primary: "{{ (_role_a == 'primary') and (_role_b == 'primary') }}"
+    _both_replica: "{{ (_role_a == 'replica') and (_role_b == 'replica') }}"
+    _no_primary: "{{ (_role_a != 'primary') and (_role_b != 'primary') }}"
+    _is_restore_mode: "{{ (_effective_mode | trim) == 'restore_replication' }}"
+    _has_target: "{{ target_primary | default('') | trim != '' }}"
+  ansible.builtin.set_fact:
+    _chk05_status: >-
+      {% if _both_replica | bool %}fail
+      {% elif _no_primary | bool %}fail
+      {% elif not (_both_primary | bool) %}pass
+      {% elif (_is_restore_mode | bool) and (_has_target | bool) %}pass
+      {% elif (_is_restore_mode | bool) and not (_has_target | bool) %}fail
+      {% else %}fail{% endif %}
+    _chk05_detail: >-
+      {% if _both_replica | bool %}NO PRIMARY: Both clusters report as replica ({{ _chk01_result_a.site_id }}={{ _role_a }}, {{ _chk01_result_b.site_id }}={{ _role_b }}) — Cannot proceed, no cluster is accepting writes. Likely a failed promotion or stale demotion. Manual intervention required.
+      {% elif _no_primary | bool %}NO PRIMARY: Neither cluster reports as primary ({{ _chk01_result_a.site_id }}={{ _role_a }}, {{ _chk01_result_b.site_id }}={{ _role_b }}). Cannot determine active cluster.
+      {% elif not (_both_primary | bool) %}Normal topology: {{ _chk01_result_a.site_id }}={{ _role_a }}, {{ _chk01_result_b.site_id }}={{ _role_b }}
+      {% elif (_is_restore_mode | bool) and (_has_target | bool) %}Both primary (expected in restore mode, target_primary={{ target_primary }})
+      {% elif (_is_restore_mode | bool) and not (_has_target | bool) %}Both clusters report primary but no target_primary specified — Cannot determine which to demote
+      {% else %}SPLIT-BRAIN: Both clusters report as primary ({{ _chk01_result_a.site_id }}={{ _role_a }}, {{ _chk01_result_b.site_id }}={{ _role_b }}) — Cannot proceed safely, DATA DIVERGENCE RISK{% endif %}
+
+- name: "CHK-05: Skip if only one cluster reachable"
+  when: not ((_chk01_a_reachable | bool) and (_chk01_b_reachable | bool))
+  ansible.builtin.set_fact:
+    _chk05_status: "skip"
+    _chk05_detail: "Only one cluster reachable — split-brain check not applicable"
+
+- name: "CHK-05: Set shared topology facts for CHK-06 through CHK-10"
+  ansible.builtin.set_fact:
+    _dual_topology_ok: >-
+      {{ (_chk01_a_reachable | bool) and (_chk01_b_reachable | bool) and
+         (_chk05_status | trim) == 'pass' }}
+    _wal_primary_context: >-
+      {{ cluster_a_context if (_chk01_result_a.role | default('') | trim) == 'primary'
+         else cluster_b_context }}
+    _wal_replica_context: >-
+      {{ cluster_b_context if (_chk01_result_a.role | default('') | trim) == 'primary'
+         else cluster_a_context }}
+    _wal_primary_site: >-
+      {{ _chk01_result_a.site_id if (_chk01_result_a.role | default('') | trim) == 'primary'
+         else _chk01_result_b.site_id }}
+    _wal_replica_site: >-
+      {{ _chk01_result_b.site_id if (_chk01_result_a.role | default('') | trim) == 'primary'
+         else _chk01_result_a.site_id }}
+
+- name: "CHK-05: Finalize"
+  vars:
+    _check_key: "chk05_split_brain"  # gitleaks:allow -- fixed check identifier, not a credential
+    _check_name: "CHK-05 Split-Brain Detection"
+    _check_status: "{{ _chk05_status | trim }}"
+    _check_detail: "{{ _chk05_detail | trim }}"
+    _check_data:
+      cluster_a_role: "{{ _chk01_result_a.role | trim }}"
+      cluster_b_role: "{{ _chk01_result_b.role | trim }}"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/finalize_check.yml"

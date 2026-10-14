@@ -1,0 +1,87 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: aap-eso
+  namespace: openshift-gitops
+spec:
+  goTemplate: true
+  goTemplateOptions:
+  - missingkey=error
+  ignoreApplicationDifferences:
+  - jsonPointers:
+    - /spec/syncPolicy/automated
+  template:
+    metadata:
+      name: aap-eso
+      namespace: openshift-gitops
+      labels:
+        aap.hadr.redhat.com/pair: '{{ .pair_id }}'
+        aap.hadr.redhat.com/environment: '{{ .environment_id }}'
+      annotations:
+        argocd.argoproj.io/sync-options: Prune=false
+        argocd.argoproj.io/compare-options: IgnoreExtraneous
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/ansible-automation-platform/aap-ha-dr-gitops/
+        targetRevision: main
+        path: examples/aws-rosa-pair/overlays/hadr-eso-appset
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: aap
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+        - CreateNamespace=true
+        - SkipDryRunOnMissingResource=true
+        - ApplyOutOfSyncOnly=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
+      ignoreDifferences:
+      - group: external-secrets.io
+        kind: ExternalSecret
+        jqPathExpressions:
+        - .spec.data[]?.remoteRef.conversionStrategy
+        - .spec.data[]?.remoteRef.decodingStrategy
+        - .spec.data[]?.remoteRef.metadataPolicy
+      - group: '*'
+        kind: '*'
+        jsonPointers:
+        - /status
+  templatePatch: |
+    spec:
+      source:
+        kustomize:
+          patches:
+            - target:
+                version: v1
+                kind: ConfigMap
+                name: eso-irsa-config
+              patch: |-
+                - op: replace
+                  path: /data/roleArn
+                  value: {{ .workloads.eso.role_arn | toJson }}
+            - target:
+                group: batch
+                version: v1
+                kind: CronJob
+                name: eso-irsa-annotation-repair
+              patch: |-
+                - op: replace
+                  path: /spec/jobTemplate/spec/template/spec/containers/0/env/0/value
+                  value: {{ .workloads.eso.role_arn | toJson }}
+            - target:
+                group: external-secrets.io
+                version: v1
+                kind: ClusterSecretStore
+                name: cluster-cross-account-secret-store
+              patch: |-
+                - op: replace
+                  path: /spec/provider/aws/region
+                  value: {{ .infrastructure.secrets_manager_region | toJson }}

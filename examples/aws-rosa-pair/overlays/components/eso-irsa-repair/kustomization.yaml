@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - eso-irsa-annotation-repair.yaml
+
+replacements:
+  - source:
+      kind: ConfigMap
+      name: eso-irsa-config
+      fieldPath: data.roleArn
+    targets:
+      - select:
+          kind: CronJob
+          name: eso-irsa-annotation-repair
+        fieldPaths:
+          - spec.jobTemplate.spec.template.spec.containers.[name=repair].env.[name=ESO_ROLE_ARN].value

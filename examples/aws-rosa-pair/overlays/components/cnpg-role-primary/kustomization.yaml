@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# Role is structural state. The site identity remains in cnpg-cluster-params.
+replacements:
+  - source:
+      kind: ConfigMap
+      name: cnpg-cluster-params
+      fieldPath: data.selfName
+    targets:
+      - select:
+          group: postgresql.cnpg.io
+          version: v1
+          kind: Cluster
+          name: aap-postgres
+        fieldPaths:
+          - spec.replica.primary
+        options:
+          create: true

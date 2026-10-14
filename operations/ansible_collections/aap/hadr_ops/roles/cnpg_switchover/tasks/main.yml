@@ -1,0 +1,27 @@
+---
+# cnpg_switchover — Core CNPG promotion/demotion on a single cluster
+#
+# Per-target-system role. The caller provides the context and operation.
+#
+# Input:
+#   switchover_action — "demote" | "promote" | "force_promote" | "status"
+#   switchover_context — K8s context of the target cluster
+#   switchover_new_primary — site ID of the new primary (for demote/promote)
+#   switchover_promotion_token — demotion token (for promote only)
+#   aap_namespace, cluster_name
+#
+# Output:
+#   switchover_result — dict with action, status, duration, token, etc.
+
+- name: Validate inputs
+  ansible.builtin.fail:
+    msg: >-
+      switchover_action must be 'demote', 'promote', 'force_promote', or 'status'
+      (got '{{ switchover_action | default('') }}')
+      and switchover_context must be set (got '{{ switchover_context | default('') }}')
+  when: >
+    switchover_action | default('') not in ['demote', 'promote', 'force_promote', 'status'] or
+    switchover_context | default('') == ''
+
+- name: "CNPG {{ switchover_action }}: {{ switchover_context }}"
+  ansible.builtin.include_tasks: "{{ switchover_action }}.yml"

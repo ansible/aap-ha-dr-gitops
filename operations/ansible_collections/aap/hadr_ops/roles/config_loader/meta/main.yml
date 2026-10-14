@@ -1,0 +1,11 @@
+---
+galaxy_info:
+  role_name: config_loader
+  author: AAP HA/DR Testing Team
+  description: >-
+    Loads, validates, and exposes all collection configuration variables.
+    Import this role at the start of any playbook to ensure all required
+    variables are defined and derived topology facts are available.
+  license: GPL-3.0-or-later
+  min_ansible_version: "2.15"
+dependencies: []

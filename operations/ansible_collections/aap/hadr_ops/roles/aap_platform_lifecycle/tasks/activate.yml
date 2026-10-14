@@ -1,0 +1,247 @@
+---
+# Activate AAP (idle_aap=false) on a single cluster
+# Then verify operator reconciliation, deployment scaling, and health endpoints.
+#
+# If any stage fails, subsequent stages are skipped and the result reflects
+# the failure point — avoids wasting time waiting for deployments that
+# will never come up because the operator isn't reconciling.
+
+- name: Activate AAP on {{ lifecycle_context }}
+  aap.hadr_ops.aap_platform_scale:
+    namespace: "{{ aap_namespace }}"
+    aap_name: "{{ aap_name }}"
+    context: "{{ lifecycle_context }}"
+    scale_to: "active"
+    direct_deployment_scale: false
+  register: _activate_result
+
+- name: Log AAP activated
+  ansible.builtin.debug:
+    msg: "AAP idle_aap=false on {{ lifecycle_context }} ({{ _activate_result.message | default('patched') }})"
+
+# Workaround for AAP-77947: gateway operator sets idle_deployment=true on
+# child CRs but does not set it back to false when idle_aap is toggled off.
+- name: "Workaround AAP-77947: set idle_deployment=false on child CRs"
+  kubernetes.core.k8s:
+    state: patched
+    definition:
+      apiVersion: "{{ item.api }}"
+      kind: "{{ item.kind }}"
+      metadata:
+        name: "{{ item.name }}"
+        namespace: "{{ aap_namespace }}"
+      spec:
+        idle_deployment: false
+    context: "{{ lifecycle_context }}"
+  loop:
+    - { api: "automationcontroller.ansible.com/v1beta1", kind: "AutomationController", name: "{{ aap_name }}-controller" }
+    - { api: "automationhub.ansible.com/v1beta1", kind: "AutomationHub", name: "{{ aap_name }}-hub" }
+    - { api: "eda.ansible.com/v1alpha1", kind: "EDA", name: "{{ aap_name }}-eda" }
+    - { api: "automationmetricsservice.ansible.com/v1alpha1", kind: "MetricsService", name: "{{ aap_name }}-metrics" }
+  loop_control:
+    label: "{{ item.kind }}"
+  ignore_errors: true
+
+# ── Stage 1: Wait for operator reconciliation ───────────────────
+
+- name: Wait for AAP operator to begin reconciliation
+  kubernetes.core.k8s_info:
+    api_version: aap.ansible.com/v1alpha1
+    kind: AnsibleAutomationPlatform
+    name: "{{ aap_name }}"
+    namespace: "{{ aap_namespace }}"
+    context: "{{ lifecycle_context }}"
+  register: _aap_cr_status
+  until: >
+    _aap_cr_status.resources | length > 0 and
+    (_aap_cr_status.resources[0].status.conditions | default([]) |
+     selectattr('type', 'eq', 'Running') | first | default({})).status | default('') == "True"
+  retries: "{{ aap_reconciliation_retries }}"
+  delay: "{{ aap_reconciliation_delay }}"
+  ignore_errors: true
+
+- name: Evaluate reconciliation result
+  ansible.builtin.set_fact:
+    _reconciliation_ok: >-
+      {{ _aap_cr_status is succeeded and
+         (_aap_cr_status.resources | default([]) | length > 0) and
+         ((_aap_cr_status.resources[0].status.conditions | default([]) |
+           selectattr('type', 'eq', 'Running') | first | default({})).status | default('') == "True") }}
+
+- name: Log AAP operator status
+  vars:
+    _conditions: "{{ _aap_cr_status.resources[0].status.conditions | default([]) if (_aap_cr_status.resources | default([]) | length > 0) else [] }}"
+  ansible.builtin.debug:
+    msg:
+      - "AAP operator on {{ lifecycle_context }}: {{ 'reconciling' if (_reconciliation_ok | bool) else 'FAILED TO RECONCILE' }}"
+      - "{{ _conditions | map(attribute='type') | zip(_conditions | map(attribute='status')) | map('join', '=') | list }}"
+
+- name: Short-circuit on reconciliation failure
+  when: not (_reconciliation_ok | bool)
+  block:
+    - name: Set lifecycle result (reconciliation failed)
+      ansible.builtin.set_fact:
+        lifecycle_result:
+          context: "{{ lifecycle_context }}"
+          action: "activate"
+          status: "failed"
+          failed_stage: "reconciliation"
+          gateway_healthy: false
+          controller_healthy: false
+          deployments_ready: "0/{{ aap_key_deployments | length }}"
+          deployments_healthy: false
+          message: "{{ _activate_result.message | default('patched') }}"
+          error: >-
+            AAP operator did not begin reconciliation after
+            {{ aap_reconciliation_retries }} retries ({{ aap_reconciliation_retries | int * aap_reconciliation_delay | int }}s).
+            Check operator logs: oc --context={{ lifecycle_context }} logs -n {{ aap_namespace }} deploy/automation-controller-operator-controller-manager
+
+    - name: Log activation failure
+      ansible.builtin.debug:
+        msg:
+          - "ACTIVATION FAILED on {{ lifecycle_context }}"
+          - "  Reason: {{ lifecycle_result.error | trim }}"
+          - "  Skipping deployment wait and health checks"
+
+    - name: Fail playbook (reconciliation failed, lifecycle_fail_on_error=true)
+      when: lifecycle_fail_on_error | bool
+      ansible.builtin.fail:
+        msg: "{{ lifecycle_result.error | trim }}"
+
+    - name: End activate (reconciliation failed)
+      ansible.builtin.meta: end_role
+
+# ── Stage 2: Wait for key deployments ───────────────────────────
+
+- name: Wait for key AAP deployments to scale up
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: Deployment
+    namespace: "{{ aap_namespace }}"
+    context: "{{ lifecycle_context }}"
+  register: _aap_deploys
+  until: >
+    _aap_deploys.resources | default([]) |
+    selectattr('metadata.name', 'in', aap_key_deployments) |
+    selectattr('status.readyReplicas', 'defined') |
+    rejectattr('status.readyReplicas', 'eq', 0) |
+    list | length >= (aap_key_deployments | length)
+  retries: "{{ (aap_readiness_timeout | int / aap_readiness_poll_interval | int) | int }}"
+  delay: "{{ aap_readiness_poll_interval }}"
+  ignore_errors: true
+
+- name: Count ready deployments
+  ansible.builtin.set_fact:
+    _deploy_ready_count: >-
+      {{ _aap_deploys.resources | default([]) |
+         selectattr('metadata.name', 'in', aap_key_deployments) |
+         selectattr('status.readyReplicas', 'defined') |
+         rejectattr('status.readyReplicas', 'eq', 0) |
+         list | length }}
+
+- name: Log deployment status
+  ansible.builtin.debug:
+    msg:
+      - "AAP deployments on {{ lifecycle_context }} ({{ _deploy_ready_count }}/{{ aap_key_deployments | length }} key deployments ready):"
+      - "{{ _aap_deploys.resources | default([]) | selectattr('metadata.name', 'match', '^aap-') | map(attribute='metadata.name') | zip(_aap_deploys.resources | default([]) | selectattr('metadata.name', 'match', '^aap-') | map(attribute='status.readyReplicas', default=0) | list) | map('join', '=') | list }}"
+
+- name: Short-circuit on deployment failure
+  when: (_deploy_ready_count | int) < (aap_key_deployments | length)
+  block:
+    - name: Set lifecycle result (deployments failed)
+      ansible.builtin.set_fact:
+        lifecycle_result:
+          context: "{{ lifecycle_context }}"
+          action: "activate"
+          status: "failed"
+          failed_stage: "deployments"
+          gateway_healthy: false
+          controller_healthy: false
+          deployments_ready: "{{ _deploy_ready_count }}/{{ aap_key_deployments | length }}"
+          deployments_healthy: false
+          message: "{{ _activate_result.message | default('patched') }}"
+          error: >-
+            Only {{ _deploy_ready_count }}/{{ aap_key_deployments | length }} key deployments
+            scaled up after {{ aap_readiness_timeout }}s. Operator may be stuck.
+
+    - name: Log deployment failure
+      ansible.builtin.debug:
+        msg:
+          - "DEPLOYMENT SCALING FAILED on {{ lifecycle_context }}"
+          - "  {{ lifecycle_result.deployments_ready }} ready"
+          - "  Skipping health checks"
+
+    - name: Fail playbook (deployments failed, lifecycle_fail_on_error=true)
+      when: lifecycle_fail_on_error | bool
+      ansible.builtin.fail:
+        msg: "{{ lifecycle_result.error | trim }}"
+
+    - name: End activate (deployments failed)
+      ansible.builtin.meta: end_role
+
+# ── Stage 3: Health check endpoints ─────────────────────────────
+
+- name: Get AAP route hostname
+  kubernetes.core.k8s_info:
+    api_version: route.openshift.io/v1
+    kind: Route
+    name: aap
+    namespace: "{{ aap_namespace }}"
+    context: "{{ lifecycle_context }}"
+  register: _aap_route
+  ignore_errors: true
+
+- name: Set AAP route host
+  ansible.builtin.set_fact:
+    _aap_route_host: "{{ (_aap_route.resources[0].spec.host | default('')) if (_aap_route.resources | default([]) | length > 0) else '' }}"
+
+- name: Wait for AAP gateway to respond
+  when: _aap_route_host | length > 0
+  ansible.builtin.uri:
+    url: "https://{{ _aap_route_host }}/api/gateway/v1/ping/"
+    validate_certs: false
+    status_code: 200
+  register: _gw_health
+  until: _gw_health.status == 200
+  retries: "{{ (aap_readiness_timeout | int / aap_readiness_poll_interval | int) | int }}"
+  delay: "{{ aap_readiness_poll_interval }}"
+  ignore_errors: true
+
+- name: Wait for AAP controller to respond
+  when: _aap_route_host | length > 0
+  ansible.builtin.uri:
+    url: "https://{{ _aap_route_host }}/api/controller/v2/ping/"
+    validate_certs: false
+    status_code: 200
+  register: _ctrl_health
+  until: _ctrl_health.status == 200
+  retries: "{{ (aap_readiness_timeout | int / aap_readiness_poll_interval | int) | int }}"
+  delay: "{{ aap_readiness_poll_interval }}"
+  ignore_errors: true
+
+# ── Build final result ──────────────────────────────────────────
+
+- name: Set lifecycle result (activation complete)
+  ansible.builtin.set_fact:
+    lifecycle_result:
+      context: "{{ lifecycle_context }}"
+      action: "activate"
+      status: >-
+        {% if (_gw_health.status | default(0) | int) == 200 and (_ctrl_health.status | default(0) | int) == 200 %}healthy
+        {% elif (_gw_health.status | default(0) | int) == 200 %}degraded
+        {% else %}unhealthy{% endif %}
+      failed_stage: ""
+      gateway_healthy: "{{ (_gw_health.status | default(0) | int) == 200 }}"
+      controller_healthy: "{{ (_ctrl_health.status | default(0) | int) == 200 }}"
+      deployments_ready: "{{ _deploy_ready_count }}/{{ aap_key_deployments | length }}"
+      deployments_healthy: "{{ (_deploy_ready_count | int) >= (aap_key_deployments | length) }}"
+      message: "{{ _activate_result.message | default('patched') }}"
+      error: ""
+
+- name: Log AAP health
+  ansible.builtin.debug:
+    msg:
+      - "AAP health on {{ lifecycle_context }}: {{ lifecycle_result.status | trim }}"
+      - "  Gateway:     {{ 'healthy' if (lifecycle_result.gateway_healthy | bool) else 'NOT RESPONDING' }}"
+      - "  Controller:  {{ 'healthy' if (lifecycle_result.controller_healthy | bool) else 'NOT RESPONDING' }}"
+      - "  Deployments: {{ lifecycle_result.deployments_ready }} ready"

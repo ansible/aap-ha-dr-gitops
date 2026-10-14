@@ -1,0 +1,102 @@
+---
+# Ceph RGW Zone + ObjectStore template
+#
+# This is a base template for RGW zones. Each per-cluster ODF overlay
+# patches the zone name and customEndpoints to match the local cluster.
+#
+# RGW multisite is active-active — both zones accept writes
+# and replicate asynchronously to each other.
+#
+# The CephObjectStore deploys RGW gateway pods that serve the
+# S3 API and handle multisite sync with the remote zone.
+
+apiVersion: ceph.rook.io/v1
+kind: CephObjectZone
+metadata:
+  name: zone-template
+  namespace: openshift-storage
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true,Prune=false
+spec:
+  zoneGroup: hub-zonegroup
+  metadataPool:
+    replicated:
+      size: 3
+  dataPool:
+    replicated:
+      size: 3
+  customEndpoints:
+    - https://rgw-placeholder.example.com
+---
+apiVersion: ceph.rook.io/v1
+kind: CephObjectStore
+metadata:
+  name: hub-objectstore
+  namespace: openshift-storage
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true,Prune=false
+spec:
+  zone:
+    name: zone-template
+  metadataPool:
+    replicated:
+      size: 3
+  dataPool:
+    replicated:
+      size: 3
+  gateway:
+    port: 80
+    instances: 2
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        cpu: "2"
+        memory: 4Gi
+---
+# S3 user for Hub content — generates access key + secret key
+apiVersion: ceph.rook.io/v1
+kind: CephObjectStoreUser
+metadata:
+  name: hub-s3-user
+  namespace: openshift-storage
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true,Prune=false
+spec:
+  store: hub-objectstore
+  displayName: "Hub S3 User"
+  capabilities:
+    bucket: "*"
+---
+# OBC declares the Hub content bucket — only on master zone.
+# The bucket replicates to replica zones via RGW multisite sync policy.
+# NOTE: Replica overlays patch this out with a strategic merge delete.
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: hub-rgw-obc
+  namespace: aap
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true,Prune=false
+spec:
+  bucketName: automation-hub-content
+  storageClassName: hub-objectstore-ceph-rgw
+---
+# WAL archiving bucket — per-cluster, not replicated.
+# Each cluster archives its own PostgreSQL WAL to local RGW.
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: cnpg-wal-obc
+  namespace: aap
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true,Prune=false
+spec:
+  bucketName: cnpg-wal
+  storageClassName: hub-objectstore-ceph-rgw

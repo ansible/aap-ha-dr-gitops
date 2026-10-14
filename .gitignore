@@ -1,0 +1,15 @@
+.venv/
+.local/
+build/
+__pycache__/
+*.pyc
+*.retry
+.DS_Store
+
+# Local credentials and cluster access material
+.env
+.env.*
+*.kubeconfig
+kubeconfig
+*.pem
+*.key

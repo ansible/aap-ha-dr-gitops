@@ -1,0 +1,23 @@
+---
+# RGW S3 Route — exposes the Ceph RGW endpoint for cross-cluster
+# multisite sync and external S3 access.
+#
+# Uses edge TLS — the OpenShift router terminates TLS with the
+# cluster's wildcard cert (Let's Encrypt on ROSA). RGW serves
+# HTTP internally. Cross-cluster traffic is encrypted by the router.
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: rgw-s3-replication
+  namespace: openshift-storage
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+    argocd.argoproj.io/sync-options: Prune=false
+spec:
+  to:
+    kind: Service
+    name: rook-ceph-rgw-hub-objectstore
+  port:
+    targetPort: http
+  tls:
+    termination: edge

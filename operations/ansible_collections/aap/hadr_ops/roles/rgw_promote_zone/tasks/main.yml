@@ -1,0 +1,208 @@
+---
+# RGW Promote Zone — Disaster Recovery Zone Promotion
+#
+# Promotes the surviving Ceph RGW zone to standalone realm master after the
+# master zone is permanently lost. No OBC creation is required: Hub and barman
+# credentials are ExternalSecret-managed (e.g., myenv-rgw-common / odf-rgw component)
+# and the replicated buckets are already present on the surviving cluster.
+#
+# Required caller variables:
+#   surviving_context:  k8s context of the cluster being promoted
+#   surviving_zone:     CephObjectZone name on the surviving cluster (matches site_id)
+#   dead_zone:          CephObjectZone name of the lost cluster (removed from zonegroup)
+
+# === PREFLIGHT ===
+
+- name: "preflight | validate required variables"
+  ansible.builtin.assert:
+    that:
+      - surviving_context is defined and surviving_context | length > 0
+      - surviving_zone is defined and surviving_zone | length > 0
+      - dead_zone is defined and dead_zone | length > 0
+    fail_msg: >
+      rgw_promote_zone requires surviving_context, surviving_zone, and dead_zone.
+
+- name: "preflight | get rook-ceph-tools pod on surviving cluster"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ rgw_namespace }}"
+    label_selectors:
+      - app=rook-ceph-tools
+    context: "{{ surviving_context }}"
+  register: _toolbox_pods
+
+- name: "preflight | assert toolbox pod is running"
+  ansible.builtin.assert:
+    that:
+      - _toolbox_pods.resources | length > 0
+      - _toolbox_pods.resources[0].status.phase == 'Running'
+    fail_msg: >
+      No running rook-ceph-tools pod found in {{ rgw_namespace }} on {{ surviving_context }}.
+
+- name: "preflight | set toolbox pod name"
+  ansible.builtin.set_fact:
+    _toolbox_pod: "{{ _toolbox_pods.resources[0].metadata.name }}"
+
+- name: "preflight | display promotion target"
+  ansible.builtin.debug:
+    msg:
+      - "RGW Zone Promotion (DR standalone mode)"
+      - "  Surviving cluster: {{ surviving_context }}"
+      - "  Surviving zone:    {{ surviving_zone }}"
+      - "  Dead zone:         {{ dead_zone }} (will be removed from zonegroup)"
+      - "  Toolbox pod:       {{ _toolbox_pod }}"
+
+# === STEP 1 — Check if already promoted ===
+
+- name: "step1 | get current zone state"
+  ansible.builtin.include_tasks: _toolbox_exec.yml
+  vars:
+    _pod_name: "{{ _toolbox_pod }}"
+    _context: "{{ surviving_context }}"
+    _cmd: "radosgw-admin --rgw-realm={{ rgw_realm }} zone get --rgw-zone={{ surviving_zone }} 2>/dev/null"
+
+- name: "step1 | parse zone state"
+  ansible.builtin.set_fact:
+    _zone_state: "{{ _exec_result.stdout | from_json }}"
+  when: _exec_result.return_code == 0 and _exec_result.stdout | length > 0
+
+- name: "step1 | assert zone get succeeded"
+  ansible.builtin.assert:
+    that:
+      - _exec_result.return_code == 0
+    fail_msg: >
+      radosgw-admin zone get failed on {{ surviving_context }} (return_code={{ _exec_result.return_code }}).
+      stderr: {{ _exec_result.stderr }}
+
+- name: "step1 | set already-promoted flag"
+  ansible.builtin.set_fact:
+    _already_master: "{{ _zone_state.is_master | default(false) | bool }}"
+
+- name: "step1 | log already-promoted state"
+  ansible.builtin.debug:
+    msg: "Zone {{ surviving_zone }} is already master — skipping promotion commands."
+  when: _already_master
+
+# === STEP 2 — Promote zone to standalone realm master ===
+
+- name: "step2 | mark surviving zone as master"
+  ansible.builtin.include_tasks: _toolbox_exec.yml
+  vars:
+    _pod_name: "{{ _toolbox_pod }}"
+    _context: "{{ surviving_context }}"
+    _cmd: "radosgw-admin --rgw-realm={{ rgw_realm }} zone modify --rgw-zone={{ surviving_zone }} --master 2>&1"
+  when: not _already_master
+
+- name: "step2 | assert zone modify succeeded"
+  ansible.builtin.assert:
+    that:
+      - _exec_result.return_code == 0
+    fail_msg: >
+      radosgw-admin zone modify --master failed (return_code={{ _exec_result.return_code }}).
+      stderr: {{ _exec_result.stderr }}
+  when: not _already_master
+
+- name: "step2 | remove dead zone from zonegroup"
+  ansible.builtin.include_tasks: _toolbox_exec.yml
+  vars:
+    _pod_name: "{{ _toolbox_pod }}"
+    _context: "{{ surviving_context }}"
+    # || true: idempotent — the dead zone may already have been removed or never joined
+    _cmd: >-
+      radosgw-admin --rgw-realm={{ rgw_realm }} zonegroup remove
+      --rgw-zonegroup={{ rgw_zonegroup }} --rgw-zone={{ dead_zone }} 2>&1 || true
+
+- name: "step2 | commit period as standalone"
+  ansible.builtin.include_tasks: _toolbox_exec.yml
+  vars:
+    _pod_name: "{{ _toolbox_pod }}"
+    _context: "{{ surviving_context }}"
+    _cmd: "radosgw-admin --rgw-realm={{ rgw_realm }} period update --commit 2>&1"
+  when: not _already_master
+
+- name: "step2 | assert period commit succeeded"
+  ansible.builtin.assert:
+    that:
+      - _exec_result.return_code == 0
+    fail_msg: >
+      radosgw-admin period update --commit failed (return_code={{ _exec_result.return_code }}).
+      stderr: {{ _exec_result.stderr }}
+  when: not _already_master
+
+- name: "step2 | log promotion result"
+  ansible.builtin.debug:
+    msg: "Zone {{ surviving_zone }} promoted to standalone realm master. Period committed."
+  when: not _already_master
+
+# === STEP 3 — Restart RGW pods to pick up new period ===
+
+- name: "step3 | get RGW pods on surviving cluster"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ rgw_namespace }}"
+    label_selectors:
+      - app=rook-ceph-rgw
+    context: "{{ surviving_context }}"
+  register: _rgw_pods
+
+- name: "step3 | delete RGW pods to trigger rolling restart"
+  kubernetes.core.k8s:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ rgw_namespace }}"
+    name: "{{ item.metadata.name }}"
+    state: absent
+    context: "{{ surviving_context }}"
+  loop: "{{ _rgw_pods.resources }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+
+- name: "step3 | get RGW Route hostname"
+  kubernetes.core.k8s_info:
+    api_version: route.openshift.io/v1
+    kind: Route
+    namespace: "{{ rgw_namespace }}"
+    name: rgw-s3-replication
+    context: "{{ surviving_context }}"
+  register: _rgw_route
+
+- name: "step3 | assert RGW Route exists"
+  ansible.builtin.assert:
+    that:
+      - _rgw_route.resources | length > 0
+      - _rgw_route.resources[0].spec.host is defined
+    fail_msg: "Route rgw-s3-replication not found in {{ rgw_namespace }} on {{ surviving_context }}."
+
+- name: "step3 | set RGW host fact"
+  ansible.builtin.set_fact:
+    _rgw_host: "{{ _rgw_route.resources[0].spec.host }}"
+
+- name: "step3 | wait for RGW to respond after restart"
+  ansible.builtin.uri:
+    url: "https://{{ _rgw_host }}/"
+    method: GET
+    validate_certs: false
+    status_code: [200, 403]
+  register: _rgw_probe
+  until: _rgw_probe.status in [200, 403]
+  retries: "{{ (rgw_restart_wait_seconds | int) // 10 }}"
+  delay: 10
+  ignore_errors: true
+
+- name: "step3 | assert RGW came back healthy"
+  ansible.builtin.assert:
+    that:
+      - _rgw_probe.status in [200, 403]
+    fail_msg: >
+      RGW did not respond at https://{{ _rgw_host }}/ within {{ rgw_restart_wait_seconds }}s.
+      Last status: {{ _rgw_probe.status | default('no response') }}
+
+- name: "step3 | display promotion complete"
+  ansible.builtin.debug:
+    msg:
+      - "RGW zone promotion complete."
+      - "  Zone {{ surviving_zone }} is now standalone realm master."
+      - "  RGW healthy at https://{{ _rgw_host }}/"
+      - "  Hub and barman credentials are ExternalSecret-managed — no OBC action required."

@@ -1,0 +1,34 @@
+---
+# List all CNPG backups for the cluster.
+
+- name: List CNPG backups
+  aap.hadr_ops.cnpg_backup_manage:
+    namespace: "{{ aap_namespace }}"
+    cluster_name: "{{ cluster_name }}"
+    context: "{{ target_context }}"
+    oc_binary: "{{ oc_binary }}"
+    operation: list
+  register: _backup_list
+
+- name: Set backup list result fact
+  ansible.builtin.set_fact:
+    cnpg_backup_result: "{{ _backup_list }}"
+
+- name: Display backup catalog
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.name }} | {{ item.phase }} |
+      started={{ item.started_at | default('n/a') }} |
+      completed={{ item.completed_at | default('n/a') }} |
+      size={{ item.size | default('n/a') }} |
+      method={{ item.method | default('n/a') }}
+  loop: "{{ _backup_list.backups }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Display backup summary
+  ansible.builtin.debug:
+    msg:
+      - "Total backups: {{ _backup_list.backups | length }}"
+      - "Completed: {{ _backup_list.backups | selectattr('phase', 'equalto', 'completed') | list | length }}"
+      - "Failed: {{ _backup_list.backups | selectattr('phase', 'equalto', 'failed') | list | length }}"

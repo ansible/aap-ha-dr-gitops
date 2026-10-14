@@ -1,0 +1,20 @@
+---
+# Role-specific variables only.
+# Shared variables (argocd_application_names, argocd_namespace, etc.) are provided by
+# the config_loader role — do not duplicate here.
+
+# Target cluster context (required)
+argocd_context: ""
+
+# Optional pair-state assertion for resume. When provided, the CNPG and AAP
+# platform Applications must have been regenerated from this pair/environment
+# and role before Argo CD automation is resumed.
+argocd_pair_id: ""
+argocd_environment_id: ""
+argocd_expected_role: ""
+argocd_pair_role_application_names:
+  - aap-cnpg
+  - aap-platform
+
+# For resume action: trigger a sync after resuming (default: false)
+argocd_trigger_sync: false

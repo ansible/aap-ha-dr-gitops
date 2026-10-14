@@ -1,0 +1,90 @@
+---
+# Single autofix attempt — apply fix, wait, recheck.
+# Called from autofix_attempt.yml inside a loop.
+#
+# Input vars:
+#   _fix_task_file, _recheck_task_file, _fix_attempt_index
+
+- name: "{{ _check_name }}: FIX attempt {{ _fix_attempt_index + 1 }}"
+  ansible.builtin.debug:
+    msg: >-
+      AUTOFIX: Attempting fix for {{ _check_name }}
+      (attempt {{ _fix_attempt_index + 1 }}/{{ autofix_max_retries | default(2) }})
+
+- name: "{{ _check_name }}: Initialize fix result"
+  ansible.builtin.set_fact:
+    _fix_result: "pending"
+    _fix_detail: ""
+
+- name: "{{ _check_name }}: Apply fix"
+  block:
+    - name: "{{ _check_name }}: Run fix task"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/{{ _fix_task_file }}"
+  rescue:
+    - name: "{{ _check_name }}: Fix task failed"
+      ansible.builtin.set_fact:
+        _fix_result: "failed"
+        _fix_detail: "Fix task raised an error"
+
+- name: "{{ _check_name }}: Update stats — fix attempted"
+  ansible.builtin.set_fact:
+    _autofix_stats: >-
+      {{ _autofix_stats | combine({
+        'fixes_attempted': (_autofix_stats.fixes_attempted | int) + 1
+      }) }}
+
+- name: "{{ _check_name }}: Wait before recheck"
+  when: _fix_result != 'skipped'
+  ansible.builtin.pause:
+    seconds: "{{ autofix_retry_delay | default(30) | int }}"
+    prompt: "Waiting {{ autofix_retry_delay | default(30) }}s before rechecking {{ _check_name }}..."
+
+- name: "{{ _check_name }}: Set recheck guard"
+  ansible.builtin.set_fact:
+    _recheck_only: true
+
+- name: "{{ _check_name }}: Refresh platform probe before recheck"
+  when: _check_key in ['chk11_aap_topology', 'chk12_olm_csv', 'chk13_promotion_token', 'chk14_argocd', 'chk15_chaos_artifacts', 'chk16_api_liveness']
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/platform_probe.yml"
+
+- name: "{{ _check_name }}: Recheck"
+  when: _fix_result != 'skipped'
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/{{ _recheck_task_file }}"
+
+- name: "{{ _check_name }}: Clear recheck guard"
+  ansible.builtin.set_fact:
+    _recheck_only: false
+
+- name: "{{ _check_name }}: Evaluate recheck result"
+  ansible.builtin.set_fact:
+    _fix_result: >-
+      {% if (_current_check_status | default(_check_status) | trim) != 'fail' %}success
+      {% elif _fix_result == 'skipped' %}skipped
+      {% else %}failed{% endif %}
+
+- name: "{{ _check_name }}: Update stats — fix outcome"
+  ansible.builtin.set_fact:
+    _autofix_stats: >-
+      {{ _autofix_stats | combine({
+        'fixes_succeeded': (_autofix_stats.fixes_succeeded | int) + (1 if (_fix_result | trim) == 'success' else 0),
+        'fixes_failed': (_autofix_stats.fixes_failed | int) + (1 if (_fix_result | trim) == 'failed' else 0)
+      }) }}
+
+- name: "{{ _check_name }}: Store fix outcome"
+  ansible.builtin.set_fact:
+    _preflight_checks: >-
+      {{ _preflight_checks | combine({
+        _check_key: (_preflight_checks[_check_key] | default({})) | combine({
+          'status': _current_check_status | default(_check_status) | trim,
+          'detail': _current_check_detail | default(_check_detail) | trim,
+          'fix_result': _fix_result | trim,
+          'fix_detail': _fix_detail | default('') | trim
+        })
+      }) }}
+
+- name: "{{ _check_name }}: Log fix outcome"
+  ansible.builtin.debug:
+    msg: >-
+      AUTOFIX {{ _fix_result | trim | upper }}:
+      {{ _check_name }} — {{ _fix_detail | default('see recheck result') }}
+      (status now: {{ _current_check_status | default(_check_status) | trim | upper }})

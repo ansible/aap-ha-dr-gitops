@@ -1,0 +1,39 @@
+---
+# Compatibility wrapper for the former combined platform check file.
+# New callers should include platform_probe.yml followed by the individual
+# CHK-11 through CHK-16 task file.
+
+- name: "Platform checks: Collect results"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/platform_probe.yml"
+
+- name: "Platform checks: CHK-11"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/chk11_topology.yml"
+
+- name: "Platform checks: CHK-12"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/chk12_olm_csv.yml"
+
+- name: "Platform checks: CHK-13"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/chk13_promotion_token.yml"
+
+- name: "Platform checks: CHK-14"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/chk14_argocd.yml"
+
+- name: "Platform checks: CHK-15"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/chk15_chaos_artifacts.yml"
+
+- name: "Platform checks: CHK-16"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/chk16_api_liveness.yml"
+
+- name: "Platform checks: CHK-17"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/chk17_migration_state.yml"
+
+- name: "CHK-18: Log expected recovery time"
+  ansible.builtin.debug:
+    msg:
+      - "-- CHK-18: Expected Recovery Time (Advisory) --"
+      - "  After switchover completes, expected component recovery:"
+      - "    Gateway:    ~2 minutes"
+      - "    Controller: ~4 minutes"
+      - "    EDA:        ~8 minutes"
+      - "    Hub:        ~10 minutes"
+      - "  Total expected RTO from initiation: ~11-12 minutes"

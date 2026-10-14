@@ -1,0 +1,47 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cnpg-wal-policy
+spec:
+  schedule: "17 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: aws
+              image: public.ecr.aws/aws-cli/aws-cli:latest
+              command: ["/bin/sh", "-c"]
+              args:
+                - >-
+                  aws --endpoint-url "$ENDPOINT" s3api put-bucket-policy
+                  --bucket cnpg-wal --policy file:///policy/policy.json
+              env:
+                - name: ENDPOINT
+                  value: http://rook-ceph-rgw-hub-objectstore.openshift-storage.svc:80
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: barman-rgw-credentials
+                      key: ACCESS_KEY_ID
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: barman-rgw-credentials
+                      key: ACCESS_SECRET_KEY
+              volumeMounts:
+                - name: policy
+                  mountPath: /policy
+                  readOnly: true
+          volumes:
+            - name: policy
+              configMap:
+                name: cnpg-wal-barman-policy

@@ -1,0 +1,618 @@
+---
+# =============================================================================
+# STEP 1: Validate required parameters
+# =============================================================================
+
+- name: Validate ceph_context is provided
+  ansible.builtin.assert:
+    that:
+      - ceph_context is defined
+      - ceph_context | length > 0
+    fail_msg: 'ceph_context must be specified (e.g., cluster-a, my-cluster-east)'
+
+- name: Validate Ceph ratio operation
+  ansible.builtin.assert:
+    that:
+      - ceph_operation in ['recover', 'set_ratios']
+    fail_msg: 'ceph_operation must be recover or set_ratios'
+
+- name: Validate configured Ceph ratios
+  ansible.builtin.assert:
+    that:
+      - item.full | float > 0.0
+      - item.full | float < 1.0
+      - item.backfillfull | float > 0.0
+      - item.backfillfull | float < 1.0
+      - item.nearfull | float > 0.0
+      - item.nearfull | float < 1.0
+      - item.full | float > item.backfillfull | float
+      - item.backfillfull | float > item.nearfull | float
+    fail_msg: 'Ceph ratios must satisfy 0.0 < nearfull < backfillfull < full < 1.0'
+  loop:
+    - name: elevated
+      full: '{{ ceph_full_ratio_elevated }}'
+      backfillfull: '{{ ceph_backfillfull_ratio_elevated }}'
+      nearfull: '{{ ceph_nearfull_ratio_elevated }}'
+    - name: default
+      full: '{{ ceph_full_ratio_default }}'
+      backfillfull: '{{ ceph_backfillfull_ratio_default }}'
+      nearfull: '{{ ceph_nearfull_ratio_default }}'
+    - name: target
+      full: '{{ ceph_full_ratio_target }}'
+      backfillfull: '{{ ceph_backfillfull_ratio_target }}'
+      nearfull: '{{ ceph_nearfull_ratio_target }}'
+  loop_control:
+    label: '{{ item.name }}'
+
+# =============================================================================
+# STEP 2: Find rook-ceph-operator deployment
+# =============================================================================
+
+- name: Find rook-ceph-operator deployment
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: Deployment
+    name: rook-ceph-operator
+    namespace: '{{ ceph_namespace }}'
+    context: '{{ ceph_context }}'
+    kubeconfig: '{{ ceph_kubeconfig | default(omit, true) }}'
+  register: _ceph_operator_deployment
+
+- name: Validate rook-ceph-operator exists
+  ansible.builtin.assert:
+    that:
+      - _ceph_operator_deployment.resources | length > 0
+    fail_msg: 'rook-ceph-operator deployment not found in {{ ceph_namespace }}'
+
+- name: Find running rook-ceph-operator pod
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: '{{ ceph_namespace }}'
+    label_selectors:
+      - app=rook-ceph-operator
+    field_selectors:
+      - status.phase=Running
+    context: '{{ ceph_context }}'
+    kubeconfig: '{{ ceph_kubeconfig | default(omit, true) }}'
+  register: _ceph_operator_pods
+
+- name: Validate rook-ceph-operator pod is running
+  ansible.builtin.assert:
+    that:
+      - _ceph_operator_pods.resources | length > 0
+    fail_msg: 'No running rook-ceph-operator pod found in {{ ceph_namespace }}'
+
+- name: Set rook-ceph-operator pod name
+  ansible.builtin.set_fact:
+    _ceph_operator_pod: '{{ _ceph_operator_pods.resources[0].metadata.name }}'
+
+- name: Set requested Ceph ratios
+  when: ceph_operation == 'set_ratios'
+  kubernetes.core.k8s_exec:
+    namespace: '{{ ceph_namespace }}'
+    pod: '{{ _ceph_operator_pod }}'
+    command: >-
+      ceph osd set-{{ item.ratio }}-ratio {{ item.value }}
+      --conf=/var/lib/rook/{{ ceph_namespace }}/{{ ceph_namespace }}.config
+      --keyring=/var/lib/rook/{{ ceph_namespace }}/client.admin.keyring
+    context: '{{ ceph_context }}'
+    kubeconfig: '{{ ceph_kubeconfig | default(omit, true) }}'
+  loop:
+    - ratio: full
+      value: '{{ ceph_full_ratio_target }}'
+    - ratio: backfillfull
+      value: '{{ ceph_backfillfull_ratio_target }}'
+    - ratio: nearfull
+      value: '{{ ceph_nearfull_ratio_target }}'
+  loop_control:
+    label: '{{ item.ratio }}={{ item.value }}'
+  register: _direct_ratio_results
+  failed_when: >-
+    (_direct_ratio_results.return_code | default(_direct_ratio_results.rc | default(1)) | int) != 0
+
+- name: Verify requested Ceph ratios
+  when: ceph_operation == 'set_ratios'
+  kubernetes.core.k8s_exec:
+    namespace: '{{ ceph_namespace }}'
+    pod: '{{ _ceph_operator_pod }}'
+    command: >-
+      ceph osd dump
+      --conf=/var/lib/rook/{{ ceph_namespace }}/{{ ceph_namespace }}.config
+      --keyring=/var/lib/rook/{{ ceph_namespace }}/client.admin.keyring
+    context: '{{ ceph_context }}'
+    kubeconfig: '{{ ceph_kubeconfig | default(omit, true) }}'
+  register: _direct_ratio_dump
+
+# =============================================================================
+# STEP 3: Check current Ceph health status
+# =============================================================================
+
+- name: Check Ceph health
+  when: ceph_operation == 'recover'
+  kubernetes.core.k8s_exec:
+    namespace: '{{ ceph_namespace }}'
+    pod: '{{ _ceph_operator_pod }}'
+    command: >-
+      ceph health detail
+      --conf=/var/lib/rook/{{ ceph_namespace }}/{{ ceph_namespace }}.config
+      --keyring=/var/lib/rook/{{ ceph_namespace }}/client.admin.keyring
+    context: '{{ ceph_context }}'
+    kubeconfig: '{{ ceph_kubeconfig | default(omit, true) }}'
+  register: _ceph_health
+  failed_when: >-
+    (_ceph_health.return_code | default(_ceph_health.rc | default(1)) | int) != 0
+
+- name: Get Ceph OSD utilization
+  when: ceph_operation == 'recover'
+  kubernetes.core.k8s_exec:
+    namespace: '{{ ceph_namespace }}'
+    pod: '{{ _ceph_operator_pod }}'
+    command: >-
+      ceph osd df
+      --conf=/var/lib/rook/{{ ceph_namespace }}/{{ ceph_namespace }}.config
+      --keyring=/var/lib/rook/{{ ceph_namespace }}/client.admin.keyring
+    context: '{{ ceph_context }}'
+    kubeconfig: '{{ ceph_kubeconfig | default(omit, true) }}'
+  register: _ceph_osd_df
+  failed_when: >-
+    (_ceph_osd_df.return_code | default(_ceph_osd_df.rc | default(1)) | int) != 0
+
+- name: Get current Ceph ratios
+  when: ceph_operation == 'recover'
+  kubernetes.core.k8s_exec:
+    namespace: '{{ ceph_namespace }}'
+    pod: '{{ _ceph_operator_pod }}'
+    command: >-
+      ceph osd dump
+      --conf=/var/lib/rook/{{ ceph_namespace }}/{{ ceph_namespace }}.config
+      --keyring=/var/lib/rook/{{ ceph_namespace }}/client.admin.keyring
+    context: '{{ ceph_context }}'
+    kubeconfig: '{{ ceph_kubeconfig | default(omit, true) }}'
+  register: _ceph_osd_dump
+  failed_when: >-
+    (_ceph_osd_dump.return_code | default(_ceph_osd_dump.rc | default(1)) | int) != 0
+
+- name: Display current Ceph status
+  when: ceph_operation == 'recover'
+  ansible.builtin.debug:
+    msg:
+      - '=========================================='
+      - 'Ceph Health Check - {{ ceph_context }}'
+      - '=========================================='
+      - 'Health: {{ _ceph_health.stdout | default("unknown") }}'
+      - ''
+      - 'OSD Utilization:'
+      - '{{ _ceph_osd_df.stdout | default("not available") }}'
+
+- name: Detect OSD full condition
+  when: ceph_operation == 'recover'
+  ansible.builtin.set_fact:
+    _ceph_has_full_osds: >-
+      {{
+        (_ceph_health.stdout | default("")) is search("OSD_FULL") or
+        (_ceph_health.stdout | default("")) is search("OSD_NEARFULL") or
+        (_ceph_health.stdout | default("")) is search("OSD_BACKFILLFULL") or
+        (_ceph_health.stdout | default("")) is search("POOL_FULL")
+      }}
+
+# =============================================================================
+# STEP 4: Raise full ratios if OSDs are full
+# =============================================================================
+
+- name: Raise Ceph full ratios (emergency mode)
+  when:
+    - ceph_operation == 'recover'
+    - _ceph_has_full_osds | bool
+  block:
+    - name: Parse current ratios before elevation
+      ansible.builtin.set_fact:
+        _current_full_ratio: '{{ (_ceph_osd_dump.stdout | default("", true) | regex_findall("full_ratio +([0-9.]+)") | first | default("", true)) | float }}'
+        _current_backfillfull_ratio: '{{ (_ceph_osd_dump.stdout | default("", true) | regex_findall("backfillfull_ratio +([0-9.]+)") | first | default("", true)) | float }}'
+        _current_nearfull_ratio: '{{ (_ceph_osd_dump.stdout | default("", true) | regex_findall("nearfull_ratio +([0-9.]+)") | first | default("", true)) | float }}'
+
+    - name: Validate current Ceph ratios were parsed
+      ansible.builtin.assert:
+        that:
+          - _ceph_osd_dump.stdout is defined
+          - _current_full_ratio | float > 0.0
+          - _current_backfillfull_ratio | float > 0.0
+          - _current_nearfull_ratio | float > 0.0
+        fail_msg: 'Unable to parse all Ceph full, backfillfull, and nearfull ratios; refusing to change thresholds.'
+
+    - name: Check if ratios are already elevated
+      ansible.builtin.set_fact:
+        _ratios_already_elevated: >-
+          {{ (_current_full_ratio | float) >= (ceph_full_ratio_elevated | float) and
+             (_current_backfillfull_ratio | float) >= (ceph_backfillfull_ratio_elevated | float) and
+             (_current_nearfull_ratio | float) >= (ceph_nearfull_ratio_elevated | float) }}
+
+    - name: Display warning about ratio elevation
+      ansible.builtin.debug:
+        msg:
+          - '=========================================='
+          - 'WARNING: Ceph OSDs are full!'
+          - 'Current ratios: full={{ _current_full_ratio }} backfillfull={{ _current_backfillfull_ratio }} nearfull={{ _current_nearfull_ratio }}'
+          - 'Target ratios: full={{ ceph_full_ratio_elevated }} backfillfull={{ ceph_backfillfull_ratio_elevated }} nearfull={{ ceph_nearfull_ratio_elevated }}'
+          - '{{ _ratios_already_elevated | bool | ternary("Ratios already elevated - skipping", "Temporarily raising full ratios to allow cleanup operations") }}'
+          - '=========================================='
+
+    - name: Validate elevated ratios are sane
+      ansible.builtin.assert:
+        that:
+          - ceph_full_ratio_elevated | float > 0.0
+          - ceph_full_ratio_elevated | float < 1.0
+          - ceph_backfillfull_ratio_elevated | float > 0.0
+          - ceph_backfillfull_ratio_elevated | float < 1.0
+          - ceph_nearfull_ratio_elevated | float > 0.0
+          - ceph_nearfull_ratio_elevated | float < 1.0
+          - ceph_full_ratio_elevated | float > ceph_backfillfull_ratio_elevated | float
+          - ceph_backfillfull_ratio_elevated | float > ceph_nearfull_ratio_elevated | float
+        fail_msg: 'Elevated ratios are invalid. Must be: 0.0 < nearfull < backfillfull < full < 1.0'
+
+    - name: Set elevated ratios (atomic block)
+      when:
+        - not _ratios_already_elevated | bool
+      block:
+        - name: Set elevated full ratio
+          kubernetes.core.k8s_exec:
+            namespace: '{{ ceph_namespace }}'
+            pod: '{{ _ceph_operator_pod }}'
+            command: >-
+              ceph osd set-full-ratio {{ ceph_full_ratio_elevated }}
+              --conf=/var/lib/rook/{{ ceph_namespace }}/{{ ceph_namespace }}.config
+              --keyring=/var/lib/rook/{{ ceph_namespace }}/client.admin.keyring
+            context: '{{ ceph_context }}'
+            kubeconfig: '{{ ceph_kubeconfig | default(omit, true) }}'
+          register: _ratio_full_result
+          failed_when: >-
+            (_ratio_full_result.return_code | default(_ratio_full_result.rc | default(1)) | int) != 0
+
+        - name: Set elevated backfillfull ratio
+          kubernetes.core.k8s_exec:
+            namespace: '{{ ceph_namespace }}'
+            pod: '{{ _ceph_operator_pod }}'
+            command: >-
+              ceph osd set-backfillfull-ratio {{ ceph_backfillfull_ratio_elevated }}
+              --conf=/var/lib/rook/{{ ceph_namespace }}/{{ ceph_namespace }}.config
+              --keyring=/var/lib/rook/{{ ceph_namespace }}/client.admin.keyring
+            context: '{{ ceph_context }}'
+            kubeconfig: '{{ ceph_kubeconfig | default(omit, true) }}'
+          register: _ratio_backfill_result
+          failed_when: >-
+            (_ratio_backfill_result.return_code | default(_ratio_backfill_result.rc | default(1)) | int) != 0
+
+        - name: Set elevated nearfull ratio
+          kubernetes.core.k8s_exec:
+            namespace: '{{ ceph_namespace }}'
+            pod: '{{ _ceph_operator_pod }}'
+            command: >-
+              ceph osd set-nearfull-ratio {{ ceph_nearfull_ratio_elevated }}
+              --conf=/var/lib/rook/{{ ceph_namespace }}/{{ ceph_namespace }}.config
+              --keyring=/var/lib/rook/{{ ceph_namespace }}/client.admin.keyring
+            context: '{{ ceph_context }}'
+            kubeconfig: '{{ ceph_kubeconfig | default(omit, true) }}'
+          register: _ratio_near_result
+          failed_when: >-
+            (_ratio_near_result.return_code | default(_ratio_near_result.rc | default(1)) | int) != 0
+
+      rescue:
+        - name: Log ratio elevation failure
+          ansible.builtin.debug:
+            msg:
+              - 'ERROR: Failed to set elevated ratios'
+              - 'Full ratio: {{ _ratio_full_result.rc | default("not attempted") }}'
+              - 'Backfillfull ratio: {{ _ratio_backfill_result.rc | default("not attempted") }}'
+              - 'Nearfull ratio: {{ _ratio_near_result.rc | default("not attempted") }}'
+              - 'Manual intervention required to check Ceph state'
+
+        - name: Fail the playbook on ratio elevation failure
+          ansible.builtin.fail:
+            msg: 'Ceph ratio elevation failed. Cluster may be in inconsistent state. Check Ceph health manually.'
+
+    - name: Verify elevated ratios
+      kubernetes.core.k8s_exec:
+        namespace: '{{ ceph_namespace }}'
+        pod: '{{ _ceph_operator_pod }}'
+        command: >-
+          ceph osd dump
+          --conf=/var/lib/rook/{{ ceph_namespace }}/{{ ceph_namespace }}.config
+          --keyring=/var/lib/rook/{{ ceph_namespace }}/client.admin.keyring
+        context: '{{ ceph_context }}'
+        kubeconfig: '{{ ceph_kubeconfig | default(omit, true) }}'
+      register: _ceph_elevated_ratios
+      failed_when: >-
+        (_ceph_elevated_ratios.return_code | default(_ceph_elevated_ratios.rc | default(1)) | int) != 0
+
+    - name: Display elevated ratios
+      ansible.builtin.debug:
+        msg:
+          - 'Elevated ratios applied:'
+          - '{{ _ceph_elevated_ratios.stdout | default("") }}'
+
+# =============================================================================
+# STEP 5: Trigger cleanup operations
+# =============================================================================
+
+- name: Trigger cleanup operations
+  when:
+    - ceph_operation == 'recover'
+    - _ceph_has_full_osds | bool
+    - ceph_auto_cleanup | bool
+  block:
+    - name: Delete WAL ObjectBucketClaim (DESTRUCTIVE - removes all WAL archives)
+      when:
+        - ceph_delete_wal_obc | bool
+      block:
+        - name: Require explicit WAL deletion confirmation
+          ansible.builtin.assert:
+            that:
+              - ceph_delete_wal_obc_confirm | bool
+            fail_msg: 'Set ceph_delete_wal_obc_confirm=true to confirm deletion of all WAL archives.'
+
+        - name: Delete WAL ObjectBucketClaim
+          kubernetes.core.k8s:
+            api_version: objectbucket.io/v1alpha1
+            kind: ObjectBucketClaim
+            name: '{{ ceph_wal_obc_name }}'
+            namespace: '{{ aap_namespace }}'
+            context: '{{ ceph_context }}'
+            kubeconfig: '{{ ceph_kubeconfig | default(omit, true) }}'
+            state: absent
+          register: _wal_obc_delete_result
+
+    - name: Log WAL OBC deletion result
+      when:
+        - ceph_delete_wal_obc | bool
+      ansible.builtin.debug:
+        msg: 'WAL OBC deletion: {{ _wal_obc_delete_result.changed | default(false) | ternary("deleted", "not found (already deleted or does not exist)") }}'
+
+    - name: Trigger AAP cleanup job
+      when:
+        - ceph_trigger_aap_cleanup | bool
+      block:
+        - name: Check if AAP cleanup CronJob exists
+          kubernetes.core.k8s_info:
+            api_version: batch/v1
+            kind: CronJob
+            name: '{{ aap_cleanup_cronjob }}'
+            namespace: '{{ aap_namespace }}'
+            context: '{{ ceph_context }}'
+            kubeconfig: '{{ ceph_kubeconfig | default(omit, true) }}'
+          register: _aap_cleanup_cronjob
+
+        - name: Require AAP cleanup CronJob
+          ansible.builtin.assert:
+            that:
+              - _aap_cleanup_cronjob.resources | length > 0
+            fail_msg: 'AAP cleanup CronJob {{ aap_cleanup_cronjob }} was not found.'
+
+        - name: Generate unique job name
+          when:
+            - _aap_cleanup_cronjob.resources | default([]) | length > 0
+          ansible.builtin.set_fact:
+            _cleanup_job_name: 'aap-cleanup-manual-{{ lookup("pipe", "date +%s") }}'
+
+        - name: Create manual cleanup job from CronJob
+          when:
+            - _aap_cleanup_cronjob.resources | default([]) | length > 0
+          kubernetes.core.k8s:
+            state: present
+            context: '{{ ceph_context }}'
+            kubeconfig: '{{ ceph_kubeconfig | default(omit, true) }}'
+            definition:
+              apiVersion: batch/v1
+              kind: Job
+              metadata:
+                name: '{{ _cleanup_job_name }}'
+                namespace: '{{ aap_namespace }}'
+                labels:
+                  app: aap-cleanup
+                  trigger: ceph-recovery
+              spec:
+                template: '{{ _aap_cleanup_cronjob.resources[0].spec.jobTemplate.spec.template }}'
+                backoffLimit: 3
+                ttlSecondsAfterFinished: 3600
+          register: _aap_cleanup_job_created
+
+        - name: Wait for cleanup job to complete
+          when:
+            - _aap_cleanup_job_created is defined
+            - _aap_cleanup_job_created.changed | default(false) | bool
+          kubernetes.core.k8s_info:
+            api_version: batch/v1
+            kind: Job
+            name: '{{ _cleanup_job_name }}'
+            namespace: '{{ aap_namespace }}'
+            context: '{{ ceph_context }}'
+            kubeconfig: '{{ ceph_kubeconfig | default(omit, true) }}'
+          register: _cleanup_job_status
+          until:
+            - _cleanup_job_status.resources | length > 0
+            - _cleanup_job_status.resources[0].status.succeeded is defined or
+              _cleanup_job_status.resources[0].status.failed is defined
+          retries: '{{ ((ceph_cleanup_timeout / 30) | float | round(0, "ceil")) | int }}'
+          delay: 30
+
+        - name: Log cleanup job result
+          when:
+            - _cleanup_job_status is defined
+          ansible.builtin.debug:
+            msg: 'AAP cleanup job: {{ (_cleanup_job_status.resources[0].status.succeeded | default(0)) | ternary("completed successfully", "failed or timed out") }}'
+
+        - name: Fail if cleanup job failed
+          when:
+            - _cleanup_job_status.resources | length > 0
+            - _cleanup_job_status.resources[0].status.failed is defined
+          ansible.builtin.fail:
+            msg: 'AAP cleanup job {{ _cleanup_job_name }} failed.'
+
+# =============================================================================
+# STEP 6: Monitor recovery
+# =============================================================================
+
+- name: Wait for Ceph health recovery
+  when:
+    - ceph_operation == 'recover'
+    - _ceph_has_full_osds | bool
+    - ceph_wait_for_health_ok | bool
+  block:
+    - name: Monitor Ceph health status
+      kubernetes.core.k8s_exec:
+        namespace: '{{ ceph_namespace }}'
+        pod: '{{ _ceph_operator_pod }}'
+        command: >-
+          ceph health
+          --conf=/var/lib/rook/{{ ceph_namespace }}/{{ ceph_namespace }}.config
+          --keyring=/var/lib/rook/{{ ceph_namespace }}/client.admin.keyring
+        context: '{{ ceph_context }}'
+        kubeconfig: '{{ ceph_kubeconfig | default(omit, true) }}'
+      register: _ceph_health_monitor
+      failed_when: >-
+        (_ceph_health_monitor.return_code | default(_ceph_health_monitor.rc | default(1)) | int) != 0
+      until: _ceph_health_monitor.stdout is search('HEALTH_OK')
+      retries: '{{ ((ceph_health_timeout / 30) | float | round(0, "ceil")) | int }}'
+      delay: 30
+
+    - name: Display recovery status
+      ansible.builtin.debug:
+        msg:
+          - 'Ceph health status: {{ _ceph_health_monitor.stdout | default("timeout") }}'
+          - '{{ (_ceph_health_monitor.stdout | default("")) is search("HEALTH_OK") | ternary("Recovery successful", "WARNING: Ceph did not reach HEALTH_OK within timeout") }}'
+  rescue:
+    - name: Fail clearly when Ceph recovery does not complete
+      ansible.builtin.fail:
+        msg: >-
+          Ceph did not reach HEALTH_OK within {{ ceph_health_timeout }} seconds.
+          Elevated ratios may still be active; inspect them before restoring defaults.
+
+# =============================================================================
+# STEP 7: Restore default ratios
+# =============================================================================
+
+- name: Restore default Ceph ratios
+  when:
+    - ceph_operation == 'recover'
+    - _ceph_has_full_osds | bool
+    - ceph_auto_restore_defaults | bool
+    - not ceph_wait_for_health_ok | bool or
+      ((_ceph_health_monitor is defined) and
+       (_ceph_health_monitor.stdout | default('')) is search('HEALTH_OK'))
+  block:
+    - name: Restore default full ratio
+      kubernetes.core.k8s_exec:
+        namespace: '{{ ceph_namespace }}'
+        pod: '{{ _ceph_operator_pod }}'
+        command: >-
+          ceph osd set-full-ratio {{ ceph_full_ratio_default }}
+          --conf=/var/lib/rook/{{ ceph_namespace }}/{{ ceph_namespace }}.config
+          --keyring=/var/lib/rook/{{ ceph_namespace }}/client.admin.keyring
+        context: '{{ ceph_context }}'
+        kubeconfig: '{{ ceph_kubeconfig | default(omit, true) }}'
+      register: _restore_full_result
+      failed_when: >-
+        (_restore_full_result.return_code | default(_restore_full_result.rc | default(1)) | int) != 0
+
+    - name: Restore default backfillfull ratio
+      kubernetes.core.k8s_exec:
+        namespace: '{{ ceph_namespace }}'
+        pod: '{{ _ceph_operator_pod }}'
+        command: >-
+          ceph osd set-backfillfull-ratio {{ ceph_backfillfull_ratio_default }}
+          --conf=/var/lib/rook/{{ ceph_namespace }}/{{ ceph_namespace }}.config
+          --keyring=/var/lib/rook/{{ ceph_namespace }}/client.admin.keyring
+        context: '{{ ceph_context }}'
+        kubeconfig: '{{ ceph_kubeconfig | default(omit, true) }}'
+      register: _restore_backfill_result
+      failed_when: >-
+        (_restore_backfill_result.return_code | default(_restore_backfill_result.rc | default(1)) | int) != 0
+
+    - name: Restore default nearfull ratio
+      kubernetes.core.k8s_exec:
+        namespace: '{{ ceph_namespace }}'
+        pod: '{{ _ceph_operator_pod }}'
+        command: >-
+          ceph osd set-nearfull-ratio {{ ceph_nearfull_ratio_default }}
+          --conf=/var/lib/rook/{{ ceph_namespace }}/{{ ceph_namespace }}.config
+          --keyring=/var/lib/rook/{{ ceph_namespace }}/client.admin.keyring
+        context: '{{ ceph_context }}'
+        kubeconfig: '{{ ceph_kubeconfig | default(omit, true) }}'
+      register: _restore_near_result
+      failed_when: >-
+        (_restore_near_result.return_code | default(_restore_near_result.rc | default(1)) | int) != 0
+
+    - name: Verify default ratios restored
+      kubernetes.core.k8s_exec:
+        namespace: '{{ ceph_namespace }}'
+        pod: '{{ _ceph_operator_pod }}'
+        command: >-
+          ceph osd dump
+          --conf=/var/lib/rook/{{ ceph_namespace }}/{{ ceph_namespace }}.config
+          --keyring=/var/lib/rook/{{ ceph_namespace }}/client.admin.keyring
+        context: '{{ ceph_context }}'
+        kubeconfig: '{{ ceph_kubeconfig | default(omit, true) }}'
+      register: _ceph_restored_ratios
+      failed_when: >-
+        (_ceph_restored_ratios.return_code | default(_ceph_restored_ratios.rc | default(1)) | int) != 0
+
+    - name: Display restored ratios
+      ansible.builtin.debug:
+        msg:
+          - '=========================================='
+          - 'Default ratios restored successfully!'
+          - '=========================================='
+          - '{{ _ceph_restored_ratios.stdout | default("") }}'
+
+# =============================================================================
+# STEP 8: Final status report
+# =============================================================================
+
+- name: Get final Ceph status
+  when:
+    - ceph_operation == 'recover'
+    - _ceph_has_full_osds | bool
+  kubernetes.core.k8s_exec:
+    namespace: '{{ ceph_namespace }}'
+    pod: '{{ _ceph_operator_pod }}'
+    command: >-
+      ceph status
+      --conf=/var/lib/rook/{{ ceph_namespace }}/{{ ceph_namespace }}.config
+      --keyring=/var/lib/rook/{{ ceph_namespace }}/client.admin.keyring
+    context: '{{ ceph_context }}'
+    kubeconfig: '{{ ceph_kubeconfig | default(omit, true) }}'
+  register: _ceph_final_status
+  failed_when: >-
+    (_ceph_final_status.return_code | default(_ceph_final_status.rc | default(1)) | int) != 0
+
+- name: Display final status (when recovery was performed)
+  when:
+    - ceph_operation == 'recover'
+    - _ceph_has_full_osds | bool
+  ansible.builtin.debug:
+    msg:
+      - '=========================================='
+      - 'Ceph Full Ratio Manager - Completion Report'
+      - '=========================================='
+      - 'Context: {{ ceph_context }}'
+      - 'OSDs were full: {{ _ceph_has_full_osds }}'
+      - 'Cleanup triggered: {{ ceph_auto_cleanup and _ceph_has_full_osds }}'
+      - 'Defaults restored: {{ ceph_auto_restore_defaults and _ceph_has_full_osds and (not ceph_wait_for_health_ok or ((_ceph_health_monitor is defined) and (_ceph_health_monitor.stdout | default("")) is search("HEALTH_OK"))) }}'
+      - ''
+      - 'Final Ceph Status:'
+      - '{{ _ceph_final_status.stdout | default("not available") }}'
+      - '=========================================='
+
+- name: Display no action needed message
+  when:
+    - ceph_operation == 'recover'
+    - not _ceph_has_full_osds | bool
+  ansible.builtin.debug:
+    msg:
+      - '=========================================='
+      - 'Ceph Full Ratio Manager - No Action Needed'
+      - '=========================================='
+      - 'Context: {{ ceph_context }}'
+      - 'Ceph health is OK - no OSD full conditions detected'
+      - 'No recovery actions were necessary'
+      - '=========================================='
+...

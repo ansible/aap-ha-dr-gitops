@@ -1,0 +1,35 @@
+---
+# Namespace for AAP Plus deployment
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aap
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+---
+# OperatorGroup for AAP operator (namespace-scoped)
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: aap-operator-group
+  namespace: aap
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+spec:
+  targetNamespaces:
+  - aap
+---
+# AAP 2.7 Operator Subscription
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: ansible-automation-platform-operator
+  namespace: aap
+  annotations:
+    argocd.argoproj.io/sync-wave: "-3"
+spec:
+  channel: stable-2.7
+  name: ansible-automation-platform-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  installPlanApproval: Automatic

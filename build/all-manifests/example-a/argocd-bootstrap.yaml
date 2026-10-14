@@ -1,0 +1,711 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: aap-cnpg
+  namespace: openshift-gitops
+spec:
+  goTemplate: true
+  goTemplateOptions:
+  - missingkey=error
+  ignoreApplicationDifferences:
+  - jsonPointers:
+    - /spec/syncPolicy/automated
+  template:
+    metadata:
+      name: aap-cnpg
+      namespace: openshift-gitops
+      labels:
+        aap.hadr.redhat.com/pair: '{{ .pair_id }}'
+        aap.hadr.redhat.com/environment: '{{ .environment_id }}'
+        aap.hadr.redhat.com/desired-role: '{{ if eq .environment_id .desired_primary_environment_id }}primary{{
+          else }}replica{{ end }}'
+      annotations:
+        argocd.argoproj.io/sync-options: Prune=false
+        argocd.argoproj.io/compare-options: IgnoreExtraneous
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/ansible-automation-platform/aap-ha-dr-gitops/
+        targetRevision: main
+        path: base/cnpg
+        kustomize:
+          patches:
+          - target:
+              group: postgresql.cnpg.io
+              version: v1
+              kind: Cluster
+              name: aap-postgres
+            patch: |
+              - op: replace
+                path: /spec/replica/self
+                value: '{{ .workloads.cnpg.site_name }}'
+              - op: replace
+                path: /spec/replica/primary
+                value: '{{ if eq .environment_id .desired_primary_environment_id }}{{ .workloads.cnpg.site_name }}{{ else }}{{ .workloads.cnpg.peer.site_name }}{{ end }}'
+              - op: replace
+                path: /spec/replica/source
+                value: '{{ .workloads.cnpg.peer.site_name }}'
+              - op: replace
+                path: /spec/storage/storageClass
+                value: '{{ .workloads.cnpg.storage_class }}'
+              - op: replace
+                path: /spec/walStorage/storageClass
+                value: '{{ .workloads.cnpg.storage_class }}'
+              - op: replace
+                path: /spec/backup/retentionPolicy
+                value: 2d
+              - op: replace
+                path: /spec/backup/barmanObjectStore/destinationPath
+                value: '{{ .workloads.cnpg.wal_path }}'
+              - op: replace
+                path: /spec/externalClusters/0/name
+                value: '{{ .workloads.cnpg.site_name }}'
+              - op: replace
+                path: /spec/externalClusters/0/barmanObjectStore/destinationPath
+                value: '{{ .workloads.cnpg.wal_path }}'
+              - op: replace
+                path: /spec/externalClusters/0/connectionParameters/host
+                value: '{{ .workloads.cnpg.replication_host }}'
+              - op: replace
+                path: /spec/externalClusters/1/name
+                value: '{{ .workloads.cnpg.peer.site_name }}'
+              - op: replace
+                path: /spec/externalClusters/1/barmanObjectStore/destinationPath
+                value: '{{ .workloads.cnpg.peer.wal_path }}'
+              - op: replace
+                path: /spec/externalClusters/1/connectionParameters/host
+                value: '{{ .workloads.cnpg.peer.replication_host }}'
+              {{ if eq .environment_id .desired_primary_environment_id }}
+              - op: replace
+                path: /spec/bootstrap/initdb/database
+                value: postgres
+              {{ else }}
+              - op: replace
+                path: /spec/bootstrap
+                value:
+                  pg_basebackup:
+                    source: '{{ .workloads.cnpg.peer.site_name }}'
+              {{ end }}
+              - op: replace
+                path: /spec/storage/size
+                value: {{ .workloads.cnpg.data_size }}
+              - op: replace
+                path: /spec/walStorage/size
+                value: {{ .workloads.cnpg.wal_size }}
+              - op: replace
+                path: /spec/instances
+                value: {{ .workloads.cnpg.instances }}
+          - target:
+              version: v1
+              kind: Service
+              name: aap-postgres-replication
+            patch: |-
+              - op: replace
+                path: /metadata/annotations/external-dns.alpha.kubernetes.io~1hostname
+                value: '{{ .workloads.cnpg.replication_host }}'
+          - target:
+              group: external-secrets.io
+              version: v1
+              kind: ExternalSecret
+              name: cnpg-server-tls
+            patch: |-
+              - op: replace
+                path: /spec/data/0/remoteRef/property
+                value: '{{ printf "%s-server.crt" .workloads.cnpg.site_name }}'
+              - op: replace
+                path: /spec/data/1/remoteRef/property
+                value: '{{ printf "%s-server.key" .workloads.cnpg.site_name }}'
+          - target:
+              group: external-secrets.io
+              version: v1
+              kind: ExternalSecret
+              name: cnpg-replication-tls
+            patch: |-
+              - op: replace
+                path: /spec/data/0/remoteRef/property
+                value: '{{ printf "%s-replication.crt" .workloads.cnpg.site_name }}'
+              - op: replace
+                path: /spec/data/1/remoteRef/property
+                value: '{{ printf "%s-replication.key" .workloads.cnpg.site_name }}'
+          - target:
+              kind: ExternalSecret
+              name: cnpg-server-tls
+            patch: |
+              - op: replace
+                path: /spec/data/0/remoteRef/key
+                value: '{{ .workloads.eso.secret_prefix }}/cnpg-tls'
+              - op: replace
+                path: /spec/data/1/remoteRef/key
+                value: '{{ .workloads.eso.secret_prefix }}/cnpg-tls'
+          - target:
+              kind: ExternalSecret
+              name: cnpg-replication-tls
+            patch: |
+              - op: replace
+                path: /spec/data/0/remoteRef/key
+                value: '{{ .workloads.eso.secret_prefix }}/cnpg-tls'
+              - op: replace
+                path: /spec/data/1/remoteRef/key
+                value: '{{ .workloads.eso.secret_prefix }}/cnpg-tls'
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: aap
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+        - CreateNamespace=true
+        - SkipDryRunOnMissingResource=true
+        - ApplyOutOfSyncOnly=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
+      ignoreDifferences:
+      - group: apps
+        kind: Deployment
+        jsonPointers:
+        - /spec/replicas
+      - group: postgresql.cnpg.io
+        kind: Cluster
+        jsonPointers:
+        - /spec/bootstrap
+        - /spec/replica/promotionToken
+        - /spec/affinity
+        - /spec/monitoring/customQueriesConfigMap
+        - /spec/monitoring/disableDefaultQueries
+        - /spec/monitoring/enablePodMonitor
+        - /spec/postgresGID
+        - /spec/postgresUID
+        - /spec/smartShutdownTimeout
+        - /spec/startDelay
+        - /spec/resources/claims
+        - /spec/enablePodAntiAffinity
+        - /spec/topologySpreadConstraints
+        - /spec/probes
+        - /spec/minSyncReplicas
+        - /spec/maxSyncReplicas
+        - /spec/primaryUpdateStrategy
+        - /spec/primaryUpdateMethod
+        - /spec/replicationSlots
+        - /spec/failoverDelay
+        - /spec/logLevel
+        - /spec/enablePDB
+        - /spec/enableSuperuserAccess
+        - /spec/storage/resizeInUseVolumes
+        - /spec/walStorage/resizeInUseVolumes
+        - /spec/monitoring
+        - /spec/postgresql
+        - /spec/resources/ephemeralVolumeSource
+        - /spec/backup/target
+      - group: '*'
+        kind: '*'
+        jsonPointers:
+        - /status
+  generators:
+  - matrix:
+      generators:
+      - matrix:
+          generators:
+          - git:
+              repoURL: https://github.com/ansible-automation-platform/aap-ha-dr-gitops/
+              revision: main
+              pathParamPrefix: pair
+              files:
+              - path: examples/aws-rosa-pair/deployment/argocd/pairs/*.yaml
+          - list:
+              elementsYaml: '[{{ range $i, $id := .member_environments }}{{ if $i }},{{ end }}{"environment_id":{{
+                $id | toJson }}}{{ end }}]'
+      - git:
+          repoURL: https://github.com/ansible-automation-platform/aap-ha-dr-gitops/
+          revision: main
+          pathParamPrefix: environment
+          files:
+          - path: examples/aws-rosa-pair/deployment/argocd/environments/{{ .environment_id }}.yaml
+    selector:
+      matchLabels:
+        target_cluster_id: example-a
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: aap-eso
+  namespace: openshift-gitops
+spec:
+  goTemplate: true
+  goTemplateOptions:
+  - missingkey=error
+  ignoreApplicationDifferences:
+  - jsonPointers:
+    - /spec/syncPolicy/automated
+  template:
+    metadata:
+      name: aap-eso
+      namespace: openshift-gitops
+      labels:
+        aap.hadr.redhat.com/pair: '{{ .pair_id }}'
+        aap.hadr.redhat.com/environment: '{{ .environment_id }}'
+      annotations:
+        argocd.argoproj.io/sync-options: Prune=false
+        argocd.argoproj.io/compare-options: IgnoreExtraneous
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/ansible-automation-platform/aap-ha-dr-gitops/
+        targetRevision: main
+        path: base/eso
+        kustomize:
+          patches:
+          - target:
+              kind: ClusterSecretStore
+              name: cluster-cross-account-secret-store
+            patch: |
+              - op: replace
+                path: /spec/provider/aws/region
+                value: '{{ .workloads.eso.region }}'
+          - target:
+              kind: ExternalSecret
+              name: aap-controller-secret-key
+            patch: |
+              - op: replace
+                path: /spec/dataFrom/0/extract/key
+                value: '{{ .workloads.eso.secret_prefix }}/aap-controller-secret-key'
+          - target:
+              kind: ExternalSecret
+              name: aap-hub-db-fields-encryption
+            patch: |
+              - op: replace
+                path: /spec/dataFrom/0/extract/key
+                value: '{{ .workloads.eso.secret_prefix }}/aap-hub-db-fields-encryption'
+          - target:
+              kind: ExternalSecret
+              name: aap-db-fields-encryption-secret
+            patch: |
+              - op: replace
+                path: /spec/dataFrom/0/extract/key
+                value: '{{ .workloads.eso.secret_prefix }}/aap-db-fields-encryption-secret'
+          - target:
+              kind: ExternalSecret
+              name: aap-controller-receptor-ca
+            patch: |
+              - op: replace
+                path: /spec/data/0/remoteRef/key
+                value: '{{ .workloads.eso.secret_prefix }}/aap-controller-receptor-ca'
+              - op: replace
+                path: /spec/data/1/remoteRef/key
+                value: '{{ .workloads.eso.secret_prefix }}/aap-controller-receptor-ca'
+          - target:
+              kind: ExternalSecret
+              name: aap-admin-password
+            patch: |
+              - op: replace
+                path: /spec/dataFrom/0/extract/key
+                value: '{{ .workloads.eso.secret_prefix }}/aap-admin-password'
+          - target:
+              kind: ExternalSecret
+              name: cnpg-init-sql
+            patch: |
+              - op: replace
+                path: /spec/dataFrom/0/extract/key
+                value: '{{ .workloads.eso.secret_prefix }}/cnpg-init-sql'
+          - target:
+              kind: ExternalSecret
+              name: aap-controller-admin-password
+            patch: |
+              - op: replace
+                path: /spec/dataFrom/0/extract/key
+                value: '{{ .workloads.eso.secret_prefix }}/aap-controller-admin-password'
+          - target:
+              kind: ExternalSecret
+              name: aap-controller-receptor-work-signing
+            patch: |
+              - op: replace
+                path: /spec/dataFrom/0/extract/key
+                value: '{{ .workloads.eso.secret_prefix }}/aap-controller-receptor-work-signing'
+          - target:
+              kind: ExternalSecret
+              name: aap-eda-admin-password
+            patch: |
+              - op: replace
+                path: /spec/dataFrom/0/extract/key
+                value: '{{ .workloads.eso.secret_prefix }}/aap-eda-admin-password'
+          - target:
+              kind: ExternalSecret
+              name: aap-eda-db-fields-encryption-secret
+            patch: |
+              - op: replace
+                path: /spec/dataFrom/0/extract/key
+                value: '{{ .workloads.eso.secret_prefix }}/aap-eda-db-fields-encryption-secret'
+          - target:
+              kind: ExternalSecret
+              name: aap-hub-admin-password
+            patch: |
+              - op: replace
+                path: /spec/dataFrom/0/extract/key
+                value: '{{ .workloads.eso.secret_prefix }}/aap-hub-admin-password'
+          - target:
+              kind: ExternalSecret
+              name: aap-hub-container-auth
+            patch: |
+              - op: replace
+                path: /spec/dataFrom/0/extract/key
+                value: '{{ .workloads.eso.secret_prefix }}/aap-hub-container-auth'
+          - target:
+              kind: ExternalSecret
+              name: aap-controller-postgres-configuration
+            patch: |
+              - op: replace
+                path: /spec/dataFrom/0/extract/key
+                value: '{{ .workloads.eso.secret_prefix }}/aap-controller-postgres-configuration'
+          - target:
+              kind: ExternalSecret
+              name: aap-gateway-postgres-configuration
+            patch: |
+              - op: replace
+                path: /spec/dataFrom/0/extract/key
+                value: '{{ .workloads.eso.secret_prefix }}/aap-gateway-postgres-configuration'
+          - target:
+              kind: ExternalSecret
+              name: aap-eda-postgres-configuration
+            patch: |
+              - op: replace
+                path: /spec/dataFrom/0/extract/key
+                value: '{{ .workloads.eso.secret_prefix }}/aap-eda-postgres-configuration'
+          - target:
+              kind: ExternalSecret
+              name: aap-eda-event-stream-postgres-configuration
+            patch: |
+              - op: replace
+                path: /spec/dataFrom/0/extract/key
+                value: '{{ .workloads.eso.secret_prefix }}/aap-eda-event-stream-postgres-configuration'
+          - target:
+              kind: ExternalSecret
+              name: aap-hub-postgres-configuration
+            patch: |
+              - op: replace
+                path: /spec/dataFrom/0/extract/key
+                value: '{{ .workloads.eso.secret_prefix }}/aap-hub-postgres-configuration'
+          - target:
+              kind: ExternalSecret
+              name: cnpg-ca
+            patch: |
+              - op: replace
+                path: /spec/data/0/remoteRef/key
+                value: '{{ .workloads.eso.secret_prefix }}/cnpg-tls'
+              - op: replace
+                path: /spec/data/1/remoteRef/key
+                value: '{{ .workloads.eso.secret_prefix }}/cnpg-tls'
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: aap
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+        - CreateNamespace=true
+        - SkipDryRunOnMissingResource=true
+        - ApplyOutOfSyncOnly=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
+      ignoreDifferences:
+      - group: external-secrets.io
+        kind: ExternalSecret
+        jqPathExpressions:
+        - .spec.data[]?.remoteRef.conversionStrategy
+        - .spec.data[]?.remoteRef.decodingStrategy
+        - .spec.data[]?.remoteRef.metadataPolicy
+      - group: '*'
+        kind: '*'
+        jsonPointers:
+        - /status
+  generators:
+  - matrix:
+      generators:
+      - matrix:
+          generators:
+          - git:
+              repoURL: https://github.com/ansible-automation-platform/aap-ha-dr-gitops/
+              revision: main
+              pathParamPrefix: pair
+              files:
+              - path: examples/aws-rosa-pair/deployment/argocd/pairs/*.yaml
+          - list:
+              elementsYaml: '[{{ range $i, $id := .member_environments }}{{ if $i }},{{ end }}{"environment_id":{{
+                $id | toJson }}}{{ end }}]'
+      - git:
+          repoURL: https://github.com/ansible-automation-platform/aap-ha-dr-gitops/
+          revision: main
+          pathParamPrefix: environment
+          files:
+          - path: examples/aws-rosa-pair/deployment/argocd/environments/{{ .environment_id }}.yaml
+    selector:
+      matchLabels:
+        target_cluster_id: example-a
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: aap-odf
+  namespace: openshift-gitops
+spec:
+  goTemplate: true
+  goTemplateOptions:
+  - missingkey=error
+  ignoreApplicationDifferences:
+  - jsonPointers:
+    - /spec/syncPolicy/automated
+  template:
+    metadata:
+      name: aap-odf
+      namespace: openshift-gitops
+      labels:
+        aap.hadr.redhat.com/pair: '{{ .pair_id }}'
+        aap.hadr.redhat.com/environment: '{{ .environment_id }}'
+        aap.hadr.redhat.com/rgw-role: '{{ .rgw_role }}'
+      annotations:
+        argocd.argoproj.io/sync-options: Prune=false
+        argocd.argoproj.io/compare-options: IgnoreExtraneous
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/ansible-automation-platform/aap-ha-dr-gitops/
+        targetRevision: main
+        path: '{{ if eq .rgw_role "primary" }}layers/odf-primary{{ else }}layers/odf-replica{{ end }}'
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: aap
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+        - CreateNamespace=true
+        - SkipDryRunOnMissingResource=true
+        - ApplyOutOfSyncOnly=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
+      ignoreDifferences:
+      - group: '*'
+        kind: '*'
+        jsonPointers:
+        - /status
+  templatePatch: |
+    spec:
+      source:
+        kustomize:
+          patches:
+            - target:
+                group: ceph.rook.io
+                version: v1
+                kind: CephObjectZone
+                name: zone-template
+              patch: |-
+                - op: replace
+                  path: /metadata/name
+                  value: {{ .rgw_zone_name | toJson }}
+                - op: replace
+                  path: /spec/customEndpoints/0
+                  value: {{ .workloads.odf.endpoint | toJson }}
+            - target:
+                group: ceph.rook.io
+                version: v1
+                kind: CephObjectStore
+                name: hub-objectstore
+              patch: |-
+                - op: replace
+                  path: /spec/zone/name
+                  value: {{ .rgw_zone_name | toJson }}
+            - target:
+                group: ocs.openshift.io
+                version: v1
+                kind: StorageCluster
+                name: ocs-storagecluster
+              patch: |-
+                - op: replace
+                  path: /spec/storageDeviceSets/0/dataPVCTemplate/spec/storageClassName
+                  value: {{ .workloads.odf.storage_class | toJson }}
+            {{- if eq .rgw_role "replica" }}
+            - target:
+                group: ceph.rook.io
+                version: v1
+                kind: CephObjectRealm
+                name: hub-realm
+              patch: |-
+                - op: add
+                  path: /spec/pull
+                  value:
+                    endpoint: {{ .workloads.odf.partner_endpoint | toJson }}
+            {{- end }}
+
+            - target:
+                kind: ExternalSecret
+                name: barman-rgw-credentials
+              patch: |
+                - op: replace
+                  path: /spec/data/0/remoteRef/key
+                  value: '{{ .workloads.eso.secret_prefix }}/hub-rgw-s3-credentials'
+                - op: replace
+                  path: /spec/data/1/remoteRef/key
+                  value: '{{ .workloads.eso.secret_prefix }}/hub-rgw-s3-credentials'
+            - target:
+                kind: ExternalSecret
+                name: hub-rgw-s3-credentials
+              patch: |
+                - op: replace
+                  path: /spec/dataFrom/0/extract/key
+                  value: '{{ .workloads.eso.secret_prefix }}/hub-rgw-s3-credentials'
+            - target:
+                kind: ExternalSecret
+                name: hub-realm-keys
+              patch: |
+                - op: replace
+                  path: /spec/dataFrom/0/extract/key
+                  value: '{{ .workloads.eso.secret_prefix }}/hub-realm-keys'
+  generators:
+  - matrix:
+      generators:
+      - matrix:
+          generators:
+          - git:
+              repoURL: https://github.com/ansible-automation-platform/aap-ha-dr-gitops/
+              revision: main
+              pathParamPrefix: pair
+              files:
+              - path: examples/aws-rosa-pair/deployment/argocd/pairs/*.yaml
+          - list:
+              elementsYaml: '[{{ range $i, $id := .member_environments }}{{ if $i }},{{ end }}{"environment_id":{{
+                $id | toJson }}}{{ end }}]'
+      - git:
+          repoURL: https://github.com/ansible-automation-platform/aap-ha-dr-gitops/
+          revision: main
+          pathParamPrefix: environment
+          files:
+          - path: examples/aws-rosa-pair/deployment/argocd/environments/{{ .environment_id }}.yaml
+    selector:
+      matchLabels:
+        target_cluster_id: example-a
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: aap-platform
+  namespace: openshift-gitops
+spec:
+  goTemplate: true
+  goTemplateOptions:
+  - missingkey=error
+  ignoreApplicationDifferences:
+  - jsonPointers:
+    - /spec/syncPolicy/automated
+  template:
+    metadata:
+      name: aap-platform
+      namespace: openshift-gitops
+      labels:
+        aap.hadr.redhat.com/pair: '{{ .pair_id }}'
+        aap.hadr.redhat.com/environment: '{{ .environment_id }}'
+        aap.hadr.redhat.com/desired-role: '{{ if eq .environment_id .desired_primary_environment_id }}primary{{
+          else }}replica{{ end }}'
+      annotations:
+        argocd.argoproj.io/sync-options: Prune=false
+        argocd.argoproj.io/compare-options: IgnoreExtraneous
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/ansible-automation-platform/aap-ha-dr-gitops/
+        targetRevision: main
+        path: '{{ if eq .environment_id .desired_primary_environment_id }}layers/platform-primary{{ else }}layers/platform-replica{{
+          end }}'
+        kustomize:
+          patches: []
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: aap
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+        - CreateNamespace=true
+        - SkipDryRunOnMissingResource=true
+        - ApplyOutOfSyncOnly=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
+      ignoreDifferences:
+      - group: apps
+        kind: Deployment
+        jsonPointers:
+        - /spec/replicas
+      - group: aap.ansible.com
+        kind: AnsibleAutomationPlatform
+        jsonPointers:
+        - /spec/database
+      - group: '*'
+        kind: '*'
+        jsonPointers:
+        - /status
+  templatePatch: |
+    spec:
+      source:
+        kustomize:
+          patches:
+            - target:
+                group: aap.ansible.com
+                version: v1alpha1
+                kind: AnsibleAutomationPlatform
+                name: aap
+              patch: |-
+                - op: replace
+                  path: /spec/public_base_url
+                  value: {{ .workloads.platform.public_base_url | toJson }}
+                - op: replace
+                  path: /spec/extra_settings
+                  value:
+                    - setting: CSRF_TRUSTED_ORIGINS
+                      value:
+                        - {{ .workloads.platform.public_base_url | toJson }}
+                        - {{ .workloads.platform.route_url | toJson }}
+  generators:
+  - matrix:
+      generators:
+      - matrix:
+          generators:
+          - git:
+              repoURL: https://github.com/ansible-automation-platform/aap-ha-dr-gitops/
+              revision: main
+              pathParamPrefix: pair
+              files:
+              - path: examples/aws-rosa-pair/deployment/argocd/pairs/*.yaml
+          - list:
+              elementsYaml: '[{{ range $i, $id := .member_environments }}{{ if $i }},{{ end }}{"environment_id":{{
+                $id | toJson }}}{{ end }}]'
+      - git:
+          repoURL: https://github.com/ansible-automation-platform/aap-ha-dr-gitops/
+          revision: main
+          pathParamPrefix: environment
+          files:
+          - path: examples/aws-rosa-pair/deployment/argocd/environments/{{ .environment_id }}.yaml
+    selector:
+      matchLabels:
+        target_cluster_id: example-a
+
+---

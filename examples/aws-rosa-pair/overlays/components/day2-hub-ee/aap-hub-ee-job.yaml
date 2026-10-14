@@ -1,0 +1,150 @@
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: aap-hub-ee-setup
+  namespace: aap
+  annotations:
+    argocd.argoproj.io/sync-wave: "25"
+spec:
+  schedule: "*/45 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      ttlSecondsAfterFinished: 300
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: hub-ee-setup
+            image: registry.access.redhat.com/ubi9/skopeo:latest
+            command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+
+              SRC_URL="registry.redhat.io"
+              DST_URL="aap.aap.svc.cluster.local"
+              IMAGE_LIST="ansible-automation-platform-25/ee-supported-rhel9 ansible-automation-platform-26/ee-supported-rhel9"
+              echo "Waiting for AAP gateway..."
+              GATEWAY_READY=0
+              for i in $(seq 1 60); do
+                STATUS=$(curl -sk http://aap.aap.svc.cluster.local/api/gateway/v1/ping/ 2>/dev/null | grep -o '"status":"[^"]*"' | head -1)
+                if echo "$STATUS" | grep -q "good"; then
+                  echo "Gateway is ready"
+                  GATEWAY_READY=1
+                  break
+                fi
+                echo "  attempt $i: $STATUS"
+                sleep 10
+              done
+              if [ "$GATEWAY_READY" = "0" ]; then
+                echo "ERROR: AAP gateway is not ready"
+                exit 1
+              fi
+
+              SRC_AUTHFILE="/tmp/src-auth.json"
+              DST_AUTHFILE="/tmp/dst-auth.json"
+
+              echo "Logging into source registry..."
+              skopeo login --authfile "${SRC_AUTHFILE}" -u "${SRC_USER}" -p "${SRC_PASS}" "${SRC_URL}"
+
+              echo "Logging into destination registry..."
+              skopeo login --authfile "${DST_AUTHFILE}" --tls-verify=false -u "${ADMIN_USER}" -p "${ADMIN_PASS}" "${DST_URL}"
+
+              # Wait for Hub API to be responsive (may be reconciling after CR change)
+              echo "Checking Hub container registry is ready..."
+              HUB_READY=0
+              for i in $(seq 1 60); do
+                HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
+                  -u "${ADMIN_USER}:${ADMIN_PASS}" \
+                  "http://${DST_URL}/v2/" 2>/dev/null || echo "000")
+                if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "401" ]; then
+                  echo "Hub container registry is ready (HTTP ${HTTP_CODE})"
+                  HUB_READY=1
+                  break
+                fi
+                echo "  attempt $i: HTTP ${HTTP_CODE} — waiting for Hub..."
+                sleep 10
+              done
+              if [ "$HUB_READY" = "0" ]; then
+                echo "ERROR: Hub container registry not ready after 10 minutes"
+                exit 1
+              fi
+
+              FAILED=0
+              for IMAGE in ${IMAGE_LIST}; do
+                echo ""
+                echo "=== Processing ${IMAGE} ==="
+
+                ALL_TAGS=$(skopeo list-tags --authfile "${SRC_AUTHFILE}" "docker://${SRC_URL}/${IMAGE}" 2>&1) || {
+                  echo "Failed to list tags for ${IMAGE}: ${ALL_TAGS}"
+                  FAILED=1
+                  continue
+                }
+
+                TAG_FORMAT='[0-9]\.[0-9]'
+                FILTERED_TAGS=$(echo "$ALL_TAGS" | sed 's/.*\[//;s/\].*//' | tr ',' '\n' | tr -d '" ' | grep -Eo "${TAG_FORMAT}" | sort -rVu || true)
+                TAG_LIST="latest
+                ${FILTERED_TAGS}"
+
+                echo -e "Tags to sync:\n${TAG_LIST}"
+
+                for TAG in ${TAG_LIST}; do
+                  echo "Copying ${IMAGE}:${TAG}..."
+                  COPY_OK=0
+                  for ATTEMPT in 1 2 3; do
+                    if skopeo copy --remove-signatures \
+                      --src-authfile "${SRC_AUTHFILE}" \
+                      --dest-authfile "${DST_AUTHFILE}" \
+                      --dest-tls-verify=false \
+                      "docker://${SRC_URL}/${IMAGE}:${TAG}" \
+                      "docker://${DST_URL}/${IMAGE}:${TAG}"; then
+                      COPY_OK=1
+                      break
+                    fi
+                    echo "  Attempt ${ATTEMPT}/3 failed, retrying in 30s..."
+                    sleep 30
+                  done
+                  if [ "$COPY_OK" = "0" ]; then
+                    echo "Failed to copy ${IMAGE}:${TAG} after 3 attempts"
+                    FAILED=1
+                  fi
+                done
+              done
+
+              echo ""
+              if [ "$FAILED" = "1" ]; then
+                echo "Some image copies failed"
+                exit 1
+              fi
+              echo "All execution environment images synced successfully"
+            env:
+            - name: ADMIN_USER
+              value: "admin"
+            - name: ADMIN_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: aap-admin-password
+                  key: password
+            - name: SRC_USER
+              valueFrom:
+                secretKeyRef:
+                  name: registry-redhat-io-pull-secret
+                  key: username
+            - name: SRC_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: registry-redhat-io-pull-secret
+                  key: password
+            resources:
+              requests:
+                cpu: 100m
+                memory: 128Mi
+              limits:
+                cpu: 500m
+                memory: 512Mi

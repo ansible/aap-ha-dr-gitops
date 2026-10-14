@@ -1,0 +1,9 @@
+---
+requires_ansible: ">=2.14.0"
+action_groups:
+  hadr_ops:
+    - cnpg_backup_manage
+    - cnpg_cluster_info
+    - cnpg_switchover_step
+    - aap_platform_scale
+    - argocd_application_update

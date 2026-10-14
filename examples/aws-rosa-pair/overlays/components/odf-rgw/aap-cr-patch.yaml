@@ -1,0 +1,24 @@
+apiVersion: aap.ansible.com/v1alpha1
+kind: AnsibleAutomationPlatform
+metadata:
+  name: aap
+spec:
+  route_annotations: |
+    haproxy.router.openshift.io/timeout: '600s'
+    haproxy.router.openshift.io/set-forwarded-headers: 'never'
+  gateway_timeouts:
+    - gateway_route_name: "hub container registry"
+      request_timeout_seconds: 600
+      idle_timeout_seconds: 600
+    - gateway_route_name: "pulp content"
+      request_timeout_seconds: 600
+      idle_timeout_seconds: 600
+    - gateway_route_name: "galaxy api"
+      request_timeout_seconds: 600
+      idle_timeout_seconds: 600
+  hub:
+    storage_type: s3
+    object_storage_s3_secret: hub-rgw-s3-credentials
+    pulp_settings:
+      redirect_to_object_storage: false
+      token_expiration_time: 86400

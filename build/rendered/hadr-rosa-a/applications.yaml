@@ -1,0 +1,540 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  annotations:
+    argocd.argoproj.io/compare-options: IgnoreExtraneous
+    argocd.argoproj.io/sync-options: Prune=false
+  labels:
+    aap.hadr.redhat.com/environment: rosa-hadr-01-a
+    aap.hadr.redhat.com/pair: rosa-hadr-01
+  name: aap-eso
+  namespace: openshift-gitops
+spec:
+  destination:
+    namespace: aap
+    server: https://kubernetes.default.svc
+  ignoreDifferences:
+  - group: external-secrets.io
+    jqPathExpressions:
+    - .spec.data[]?.remoteRef.conversionStrategy
+    - .spec.data[]?.remoteRef.decodingStrategy
+    - .spec.data[]?.remoteRef.metadataPolicy
+    kind: ExternalSecret
+  - group: '*'
+    jsonPointers:
+    - /status
+    kind: '*'
+  project: default
+  source:
+    kustomize:
+      patches:
+      - patch: |
+          - op: replace
+            path: /spec/provider/aws/region
+            value: 'us-east-1'
+        target:
+          kind: ClusterSecretStore
+          name: cluster-cross-account-secret-store
+      - patch: |
+          - op: replace
+            path: /spec/dataFrom/0/extract/key
+            value: 'eso/aap/shared/aap-controller-secret-key'
+        target:
+          kind: ExternalSecret
+          name: aap-controller-secret-key
+      - patch: |
+          - op: replace
+            path: /spec/dataFrom/0/extract/key
+            value: 'eso/aap/shared/aap-hub-db-fields-encryption'
+        target:
+          kind: ExternalSecret
+          name: aap-hub-db-fields-encryption
+      - patch: |
+          - op: replace
+            path: /spec/dataFrom/0/extract/key
+            value: 'eso/aap/shared/aap-db-fields-encryption-secret'
+        target:
+          kind: ExternalSecret
+          name: aap-db-fields-encryption-secret
+      - patch: |
+          - op: replace
+            path: /spec/data/0/remoteRef/key
+            value: 'eso/aap/shared/aap-controller-receptor-ca'
+          - op: replace
+            path: /spec/data/1/remoteRef/key
+            value: 'eso/aap/shared/aap-controller-receptor-ca'
+        target:
+          kind: ExternalSecret
+          name: aap-controller-receptor-ca
+      - patch: |
+          - op: replace
+            path: /spec/dataFrom/0/extract/key
+            value: 'eso/aap/shared/aap-admin-password'
+        target:
+          kind: ExternalSecret
+          name: aap-admin-password
+      - patch: |
+          - op: replace
+            path: /spec/dataFrom/0/extract/key
+            value: 'eso/aap/shared/cnpg-init-sql'
+        target:
+          kind: ExternalSecret
+          name: cnpg-init-sql
+      - patch: |
+          - op: replace
+            path: /spec/dataFrom/0/extract/key
+            value: 'eso/aap/shared/aap-controller-admin-password'
+        target:
+          kind: ExternalSecret
+          name: aap-controller-admin-password
+      - patch: |
+          - op: replace
+            path: /spec/dataFrom/0/extract/key
+            value: 'eso/aap/shared/aap-controller-receptor-work-signing'
+        target:
+          kind: ExternalSecret
+          name: aap-controller-receptor-work-signing
+      - patch: |
+          - op: replace
+            path: /spec/dataFrom/0/extract/key
+            value: 'eso/aap/shared/aap-eda-admin-password'
+        target:
+          kind: ExternalSecret
+          name: aap-eda-admin-password
+      - patch: |
+          - op: replace
+            path: /spec/dataFrom/0/extract/key
+            value: 'eso/aap/shared/aap-eda-db-fields-encryption-secret'
+        target:
+          kind: ExternalSecret
+          name: aap-eda-db-fields-encryption-secret
+      - patch: |
+          - op: replace
+            path: /spec/dataFrom/0/extract/key
+            value: 'eso/aap/shared/aap-hub-admin-password'
+        target:
+          kind: ExternalSecret
+          name: aap-hub-admin-password
+      - patch: |
+          - op: replace
+            path: /spec/dataFrom/0/extract/key
+            value: 'eso/aap/shared/aap-hub-container-auth'
+        target:
+          kind: ExternalSecret
+          name: aap-hub-container-auth
+      - patch: |
+          - op: replace
+            path: /spec/dataFrom/0/extract/key
+            value: 'eso/aap/shared/aap-controller-postgres-configuration'
+        target:
+          kind: ExternalSecret
+          name: aap-controller-postgres-configuration
+      - patch: |
+          - op: replace
+            path: /spec/dataFrom/0/extract/key
+            value: 'eso/aap/shared/aap-gateway-postgres-configuration'
+        target:
+          kind: ExternalSecret
+          name: aap-gateway-postgres-configuration
+      - patch: |
+          - op: replace
+            path: /spec/dataFrom/0/extract/key
+            value: 'eso/aap/shared/aap-eda-postgres-configuration'
+        target:
+          kind: ExternalSecret
+          name: aap-eda-postgres-configuration
+      - patch: |
+          - op: replace
+            path: /spec/dataFrom/0/extract/key
+            value: 'eso/aap/shared/aap-eda-event-stream-postgres-configuration'
+        target:
+          kind: ExternalSecret
+          name: aap-eda-event-stream-postgres-configuration
+      - patch: |
+          - op: replace
+            path: /spec/dataFrom/0/extract/key
+            value: 'eso/aap/shared/aap-hub-postgres-configuration'
+        target:
+          kind: ExternalSecret
+          name: aap-hub-postgres-configuration
+      - patch: |
+          - op: replace
+            path: /spec/data/0/remoteRef/key
+            value: 'eso/aap/shared/cnpg-tls'
+          - op: replace
+            path: /spec/data/1/remoteRef/key
+            value: 'eso/aap/shared/cnpg-tls'
+        target:
+          kind: ExternalSecret
+          name: cnpg-ca
+    path: base/eso
+    repoURL: https://github.com/ansible-automation-platform/aap-hadr-example.git
+    targetRevision: main
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    retry:
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+      limit: 5
+    syncOptions:
+    - CreateNamespace=true
+    - SkipDryRunOnMissingResource=true
+    - ApplyOutOfSyncOnly=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  annotations:
+    argocd.argoproj.io/compare-options: IgnoreExtraneous
+    argocd.argoproj.io/sync-options: Prune=false
+  labels:
+    aap.hadr.redhat.com/environment: rosa-hadr-01-a
+    aap.hadr.redhat.com/pair: rosa-hadr-01
+    aap.hadr.redhat.com/rgw-role: primary
+  name: aap-odf
+  namespace: openshift-gitops
+spec:
+  destination:
+    namespace: aap
+    server: https://kubernetes.default.svc
+  ignoreDifferences:
+  - group: '*'
+    jsonPointers:
+    - /status
+    kind: '*'
+  project: default
+  source:
+    path: layers/odf-primary
+    repoURL: https://github.com/ansible-automation-platform/aap-hadr-example.git
+    targetRevision: main
+    kustomize:
+      patches:
+      - target:
+          group: ceph.rook.io
+          version: v1
+          kind: CephObjectZone
+          name: zone-template
+        patch: |-
+          - op: replace
+            path: /metadata/name
+            value: "rosa-a"
+          - op: replace
+            path: /spec/customEndpoints/0
+            value: "https://rgw-s3-replication-openshift-storage.apps.rosa.i8m2i7h2m5l3g4j.ff74.p3.openshiftapps.com"
+      - target:
+          group: ceph.rook.io
+          version: v1
+          kind: CephObjectStore
+          name: hub-objectstore
+        patch: |-
+          - op: replace
+            path: /spec/zone/name
+            value: "rosa-a"
+      - target:
+          group: ocs.openshift.io
+          version: v1
+          kind: StorageCluster
+          name: ocs-storagecluster
+        patch: |-
+          - op: replace
+            path: /spec/storageDeviceSets/0/dataPVCTemplate/spec/storageClassName
+            value: "gp3-csi"
+      - target:
+          kind: ExternalSecret
+          name: barman-rgw-credentials
+        patch: |
+          - op: replace
+            path: /spec/data/0/remoteRef/key
+            value: 'eso/aap/shared/hub-rgw-s3-credentials'
+          - op: replace
+            path: /spec/data/1/remoteRef/key
+            value: 'eso/aap/shared/hub-rgw-s3-credentials'
+      - target:
+          kind: ExternalSecret
+          name: hub-rgw-s3-credentials
+        patch: |
+          - op: replace
+            path: /spec/dataFrom/0/extract/key
+            value: 'eso/aap/shared/hub-rgw-s3-credentials'
+      - target:
+          kind: ExternalSecret
+          name: hub-realm-keys
+        patch: |
+          - op: replace
+            path: /spec/dataFrom/0/extract/key
+            value: 'eso/aap/shared/hub-realm-keys'
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    retry:
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+      limit: 5
+    syncOptions:
+    - CreateNamespace=true
+    - SkipDryRunOnMissingResource=true
+    - ApplyOutOfSyncOnly=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  annotations:
+    argocd.argoproj.io/compare-options: IgnoreExtraneous
+    argocd.argoproj.io/sync-options: Prune=false
+  labels:
+    aap.hadr.redhat.com/desired-role: primary
+    aap.hadr.redhat.com/environment: rosa-hadr-01-a
+    aap.hadr.redhat.com/pair: rosa-hadr-01
+  name: aap-cnpg
+  namespace: openshift-gitops
+spec:
+  destination:
+    namespace: aap
+    server: https://kubernetes.default.svc
+  ignoreDifferences:
+  - group: apps
+    jsonPointers:
+    - /spec/replicas
+    kind: Deployment
+  - group: postgresql.cnpg.io
+    jsonPointers:
+    - /spec/bootstrap
+    - /spec/replica/promotionToken
+    - /spec/affinity
+    - /spec/monitoring/customQueriesConfigMap
+    - /spec/monitoring/disableDefaultQueries
+    - /spec/monitoring/enablePodMonitor
+    - /spec/postgresGID
+    - /spec/postgresUID
+    - /spec/smartShutdownTimeout
+    - /spec/startDelay
+    - /spec/resources/claims
+    - /spec/enablePodAntiAffinity
+    - /spec/topologySpreadConstraints
+    - /spec/probes
+    - /spec/minSyncReplicas
+    - /spec/maxSyncReplicas
+    - /spec/primaryUpdateStrategy
+    - /spec/primaryUpdateMethod
+    - /spec/replicationSlots
+    - /spec/failoverDelay
+    - /spec/logLevel
+    - /spec/enablePDB
+    - /spec/enableSuperuserAccess
+    - /spec/storage/resizeInUseVolumes
+    - /spec/walStorage/resizeInUseVolumes
+    - /spec/monitoring
+    - /spec/postgresql
+    - /spec/resources/ephemeralVolumeSource
+    - /spec/backup/target
+    kind: Cluster
+  - group: '*'
+    jsonPointers:
+    - /status
+    kind: '*'
+  project: default
+  source:
+    kustomize:
+      patches:
+      - patch: |
+          - op: replace
+            path: /spec/replica/self
+            value: 'rosa-a'
+          - op: replace
+            path: /spec/replica/primary
+            value: 'rosa-a'
+          - op: replace
+            path: /spec/replica/source
+            value: 'rosa-b'
+          - op: replace
+            path: /spec/storage/storageClass
+            value: 'gp3-csi'
+          - op: replace
+            path: /spec/walStorage/storageClass
+            value: 'gp3-csi'
+          - op: replace
+            path: /spec/backup/retentionPolicy
+            value: 2d
+          - op: replace
+            path: /spec/backup/barmanObjectStore/destinationPath
+            value: 's3://cnpg-wal/rosa-a/'
+          - op: replace
+            path: /spec/externalClusters/0/name
+            value: 'rosa-a'
+          - op: replace
+            path: /spec/externalClusters/0/barmanObjectStore/destinationPath
+            value: 's3://cnpg-wal/rosa-a/'
+          - op: replace
+            path: /spec/externalClusters/0/connectionParameters/host
+            value: 'postgres-repl.rosa.i8m2i7h2m5l3g4j.ff74.p3.openshiftapps.com'
+          - op: replace
+            path: /spec/externalClusters/1/name
+            value: 'rosa-b'
+          - op: replace
+            path: /spec/externalClusters/1/barmanObjectStore/destinationPath
+            value: 's3://cnpg-wal/rosa-b/'
+          - op: replace
+            path: /spec/externalClusters/1/connectionParameters/host
+            value: 'postgres-repl.rosa.o5x7k1t3d0r6y3b.0re0.p3.openshiftapps.com'
+
+          - op: replace
+            path: /spec/bootstrap/initdb/database
+            value: postgres
+
+          - op: replace
+            path: /spec/storage/size
+            value: 2Ti
+          - op: replace
+            path: /spec/walStorage/size
+            value: 200Gi
+          - op: replace
+            path: /spec/instances
+            value: 3
+        target:
+          group: postgresql.cnpg.io
+          kind: Cluster
+          name: aap-postgres
+          version: v1
+      - patch: |-
+          - op: replace
+            path: /metadata/annotations/external-dns.alpha.kubernetes.io~1hostname
+            value: 'postgres-repl.rosa.i8m2i7h2m5l3g4j.ff74.p3.openshiftapps.com'
+        target:
+          kind: Service
+          name: aap-postgres-replication
+          version: v1
+      - patch: |-
+          - op: replace
+            path: /spec/data/0/remoteRef/property
+            value: 'rosa-a-server.crt'
+          - op: replace
+            path: /spec/data/1/remoteRef/property
+            value: 'rosa-a-server.key'
+        target:
+          group: external-secrets.io
+          kind: ExternalSecret
+          name: cnpg-server-tls
+          version: v1
+      - patch: |-
+          - op: replace
+            path: /spec/data/0/remoteRef/property
+            value: 'rosa-a-replication.crt'
+          - op: replace
+            path: /spec/data/1/remoteRef/property
+            value: 'rosa-a-replication.key'
+        target:
+          group: external-secrets.io
+          kind: ExternalSecret
+          name: cnpg-replication-tls
+          version: v1
+      - patch: |
+          - op: replace
+            path: /spec/data/0/remoteRef/key
+            value: 'eso/aap/shared/cnpg-tls'
+          - op: replace
+            path: /spec/data/1/remoteRef/key
+            value: 'eso/aap/shared/cnpg-tls'
+        target:
+          kind: ExternalSecret
+          name: cnpg-server-tls
+      - patch: |
+          - op: replace
+            path: /spec/data/0/remoteRef/key
+            value: 'eso/aap/shared/cnpg-tls'
+          - op: replace
+            path: /spec/data/1/remoteRef/key
+            value: 'eso/aap/shared/cnpg-tls'
+        target:
+          kind: ExternalSecret
+          name: cnpg-replication-tls
+    path: base/cnpg
+    repoURL: https://github.com/ansible-automation-platform/aap-hadr-example.git
+    targetRevision: main
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    retry:
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+      limit: 5
+    syncOptions:
+    - CreateNamespace=true
+    - SkipDryRunOnMissingResource=true
+    - ApplyOutOfSyncOnly=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  annotations:
+    argocd.argoproj.io/compare-options: IgnoreExtraneous
+    argocd.argoproj.io/sync-options: Prune=false
+  labels:
+    aap.hadr.redhat.com/desired-role: primary
+    aap.hadr.redhat.com/environment: rosa-hadr-01-a
+    aap.hadr.redhat.com/pair: rosa-hadr-01
+  name: aap-platform
+  namespace: openshift-gitops
+spec:
+  destination:
+    namespace: aap
+    server: https://kubernetes.default.svc
+  ignoreDifferences:
+  - group: apps
+    jsonPointers:
+    - /spec/replicas
+    kind: Deployment
+  - group: aap.ansible.com
+    jsonPointers:
+    - /spec/database
+    kind: AnsibleAutomationPlatform
+  - group: '*'
+    jsonPointers:
+    - /status
+    kind: '*'
+  project: default
+  source:
+    kustomize:
+      patches:
+      - target:
+          group: aap.ansible.com
+          version: v1alpha1
+          kind: AnsibleAutomationPlatform
+          name: aap
+        patch: |-
+          - op: replace
+            path: /spec/public_base_url
+            value: "https://proxy.aap-hadr-1.devcluster.openshift.com"
+          - op: replace
+            path: /spec/extra_settings
+            value:
+              - setting: CSRF_TRUSTED_ORIGINS
+                value:
+                  - "https://proxy.aap-hadr-1.devcluster.openshift.com"
+                  - "https://aap-aap.apps.rosa.i8m2i7h2m5l3g4j.ff74.p3.openshiftapps.com"
+    path: layers/platform-primary
+    repoURL: https://github.com/ansible-automation-platform/aap-hadr-example.git
+    targetRevision: main
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    retry:
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+      limit: 5
+    syncOptions:
+    - CreateNamespace=true
+    - SkipDryRunOnMissingResource=true
+    - ApplyOutOfSyncOnly=true

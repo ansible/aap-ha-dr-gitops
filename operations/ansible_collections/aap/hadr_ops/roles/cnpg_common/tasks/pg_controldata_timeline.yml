@@ -1,0 +1,45 @@
+---
+# Get the WAL timeline ID from a CNPG pod via pg_controldata.
+#
+# Required variables:
+#   _timeline_context:   Kubernetes context name
+#   _timeline_labels:    Label selector string (e.g. "cnpg.io/cluster=aap-postgres")
+#
+# Optional variables:
+#   _timeline_kubeconfig:       Path to kubeconfig (default: omitted)
+#   _timeline_field_selectors:  Field selector list (default: ["status.phase=Running"])
+#
+# Output variables:
+#   _timeline_pod:    Name of the pod found
+#   _timeline_value:  Timeline ID as a string (e.g. "41")
+
+- name: "pg_controldata_timeline | Find pod matching {{ _timeline_labels }}"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ aap_namespace }}"
+    label_selectors: "{{ _timeline_labels.split(',') }}"
+    field_selectors: "{{ _timeline_field_selectors | default(['status.phase=Running']) }}"
+    context: "{{ _timeline_context }}"
+    kubeconfig: "{{ _timeline_kubeconfig | default(omit) }}"
+  register: _timeline_pod_list
+
+- name: "pg_controldata_timeline | Set pod name"
+  ansible.builtin.set_fact:
+    _timeline_pod: "{{ (_timeline_pod_list.resources | default([]) | first | default({})).metadata.name | default('') }}"
+    _timeline_value: "0"
+
+- name: "pg_controldata_timeline | Read pg_controldata from {{ _timeline_pod }}"
+  kubernetes.core.k8s_exec:
+    namespace: "{{ aap_namespace }}"
+    pod: "{{ _timeline_pod }}"
+    command: "pg_controldata /var/lib/postgresql/data/pgdata"
+    context: "{{ _timeline_context }}"
+    kubeconfig: "{{ _timeline_kubeconfig | default(omit) }}"
+  register: _timeline_exec_result
+  when: _timeline_pod | length > 0
+
+- name: "pg_controldata_timeline | Parse timeline ID from output"
+  ansible.builtin.set_fact:
+    _timeline_value: "{{ _timeline_exec_result.stdout | regex_search('Latest checkpoint.s TimeLineID:\\s+(\\d+)', '\\1') | first | default('0') }}"
+  when: _timeline_pod | length > 0 and _timeline_exec_result.stdout | default('') | length > 0

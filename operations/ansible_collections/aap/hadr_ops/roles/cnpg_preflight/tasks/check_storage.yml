@@ -1,0 +1,279 @@
+---
+# Check storage health on a single CNPG cluster
+#
+# Validates:
+#   A) Object storage availability (WAL archive destination)
+#   B) PVC binding and disk capacity
+#   C) Storage class provisioner health
+#
+# Input:
+#   preflight_context — K8s context of the target cluster
+#   aap_namespace, cluster_name
+#   preflight_pvc_warn_threshold (default: 80)
+#   preflight_pvc_abort_threshold (default: 90)
+#
+# Output (set_fact):
+#   storage_check_result — dict with status, sub-check results, detail
+
+- name: Validate preflight_context is set
+  ansible.builtin.fail:
+    msg: "preflight_context must be set"
+  when: preflight_context | default('') == ''
+
+# ── A) Object Storage (WAL archive) ─────────────────────────────
+
+- name: Get CNPG cluster spec for barman config
+  aap.hadr_ops.cnpg_cluster_info:
+    namespace: "{{ aap_namespace }}"
+    cluster_name: "{{ cluster_name }}"
+    context: "{{ preflight_context }}"
+  register: _sc_cluster_info
+  failed_when: false
+
+- name: Determine primary pod
+  ansible.builtin.set_fact:
+    _sc_primary_pod: >-
+      {{ _sc_cluster_info.cluster_info.status.currentPrimary | default('')
+         if (_sc_cluster_info is succeeded and _sc_cluster_info.cluster_info is defined)
+         else '' }}
+    _sc_has_barman: >-
+      {{ (_sc_cluster_info.cluster_info.spec.backup is defined and
+          _sc_cluster_info.cluster_info.spec.backup.barmanObjectStore is defined)
+         if (_sc_cluster_info is succeeded and _sc_cluster_info.cluster_info is defined)
+         else false }}
+
+- name: Check WAL archiver status via pg_stat_archiver
+  when: _sc_primary_pod | trim != '' and (_sc_has_barman | bool)
+  ansible.builtin.include_role:
+    name: aap.hadr_ops.cnpg_common
+    tasks_from: psql_query.yml
+  vars:
+    _query_context: "{{ preflight_context }}"
+    _query_labels: "cnpg.io/cluster={{ cluster_name }},cnpg.io/instanceRole=primary"
+    _query: >-
+      SELECT row_to_json(a) FROM (SELECT archived_count, failed_count,
+      last_archived_time, last_failed_time FROM pg_stat_archiver) a;
+
+- name: Save archiver query result
+  ansible.builtin.set_fact:
+    _sc_archiver_ok: "{{ _query_result.return_code | default(1) | int == 0 }}"
+    _sc_archiver_stdout: "{{ _query_result.stdout | default('') }}"
+
+- name: Evaluate object storage health
+  ansible.builtin.set_fact:
+    _sc_objstore_status: >-
+      {% if not (_sc_has_barman | bool) %}skip
+      {% elif not (_sc_archiver_ok | default(false) | bool) %}warn
+      {% else %}pass{% endif %}
+    _sc_objstore_detail: >-
+      {% if not (_sc_has_barman | bool) %}No barman object store configured
+      {% elif not (_sc_archiver_ok | default(false) | bool) %}Cannot query archiver status
+      {% else %}Archiver reachable ({{ _sc_archiver_stdout | default('') | truncate(80) }}){% endif %}
+
+# ── B) PVC Binding and Disk Capacity ────────────────────────────
+
+- name: Get CNPG PVCs on {{ preflight_context }}
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: PersistentVolumeClaim
+    namespace: "{{ aap_namespace }}"
+    context: "{{ preflight_context }}"
+    label_selectors:
+      - "cnpg.io/cluster={{ cluster_name }}"
+  register: _sc_pvcs
+  failed_when: false
+
+- name: Evaluate PVC binding status
+  ansible.builtin.set_fact:
+    _sc_pvc_list: "{{ _sc_pvcs.resources | default([]) if (_sc_pvcs is defined and _sc_pvcs is succeeded) else [] }}"
+
+- name: Count unbound PVCs
+  ansible.builtin.set_fact:
+    _sc_unbound: "{{ _sc_pvc_list | rejectattr('status.phase', 'eq', 'Bound') | list }}"
+
+- name: Check disk usage on primary pod
+  when: _sc_primary_pod | trim != ''
+  kubernetes.core.k8s_exec:
+    namespace: "{{ aap_namespace }}"
+    pod: "{{ _sc_primary_pod | trim }}"
+    command: "df --output=pcent /var/lib/postgresql/data"
+    context: "{{ preflight_context }}"
+  register: _sc_df
+  failed_when: false
+
+- name: Parse disk usage percentage
+  ansible.builtin.set_fact:
+    _sc_df_failed: "{{ (_sc_df is failed) or (_sc_df.return_code | default(1) | int != 0) }}"
+    _sc_disk_pct: >-
+      {{ (_sc_df.stdout_lines | default(['', '0']) | last | trim | replace('%', '') | int)
+         if (not ((_sc_df is failed) or (_sc_df.return_code | default(1) | int != 0)))
+         else -1 }}
+
+- name: Evaluate PVC status
+  ansible.builtin.set_fact:
+    _sc_pvc_status: >-
+      {% if (_sc_pvcs is failed) %}fail
+      {% elif (_sc_unbound | length > 0) %}fail
+      {% elif (_sc_df_failed | bool) %}fail
+      {% elif (_sc_disk_pct | int) > (preflight_pvc_abort_threshold | default(90) | int) %}fail
+      {% elif (_sc_disk_pct | int) > (preflight_pvc_warn_threshold | default(80) | int) %}warn
+      {% else %}pass{% endif %}
+    _sc_pvc_detail: >-
+      {% if (_sc_pvcs is failed) %}Cannot query PVCs
+      {% elif (_sc_df_failed | bool) %}Cannot read disk usage from primary pod (exec failed)
+      {% elif (_sc_unbound | length > 0) %}{{ _sc_unbound | length }} PVC(s) not bound
+      {% else %}disk={{ _sc_disk_pct }}%, PVCs={{ _sc_pvc_list | length }} all bound{% endif %}
+
+# ── C) Storage Class Provisioner ────────────────────────────────
+
+- name: Get default StorageClass
+  kubernetes.core.k8s_info:
+    api_version: storage.k8s.io/v1
+    kind: StorageClass
+    context: "{{ preflight_context }}"
+  register: _sc_classes
+  failed_when: false
+
+- name: Check CSI driver pods
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ csi_drivers_namespace }}"
+    context: "{{ preflight_context }}"
+  register: _sc_csi_pods
+  failed_when: false
+
+- name: Evaluate storage class provisioner health
+  vars:
+    _has_sc: "{{ (_sc_classes.resources | default([]) | length > 0) if (_sc_classes is defined and _sc_classes is not failed) else false }}"
+    _csi_query_failed: "{{ (_sc_csi_pods is failed) or (_sc_csi_pods.resources is not defined) }}"
+    _csi_pods: "{{ _sc_csi_pods.resources | default([]) if (not _csi_query_failed) else [] }}"
+    _csi_running: "{{ _csi_pods | selectattr('status.phase', 'eq', 'Running') | list }}"
+  ansible.builtin.set_fact:
+    _sc_provisioner_status: >-
+      {% if not (_has_sc | bool) %}fail
+      {% elif _csi_query_failed %}warn
+      {% elif (_csi_pods | length == 0) %}warn
+      {% elif (_csi_running | length == 0) %}fail
+      {% else %}pass{% endif %}
+    _sc_provisioner_detail: >-
+      {% if _csi_query_failed %}Cannot query CSI pods (namespace may not exist or RBAC denied)
+      {% else %}StorageClasses={{ _sc_classes.resources | default([]) | length }}, CSI pods={{ _csi_running | length }}/{{ _csi_pods | length }}{% endif %}
+
+# ── D) Hub Storage (S3 secret or RWX PVC) ──────────────────────
+
+- name: Get AAP CR to determine hub storage type
+  kubernetes.core.k8s_info:
+    api_version: aap.ansible.com/v1alpha1
+    kind: AnsibleAutomationPlatform
+    namespace: "{{ aap_namespace }}"
+    context: "{{ preflight_context }}"
+  register: _sc_aap_cr
+  failed_when: false
+
+- name: Determine hub storage configuration
+  vars:
+    _aap_spec: "{{ (_sc_aap_cr.resources | default([]) | first | default({})).spec | default({}) }}"
+    _hub_spec: "{{ _aap_spec.hub | default({}) }}"
+  ansible.builtin.set_fact:
+    _sc_hub_storage_type: "{{ _hub_spec.storage_type | default('file') }}"
+    _sc_hub_s3_secret_name: "{{ _hub_spec.object_storage_s3_secret | default('') }}"
+
+- name: "D) Check Hub S3 credentials secret exists"
+  when: _sc_hub_storage_type == 's3' and _sc_hub_s3_secret_name | trim != ''
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: "{{ _sc_hub_s3_secret_name }}"
+    namespace: "{{ aap_namespace }}"
+    context: "{{ preflight_context }}"
+  register: _sc_hub_s3_secret
+  failed_when: false
+
+- name: "D) Check Hub RWX PVC is bound"
+  when: _sc_hub_storage_type == 'file'
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: PersistentVolumeClaim
+    namespace: "{{ aap_namespace }}"
+    context: "{{ preflight_context }}"
+    label_selectors:
+      - "app.kubernetes.io/component=automation-hub"
+  register: _sc_hub_pvc
+  failed_when: false
+
+- name: Evaluate hub storage health
+  vars:
+    _s3_secret_exists: >-
+      {{ (_sc_hub_s3_secret.resources | default([]) | length > 0)
+         if (_sc_hub_s3_secret is defined and _sc_hub_s3_secret is not failed)
+         else false }}
+    _rwx_bound: >-
+      {{ (_sc_hub_pvc.resources | default([]) | selectattr('status.phase', 'eq', 'Bound') | list | length > 0)
+         if (_sc_hub_pvc is defined and _sc_hub_pvc is not failed)
+         else false }}
+  ansible.builtin.set_fact:
+    _sc_hub_status: >-
+      {% if _sc_hub_storage_type == 's3' and _sc_hub_s3_secret_name | trim == '' %}warn
+      {% elif _sc_hub_storage_type == 's3' and not (_s3_secret_exists | bool) %}fail
+      {% elif _sc_hub_storage_type == 'file' and not (_rwx_bound | bool) %}fail
+      {% else %}pass{% endif %}
+    _sc_hub_detail: >-
+      {% if _sc_hub_storage_type == 's3' and _sc_hub_s3_secret_name | trim == '' %}Hub uses S3 but no secret name configured in CR
+      {% elif _sc_hub_storage_type == 's3' and not (_s3_secret_exists | bool) %}Hub S3 secret '{{ _sc_hub_s3_secret_name }}' not found in namespace {{ aap_namespace }}
+      {% elif _sc_hub_storage_type == 'file' and not (_rwx_bound | bool) %}Hub RWX PVC not bound (file storage mode)
+      {% elif _sc_hub_storage_type == 's3' %}Hub S3 secret '{{ _sc_hub_s3_secret_name }}' present
+      {% else %}Hub RWX PVC bound{% endif %}
+
+# ── Build combined result ───────────────────────────────────────
+
+- name: Build storage check result
+  vars:
+    _worst: >-
+      {% if (_sc_pvc_status | trim) == 'fail' or (_sc_provisioner_status | trim) == 'fail' or (_sc_hub_status | default('pass') | trim) == 'fail' %}fail
+      {% elif (_sc_pvc_status | trim) == 'warn' or (_sc_provisioner_status | trim) == 'warn' or (_sc_objstore_status | trim) == 'warn' or (_sc_hub_status | default('pass') | trim) == 'warn' %}warn
+      {% else %}pass{% endif %}
+  ansible.builtin.set_fact:
+    storage_check_result:
+      context: "{{ preflight_context }}"
+      status: "{{ _worst | trim }}"
+      object_storage:
+        status: "{{ _sc_objstore_status | trim }}"
+        detail: "{{ _sc_objstore_detail | trim }}"
+      pvc:
+        status: "{{ _sc_pvc_status | trim }}"
+        disk_percent: "{{ _sc_disk_pct | int }}"
+        pvc_count: "{{ _sc_pvc_list | length }}"
+        unbound_count: "{{ _sc_unbound | length }}"
+        detail: "{{ _sc_pvc_detail | trim }}"
+      provisioner:
+        status: "{{ _sc_provisioner_status | trim }}"
+        detail: "{{ _sc_provisioner_detail | trim }}"
+      hub_storage:
+        status: "{{ _sc_hub_status | default('pass') | trim }}"
+        type: "{{ _sc_hub_storage_type | default('unknown') }}"
+        detail: "{{ _sc_hub_detail | default('not checked') | trim }}"
+      disk_percent: "{{ _sc_disk_pct | int }}"
+      pvc_count: "{{ _sc_pvc_list | length }}"
+      unbound_count: "{{ _sc_unbound | length }}"
+      primary_pod: "{{ _sc_primary_pod | trim }}"
+      error: >-
+        {% if (_sc_pvc_status | trim) == 'fail' %}{{ _sc_pvc_detail | trim }}
+        {% elif (_sc_hub_status | default('pass') | trim) == 'fail' %}{{ _sc_hub_detail | default('') | trim }}
+        {% elif (_sc_provisioner_status | trim) == 'fail' %}Storage provisioner unhealthy: {{ _sc_provisioner_detail | trim }}
+        {% elif (_sc_objstore_status | trim) == 'warn' %}Object storage check inconclusive: {{ _sc_objstore_detail | trim }}
+        {% elif (_sc_pvc_status | trim) == 'warn' %}{{ _sc_pvc_detail | trim }}
+        {% elif (_sc_hub_status | default('pass') | trim) == 'warn' %}{{ _sc_hub_detail | default('') | trim }}
+        {% elif (_sc_provisioner_status | trim) == 'warn' %}{{ _sc_provisioner_detail | trim }}
+        {% else %}{% endif %}
+
+- name: Log storage check result
+  ansible.builtin.debug:
+    msg:
+      - "Storage Check: {{ preflight_context }}"
+      - "  Status:       {{ storage_check_result.status | trim }}"
+      - "  A) ObjStore:  {{ storage_check_result.object_storage.status | trim }} — {{ storage_check_result.object_storage.detail | trim }}"
+      - "  B) PVC:       {{ storage_check_result.pvc.status | trim }} — {{ storage_check_result.pvc.detail | trim }}"
+      - "  C) Provisioner: {{ storage_check_result.provisioner.status | trim }} — {{ storage_check_result.provisioner.detail | trim }}"
+      - "  D) Hub:       {{ storage_check_result.hub_storage.status | trim }} — {{ storage_check_result.hub_storage.detail | trim }} (type={{ storage_check_result.hub_storage.type }})"
+      - "  Error:        {{ storage_check_result.error | trim | default('none') }}"

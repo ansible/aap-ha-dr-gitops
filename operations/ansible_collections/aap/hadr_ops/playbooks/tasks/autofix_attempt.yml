@@ -1,0 +1,19 @@
+---
+# Autofix retry loop — applies a fix, waits, re-runs the check, and
+# loops up to autofix_max_retries times.
+#
+# Input vars (passed from autofix_gate.yml):
+#   _fix_task_file:     relative path to fix task (e.g. "fixes/fix_chk05_split_brain.yml")
+#   _recheck_task_file: relative path to check task (e.g. "chk05_split_brain.yml")
+#
+# Input facts:
+#   _check_key, _check_name, _check_status, _check_detail
+#   autofix_max_retries, autofix_retry_delay
+
+- name: "{{ _check_name }}: Autofix loop"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/autofix_single_attempt.yml"
+  loop: "{{ range(autofix_max_retries | default(2) | int) | list }}"
+  loop_control:
+    loop_var: _fix_attempt_index
+    label: "attempt {{ _fix_attempt_index + 1 }}/{{ autofix_max_retries | default(2) }}"
+  when: (_current_check_status | default(_check_status) | trim) == 'fail'

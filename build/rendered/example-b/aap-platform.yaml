@@ -1,0 +1,936 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+  name: aap
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "25"
+  name: aap-hub-ee-setup
+  namespace: aap
+spec:
+  concurrencyPolicy: Forbid
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      template:
+        spec:
+          containers:
+          - command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+
+              SRC_URL="registry.redhat.io"
+              DST_URL="aap.aap.svc.cluster.local"
+              IMAGE_LIST="ansible-automation-platform-25/ee-supported-rhel9 ansible-automation-platform-26/ee-supported-rhel9"
+              echo "Waiting for AAP gateway..."
+              GATEWAY_READY=0
+              for i in $(seq 1 60); do
+                STATUS=$(curl -sk http://aap.aap.svc.cluster.local/api/gateway/v1/ping/ 2>/dev/null | grep -o '"status":"[^"]*"' | head -1)
+                if echo "$STATUS" | grep -q "good"; then
+                  echo "Gateway is ready"
+                  GATEWAY_READY=1
+                  break
+                fi
+                echo "  attempt $i: $STATUS"
+                sleep 10
+              done
+              if [ "$GATEWAY_READY" = "0" ]; then
+                echo "ERROR: AAP gateway is not ready"
+                exit 1
+              fi
+
+              SRC_AUTHFILE="/tmp/src-auth.json"
+              DST_AUTHFILE="/tmp/dst-auth.json"
+
+              echo "Logging into source registry..."
+              skopeo login --authfile "${SRC_AUTHFILE}" -u "${SRC_USER}" -p "${SRC_PASS}" "${SRC_URL}"
+
+              echo "Logging into destination registry..."
+              skopeo login --authfile "${DST_AUTHFILE}" --tls-verify=false -u "${ADMIN_USER}" -p "${ADMIN_PASS}" "${DST_URL}"
+
+              # Wait for Hub API to be responsive (may be reconciling after CR change)
+              echo "Checking Hub container registry is ready..."
+              HUB_READY=0
+              for i in $(seq 1 60); do
+                HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
+                  -u "${ADMIN_USER}:${ADMIN_PASS}" \
+                  "http://${DST_URL}/v2/" 2>/dev/null || echo "000")
+                if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "401" ]; then
+                  echo "Hub container registry is ready (HTTP ${HTTP_CODE})"
+                  HUB_READY=1
+                  break
+                fi
+                echo "  attempt $i: HTTP ${HTTP_CODE} — waiting for Hub..."
+                sleep 10
+              done
+              if [ "$HUB_READY" = "0" ]; then
+                echo "ERROR: Hub container registry not ready after 10 minutes"
+                exit 1
+              fi
+
+              FAILED=0
+              for IMAGE in ${IMAGE_LIST}; do
+                echo ""
+                echo "=== Processing ${IMAGE} ==="
+
+                ALL_TAGS=$(skopeo list-tags --authfile "${SRC_AUTHFILE}" "docker://${SRC_URL}/${IMAGE}" 2>&1) || {
+                  echo "Failed to list tags for ${IMAGE}: ${ALL_TAGS}"
+                  FAILED=1
+                  continue
+                }
+
+                TAG_FORMAT='[0-9]\.[0-9]'
+                FILTERED_TAGS=$(echo "$ALL_TAGS" | sed 's/.*\[//;s/\].*//' | tr ',' '\n' | tr -d '" ' | grep -Eo "${TAG_FORMAT}" | sort -rVu || true)
+                TAG_LIST="latest
+                ${FILTERED_TAGS}"
+
+                echo -e "Tags to sync:\n${TAG_LIST}"
+
+                for TAG in ${TAG_LIST}; do
+                  echo "Copying ${IMAGE}:${TAG}..."
+                  COPY_OK=0
+                  for ATTEMPT in 1 2 3; do
+                    if skopeo copy --remove-signatures \
+                      --src-authfile "${SRC_AUTHFILE}" \
+                      --dest-authfile "${DST_AUTHFILE}" \
+                      --dest-tls-verify=false \
+                      "docker://${SRC_URL}/${IMAGE}:${TAG}" \
+                      "docker://${DST_URL}/${IMAGE}:${TAG}"; then
+                      COPY_OK=1
+                      break
+                    fi
+                    echo "  Attempt ${ATTEMPT}/3 failed, retrying in 30s..."
+                    sleep 30
+                  done
+                  if [ "$COPY_OK" = "0" ]; then
+                    echo "Failed to copy ${IMAGE}:${TAG} after 3 attempts"
+                    FAILED=1
+                  fi
+                done
+              done
+
+              echo ""
+              if [ "$FAILED" = "1" ]; then
+                echo "Some image copies failed"
+                exit 1
+              fi
+              echo "All execution environment images synced successfully"
+            env:
+            - name: ADMIN_USER
+              value: admin
+            - name: ADMIN_PASS
+              valueFrom:
+                secretKeyRef:
+                  key: password
+                  name: aap-admin-password
+            - name: SRC_USER
+              valueFrom:
+                secretKeyRef:
+                  key: username
+                  name: registry-redhat-io-pull-secret
+            - name: SRC_PASS
+              valueFrom:
+                secretKeyRef:
+                  key: password
+                  name: registry-redhat-io-pull-secret
+            image: registry.access.redhat.com/ubi9/skopeo:latest
+            name: hub-ee-setup
+            resources:
+              limits:
+                cpu: 500m
+                memory: 512Mi
+              requests:
+                cpu: 100m
+                memory: 128Mi
+          restartPolicy: OnFailure
+      ttlSecondsAfterFinished: 300
+  schedule: '*/45 * * * *'
+  successfulJobsHistoryLimit: 1
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "25"
+  name: aap-hub-remotes-setup
+  namespace: aap
+spec:
+  concurrencyPolicy: Forbid
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      template:
+        spec:
+          containers:
+          - command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+
+              HUB_API="http://aap.aap.svc.cluster.local/api/galaxy/pulp/api/v3"
+              AUTH_URL="https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token"
+              CERTIFIED_URL="https://console.redhat.com/api/automation-hub/content/published/"
+              VALIDATED_URL="https://console.redhat.com/api/automation-hub/content/validated/"
+
+              echo "Waiting for AAP gateway..."
+              GATEWAY_READY=0
+              for i in $(seq 1 60); do
+                STATUS=$(curl -sk http://aap.aap.svc.cluster.local/api/gateway/v1/ping/ 2>/dev/null | grep -o '"status":"[^"]*"' | head -1)
+                if echo "$STATUS" | grep -q "good"; then
+                  echo "Gateway is ready"
+                  GATEWAY_READY=1
+                  break
+                fi
+                echo "  attempt $i: $STATUS"
+                sleep 10
+              done
+              if [ "$GATEWAY_READY" = "0" ]; then
+                echo "ERROR: AAP gateway is not ready"
+                exit 1
+              fi
+
+              AUTH="-u ${ADMIN_USER}:${ADMIN_PASS}"
+              FAILED=0
+
+              # --- Helper: get remote by name ---
+              get_remote() {
+                curl -sk $AUTH "${HUB_API}/remotes/ansible/collection/?name=$1" \
+                  -H "Content-Type: application/json"
+              }
+
+              # --- Helper: get repository by name ---
+              get_repo() {
+                curl -sk $AUTH "${HUB_API}/repositories/ansible/ansible/?name=$1" \
+                  -H "Content-Type: application/json" || echo "get_repo failed"
+              }
+
+              # --- Helper: extract pulp_id from pulp_href ---
+              extract_pulp_id() {
+                echo "$1" | sed 's|/$||' | awk -F/ '{print $NF}'
+              }
+
+              # --- Helper: create a remote ---
+              create_remote() {
+                REMOTE_NAME="$1"
+                REMOTE_URL="$2"
+
+                echo "Creating remote '${REMOTE_NAME}'..."
+                RESPONSE=$(curl -sk -w "\n%{http_code}" $AUTH \
+                  -H "Content-Type: application/json" \
+                  -X POST "${HUB_API}/remotes/ansible/collection/" \
+                  -d "{
+                    \"name\": \"${REMOTE_NAME}\",
+                    \"url\": \"${REMOTE_URL}\",
+                    \"download_concurrency\": 10,
+                    \"policy\": \"immediate\",
+                    \"auth_url\": \"${AUTH_URL}\",
+                    \"token\": \"${OFFLINE_TOKEN}\"
+                  }")
+
+                HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+                BODY=$(echo "$RESPONSE" | sed '$d')
+
+                if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+                  echo "Remote '${REMOTE_NAME}' created successfully (HTTP ${HTTP_CODE})"
+                else
+                  echo "Failed to create remote '${REMOTE_NAME}': HTTP ${HTTP_CODE} - ${BODY}"
+                  return 1
+                fi
+              }
+
+              # --- Helper: update remote token ---
+              update_remote_token() {
+                REMOTE_NAME="$1"
+                PULP_ID="$2"
+
+                echo "Updating token for remote '${REMOTE_NAME}'..."
+                RESPONSE=$(curl -sk -w "\n%{http_code}" $AUTH \
+                  -H "Content-Type: application/json" \
+                  -X PATCH "${HUB_API}/remotes/ansible/collection/${PULP_ID}/" \
+                  -d "{
+                    \"token\": \"${OFFLINE_TOKEN}\"
+                  }")
+
+                HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+                BODY=$(echo "$RESPONSE" | sed '$d')
+
+                if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+                  echo "Token updated for remote '${REMOTE_NAME}' (HTTP ${HTTP_CODE})"
+                else
+                  echo "Failed to update token for remote '${REMOTE_NAME}': HTTP ${HTTP_CODE} - ${BODY}"
+                  return 1
+                fi
+              }
+
+              # --- Helper: associate remote with repository ---
+              associate_remote_to_repo() {
+                REPO_PULP_ID="$1"
+                REMOTE_HREF="$2"
+
+                echo "Associating remote with repository..."
+                RESPONSE=$(curl -sk -w "\n%{http_code}" $AUTH \
+                  -H "Content-Type: application/json" \
+                  -X PATCH "${HUB_API}/repositories/ansible/ansible/${REPO_PULP_ID}/" \
+                  -d "{
+                    \"remote\": \"${REMOTE_HREF}\"
+                  }")
+
+                HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+                BODY=$(echo "$RESPONSE" | sed '$d')
+
+                if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+                  echo "Remote associated with repository (HTTP ${HTTP_CODE})"
+                else
+                  echo "Failed to associate remote: HTTP ${HTTP_CODE} - ${BODY}"
+                  return 1
+                fi
+              }
+
+              # --- Helper: trigger repository sync ---
+              sync_repo() {
+                REPO_NAME="$1"
+                REPO_PULP_ID="$2"
+
+                echo "Triggering sync for repository '${REPO_NAME}'..."
+                RESPONSE=$(curl -sk -w "\n%{http_code}" $AUTH \
+                  -H "Content-Type: application/json" \
+                  -X POST "${HUB_API}/repositories/ansible/ansible/${REPO_PULP_ID}/sync/" \
+                  -d '{"optimize": true}')
+
+                HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+                BODY=$(echo "$RESPONSE" | sed '$d')
+
+                if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+                  TASK_HREF=$(echo "$BODY" | grep -o '"task":"[^"]*"' | head -1 | sed 's/"task":"//;s/"//')
+                  if [ -n "$TASK_HREF" ]; then
+                    echo "Sync started for '${REPO_NAME}', task: ${TASK_HREF}"
+                    echo "$TASK_HREF"
+                    return 0
+                  else
+                    echo "Sync accepted but no task href returned for '${REPO_NAME}'"
+                    return 1
+                  fi
+                else
+                  echo "Failed to trigger sync for '${REPO_NAME}': HTTP ${HTTP_CODE} - ${BODY}"
+                  return 1
+                fi
+              }
+
+              # --- Helper: wait for a Pulp task to complete ---
+              wait_for_task() {
+                TASK_HREF="$1"
+                REPO_NAME="$2"
+                MAX_WAIT=1800
+                INTERVAL=15
+                ELAPSED=0
+
+                echo "Waiting for '${REPO_NAME}' sync task to complete (timeout: ${MAX_WAIT}s)..."
+                while [ "$ELAPSED" -lt "$MAX_WAIT" ]; do
+                  TASK_DATA=$(curl -sk $AUTH "${HUB_API%/api/galaxy/pulp/api/v3}${TASK_HREF}" \
+                    -H "Content-Type: application/json")
+                  TASK_STATE=$(echo "$TASK_DATA" | grep -o '"state":"[^"]*"' | head -1 | sed 's/"state":"//;s/"//')
+
+                  case "$TASK_STATE" in
+                    completed)
+                      echo "Sync for '${REPO_NAME}' completed successfully"
+                      return 0
+                      ;;
+                    failed|canceled|cancelled)
+                      TASK_ERROR=$(echo "$TASK_DATA" | grep -o '"error":{[^}]*}' | head -1)
+                      echo "Sync for '${REPO_NAME}' ${TASK_STATE}: ${TASK_ERROR}"
+                      return 1
+                      ;;
+                    *)
+                      echo "  ${REPO_NAME}: state=${TASK_STATE}, elapsed=${ELAPSED}s"
+                      sleep "$INTERVAL"
+                      ELAPSED=$((ELAPSED + INTERVAL))
+                      ;;
+                  esac
+                done
+
+                echo "Timeout waiting for '${REPO_NAME}' sync after ${MAX_WAIT}s"
+                return 1
+              }
+
+              # ============================================================
+              # rh-certified: update offline token on existing remote
+              # ============================================================
+              echo ""
+              echo "=== Setting up rh-certified remote ==="
+              RH_CERT_DATA=$(get_remote "rh-certified")
+              RH_CERT_COUNT=$(echo "$RH_CERT_DATA" | grep -o '"count":[0-9]*' | grep -o '[0-9]*')
+
+              if [ "$RH_CERT_COUNT" != "0" ] && [ -n "$RH_CERT_COUNT" ]; then
+                PULP_HREF=$(echo "$RH_CERT_DATA" | grep -o '"pulp_href":"[^"]*"' | head -1 | sed 's/"pulp_href":"//;s/"//')
+                PULP_ID=$(extract_pulp_id "$PULP_HREF")
+                echo "Remote 'rh-certified' exists (pulp_id: ${PULP_ID}), updating token..."
+                if ! update_remote_token "rh-certified" "$PULP_ID"; then
+                  FAILED=1
+                fi
+              else
+                echo "Remote 'rh-certified' not found, creating..."
+                if ! create_remote "rh-certified" "$CERTIFIED_URL"; then
+                  FAILED=1
+                fi
+              fi
+
+              # ============================================================
+              # validated: create remote if missing, associate with repo
+              # ============================================================
+              echo ""
+              echo "=== Setting up validated remote ==="
+              VAL_DATA=$(get_remote "validated")
+              VAL_COUNT=$(echo "$VAL_DATA" | grep -o '"count":[0-9]*' | grep -o '[0-9]*')
+
+              if [ "$VAL_COUNT" != "0" ] && [ -n "$VAL_COUNT" ]; then
+                PULP_HREF=$(echo "$VAL_DATA" | grep -o '"pulp_href":"[^"]*"' | head -1 | sed 's/"pulp_href":"//;s/"//')
+                PULP_ID=$(extract_pulp_id "$PULP_HREF")
+                echo "Remote 'validated' already exists (pulp_id: ${PULP_ID}), updating token..."
+                if ! update_remote_token "validated" "$PULP_ID"; then
+                  FAILED=1
+                fi
+              else
+                echo "Remote 'validated' not found, creating..."
+                if ! create_remote "validated" "$VALIDATED_URL"; then
+                  FAILED=1
+                fi
+              fi
+
+              # Check if validated repository exists and needs remote association
+              echo "Checking validated repository..."
+              REPO_DATA=$(get_repo "validated")
+              REPO_COUNT=$(echo "$REPO_DATA" | grep -o '"count":[0-9]*' | grep -o '[0-9]*')
+
+              if [ "$REPO_COUNT" != "0" ] && [ -n "$REPO_COUNT" ]; then
+                REPO_REMOTE=$(echo "$REPO_DATA" | grep -o '"remote":"[^"]*"' | head -1 | sed 's/"remote":"//;s/"//')
+                REPO_REMOTE_NULL=$(echo "$REPO_DATA" | grep -o '"remote":null' || true)
+
+                if [ -n "$REPO_REMOTE_NULL" ] || [ -z "$REPO_REMOTE" ]; then
+                  echo "Repository 'validated' exists but has no remote associated"
+                  # Re-fetch the remote to get the pulp_href for association
+                  VAL_REMOTE_DATA=$(get_remote "validated")
+                  REMOTE_HREF=$(echo "$VAL_REMOTE_DATA" | grep -o '"pulp_href":"[^"]*"' | head -1 | sed 's/"pulp_href":"//;s/"//')
+                  REPO_HREF=$(echo "$REPO_DATA" | grep -o '"pulp_href":"[^"]*"' | head -1 | sed 's/"pulp_href":"//;s/"//')
+                  REPO_PULP_ID=$(extract_pulp_id "$REPO_HREF")
+
+                  if [ -n "$REMOTE_HREF" ] && [ -n "$REPO_PULP_ID" ]; then
+                    if ! associate_remote_to_repo "$REPO_PULP_ID" "$REMOTE_HREF"; then
+                      FAILED=1
+                    fi
+                  else
+                    echo "Could not determine remote href or repo pulp_id for association"
+                    FAILED=1
+                  fi
+                else
+                  echo "Repository 'validated' already has a remote associated, skipping"
+                fi
+              else
+                echo "Repository 'validated' not found, it will be created during sync"
+              fi
+
+              echo ""
+              if [ "$FAILED" = "1" ]; then
+                echo "Some remote setup operations failed, skipping sync"
+                exit 1
+              fi
+              echo "All hub remotes configured successfully"
+
+              # ============================================================
+              # Sync repositories
+              # ============================================================
+              echo ""
+              echo "=== Syncing repositories ==="
+              SYNC_FAILED=0
+
+              for REPO_NAME in rh-certified validated; do
+                echo ""
+                echo "--- Processing sync for '${REPO_NAME}' ---"
+                REPO_DATA=$(get_repo "$REPO_NAME")
+                REPO_COUNT=$(echo "$REPO_DATA" | grep -o '"count":[0-9]*' | grep -o '[0-9]*')
+
+                if [ "$REPO_COUNT" = "0" ] || [ -z "$REPO_COUNT" ]; then
+                  echo "Repository '${REPO_NAME}' not found, skipping sync"
+                  continue
+                fi
+
+                REPO_HREF=$(echo "$REPO_DATA" | grep -o '"pulp_href":"[^"]*"' | head -1 | sed 's/"pulp_href":"//;s/"//')
+                REPO_PULP_ID=$(extract_pulp_id "$REPO_HREF")
+                REPO_REMOTE=$(echo "$REPO_DATA" | grep -o '"remote":"[^"]*"' | head -1 | sed 's/"remote":"//;s/"//')
+                REPO_REMOTE_NULL=$(echo "$REPO_DATA" | grep -o '"remote":null' || true)
+
+                if [ -n "$REPO_REMOTE_NULL" ] || [ -z "$REPO_REMOTE" ]; then
+                  echo "Repository '${REPO_NAME}' has no remote associated, skipping sync"
+                  continue
+                fi
+
+                TASK_OUTPUT=$(sync_repo "$REPO_NAME" "$REPO_PULP_ID")
+                TASK_HREF=$(echo "$TASK_OUTPUT" | tail -1)
+
+                if [ -z "$TASK_HREF" ] || ! echo "$TASK_HREF" | grep -q "^/"; then
+                  echo "No valid task href for '${REPO_NAME}', sync may have failed"
+                  SYNC_FAILED=1
+                  continue
+                fi
+
+                if ! wait_for_task "$TASK_HREF" "$REPO_NAME"; then
+                  SYNC_FAILED=1
+                fi
+              done
+
+              echo ""
+              if [ "$SYNC_FAILED" = "1" ]; then
+                echo "Some sync operations failed"
+                exit 1
+              fi
+              echo "All repository syncs completed successfully"
+            env:
+            - name: ADMIN_USER
+              value: admin
+            - name: ADMIN_PASS
+              valueFrom:
+                secretKeyRef:
+                  key: password
+                  name: aap-admin-password
+            - name: OFFLINE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  key: token
+                  name: hadr-hub-token
+            image: registry.access.redhat.com/ubi9/ubi:latest
+            name: hub-remotes-setup
+            resources:
+              limits:
+                cpu: 200m
+                memory: 128Mi
+              requests:
+                cpu: 50m
+                memory: 64Mi
+          restartPolicy: OnFailure
+      ttlSecondsAfterFinished: 300
+  schedule: '*/45 * * * *'
+  successfulJobsHistoryLimit: 1
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "25"
+  name: aap-set-cleanup-schedules
+  namespace: aap
+spec:
+  concurrencyPolicy: Forbid
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      template:
+        spec:
+          containers:
+          - command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              echo "Waiting for AAP gateway..."
+              READY=false
+              for i in $(seq 1 30); do
+                STATUS=$(curl -sk http://aap.aap.svc.cluster.local/api/gateway/v1/ping/ 2>/dev/null | grep -o '"status":"[^"]*"' | head -1)
+                if echo "$STATUS" | grep -q "good"; then
+                  echo "Gateway is ready"
+                  READY=true
+                  break
+                fi
+                echo "  attempt $i: $STATUS"
+                sleep 10
+              done
+              if [ "$READY" != "true" ]; then
+                echo "ERROR: Gateway not ready after 30 attempts"
+                exit 1
+              fi
+
+              API="http://aap.aap.svc.cluster.local/api/controller/v2"
+              DAYS="${CLEANUP_RETENTION_DAYS}"
+              INTERVAL="${CLEANUP_INTERVAL_HOURS}"
+              RRULE="DTSTART:20260101T000000Z RRULE:FREQ=HOURLY;INTERVAL=${INTERVAL}"
+
+              # Fetch all system job templates
+              TEMPLATES=$(curl -sk -u "$ADMIN_USER:$ADMIN_PASS" "$API/system_job_templates/")
+              if [ -z "$TEMPLATES" ] || ! echo "$TEMPLATES" | python3 -c "import json,sys; json.load(sys.stdin)" 2>/dev/null; then
+                echo "ERROR: failed to fetch system job templates"
+                exit 1
+              fi
+
+              for JOB_TYPE in cleanup_jobs cleanup_activitystream; do
+                echo ""
+                echo "=== $JOB_TYPE ==="
+
+                TEMPLATE_ID=$(echo "$TEMPLATES" | python3 -c "
+              import json, sys
+              data = json.load(sys.stdin)
+              for r in data.get('results', []):
+                  if r.get('job_type') == '$JOB_TYPE':
+                      print(r['id']); break
+              ")
+
+                if [ -z "$TEMPLATE_ID" ]; then
+                  echo "  SKIP: no template found"
+                  continue
+                fi
+                echo "  Template ID: $TEMPLATE_ID"
+
+                SCHEDULES=$(curl -sk -u "$ADMIN_USER:$ADMIN_PASS" "$API/system_job_templates/$TEMPLATE_ID/schedules/")
+
+                SCHED_LIST=$(echo "$SCHEDULES" | python3 -c "
+              import json, sys
+              data = json.load(sys.stdin)
+              for s in data.get('results', []):
+                  days = s.get('extra_data', {}).get('days', '?')
+                  print(f'{s[\"id\"]} {days}')
+              ")
+                if [ -z "$SCHED_LIST" ]; then
+                  echo "  No schedules found"
+                  continue
+                fi
+
+                echo "$SCHED_LIST" | while IFS= read -r line; do
+                  SCHED_ID=$(echo "$line" | awk '{print $1}')
+                  CURRENT_DAYS=$(echo "$line" | awk '{print $2}')
+
+                  if [ "$CURRENT_DAYS" = "$DAYS" ]; then
+                    echo "  Schedule $SCHED_ID already set to ${DAYS}d"
+                  else
+                    echo "  Updating schedule $SCHED_ID: ${CURRENT_DAYS}d -> ${DAYS}d, interval=${INTERVAL}h"
+                    HTTP_CODE=$(curl -sk -u "$ADMIN_USER:$ADMIN_PASS" \
+                      -X PATCH -H 'Content-Type: application/json' \
+                      -d "{\"extra_data\":{\"days\":\"$DAYS\"},\"rrule\":\"$RRULE\"}" \
+                      "$API/schedules/$SCHED_ID/" -o /dev/null -w "%{http_code}")
+                    echo "  HTTP $HTTP_CODE"
+                    if [ "$HTTP_CODE" -ge 400 ] 2>/dev/null; then
+                      echo "  ERROR: PATCH failed for schedule $SCHED_ID"
+                      echo "PATCH_FAILED" > /tmp/cleanup-patch-failed
+                    fi
+                  fi
+                done
+              done
+
+              if [ -f /tmp/cleanup-patch-failed ]; then
+                rm -f /tmp/cleanup-patch-failed
+                echo "ERROR: one or more schedule updates failed"
+                exit 1
+              fi
+              echo ""
+              echo "=== Done ==="
+            env:
+            - name: ADMIN_USER
+              value: admin
+            - name: ADMIN_PASS
+              valueFrom:
+                secretKeyRef:
+                  key: password
+                  name: aap-admin-password
+            - name: CLEANUP_RETENTION_DAYS
+              value: "7"
+            - name: CLEANUP_INTERVAL_HOURS
+              value: "1"
+            image: registry.access.redhat.com/ubi9/ubi:latest
+            name: set-cleanup
+          restartPolicy: OnFailure
+      ttlSecondsAfterFinished: 300
+  schedule: 0 */6 * * *
+  successfulJobsHistoryLimit: 1
+---
+apiVersion: aap.ansible.com/v1alpha1
+kind: AnsibleAutomationPlatform
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "6"
+  name: aap
+  namespace: aap
+spec:
+  admin_password_secret: aap-admin-password
+  api:
+    log_level: INFO
+    node_selector:
+      dedicated: controlplane
+    replicas: 2
+    resource_requirements:
+      requests:
+        cpu: 500m
+        memory: 4Gi
+    tolerations:
+    - effect: NoSchedule
+      key: dedicated
+      operator: Equal
+      value: controlplane
+    topology_spread_constraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+  controller:
+    create_preload_data: false
+    disabled: false
+    ee_resource_requirements:
+      requests:
+        cpu: 100m
+        memory: 1Gi
+    extra_settings:
+    - setting: MAX_EVENT_RES_DATA
+      value: "100000000"
+    - setting: SYSTEM_TASK_ABS_MEM
+      value: '"6Gi"'
+    - setting: DEFAULT_EXECUTION_QUEUE_POD_SPEC_OVERRIDE
+      value: '{"spec":{"nodeSelector":{"dedicated":"executionplane"},"tolerations":[{"key":"dedicated","operator":"Equal","value":"executionplane","effect":"NoSchedule"}],"affinity":{"podAntiAffinity":{"preferredDuringSchedulingIgnoredDuringExecution":[{"weight":100,"podAffinityTerm":{"labelSelector":{"matchExpressions":[{"key":"app.kubernetes.io/name","operator":"In","values":["automation-controller-task","automation-platform"]}]},"topologyKey":"kubernetes.io/hostname"}}]}}}}'
+    init_container_resource_requirements:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+    node_selector: |
+      dedicated: controlplane
+    postgres_configuration_secret: aap-controller-postgres-configuration
+    rsyslog_resource_requirements:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+    task_replicas: 2
+    task_resource_requirements:
+      requests:
+        cpu: 1000m
+        memory: 8Gi
+    task_topology_spread_constraints: |
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+    tolerations: |
+      - key: dedicated
+        operator: Equal
+        value: controlplane
+        effect: NoSchedule
+    uwsgi_processes: 16
+    web_replicas: 2
+    web_resource_requirements:
+      requests:
+        cpu: 500m
+        memory: 8Gi
+    web_topology_spread_constraints: |
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+  database:
+    database_secret: aap-gateway-postgres-configuration
+    disabled: true
+    postgres_admin_secret: postgres-admin-credentials
+  eda:
+    activation_worker:
+      node_selector:
+        dedicated: executionplane
+      replicas: 2
+      resource_requirements:
+        requests:
+          cpu: 500m
+          memory: 4Gi
+      tolerations:
+      - effect: NoSchedule
+        key: dedicated
+        operator: Equal
+        value: executionplane
+    api:
+      node_selector:
+        dedicated: controlplane
+      replicas: 2
+      resource_requirements:
+        requests:
+          cpu: 500m
+          memory: 4Gi
+      tolerations:
+      - effect: NoSchedule
+        key: dedicated
+        operator: Equal
+        value: controlplane
+    database:
+      database_secret: aap-eda-postgres-configuration
+      externally_managed: true
+    default_worker:
+      node_selector:
+        dedicated: controlplane
+      replicas: 2
+      resource_requirements:
+        requests:
+          cpu: 500m
+          memory: 4Gi
+      tolerations:
+      - effect: NoSchedule
+        key: dedicated
+        operator: Equal
+        value: controlplane
+    disabled: false
+    event_stream:
+      database_secret: aap-eda-event-stream-postgres-configuration
+      externally_managed: true
+      node_selector:
+        dedicated: controlplane
+      tolerations:
+      - effect: NoSchedule
+        key: dedicated
+        operator: Equal
+        value: controlplane
+    redis_storage_size: 1Gi
+    ui_disabled: true
+    worker:
+      node_selector:
+        dedicated: controlplane
+      replicas: 2
+      resource_requirements:
+        requests:
+          cpu: 500m
+          memory: 4Gi
+      tolerations:
+      - effect: NoSchedule
+        key: dedicated
+        operator: Equal
+        value: controlplane
+  extra_settings:
+  - setting: CSRF_TRUSTED_ORIGINS
+    value:
+    - https://aap.example.com
+    - https://aap-aap.apps.cluster-b.example.com
+  gateway_timeouts:
+  - gateway_route_name: hub container registry
+    idle_timeout_seconds: 600
+    request_timeout_seconds: 600
+  - gateway_route_name: pulp content
+    idle_timeout_seconds: 600
+    request_timeout_seconds: 600
+  - gateway_route_name: galaxy api
+    idle_timeout_seconds: 600
+    request_timeout_seconds: 600
+  hub:
+    api:
+      replicas: 2
+      resource_requirements:
+        limits:
+          cpu: "2"
+          memory: 4Gi
+        requests:
+          cpu: 500m
+          memory: 2Gi
+    content:
+      replicas: 2
+      resource_requirements:
+        limits:
+          cpu: "2"
+          memory: 4Gi
+        requests:
+          cpu: 500m
+          memory: 2Gi
+    disabled: false
+    nginx_proxy_connect_timeout: 120s
+    nginx_proxy_read_timeout: 120s
+    nginx_proxy_send_timeout: 120s
+    node_selector: |
+      dedicated: controlplane
+    object_storage_s3_secret: hub-rgw-s3-credentials
+    postgres_configuration_secret: aap-hub-postgres-configuration
+    pulp_settings:
+      analytics: false
+      redirect_to_object_storage: false
+      token_expiration_time: 86400
+    redis_storage_size: 1Gi
+    storage_type: s3
+    tolerations: |
+      - key: dedicated
+        operator: Equal
+        value: controlplane
+        effect: NoSchedule
+    topology_spread_constraints: |
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+    web:
+      replicas: 2
+      resource_requirements:
+        limits:
+          cpu: "1"
+          memory: 2Gi
+        requests:
+          cpu: 200m
+          memory: 1Gi
+    worker:
+      replicas: 2
+      resource_requirements:
+        requests:
+          cpu: 250m
+          memory: 8Gi
+  idle_aap: true
+  image_pull_policy: IfNotPresent
+  lightspeed:
+    disabled: true
+  metrics:
+    database:
+      database_secret: aap-metrics-postgres-configuration
+      externally_managed_database: true
+      externally_managed_ms_awx_readonly_user: true
+      ms_awx_readonly_user_secret: aap-metrics-controller-postgres-configuration
+    disabled: true
+    name: aap-metrics
+  no_log: false
+  public_base_url: https://aap.example.com
+  redis:
+    node_selector:
+      dedicated: controlplane
+    tolerations:
+    - effect: NoSchedule
+      key: dedicated
+      operator: Equal
+      value: controlplane
+  redis_mode: standalone
+  route_annotations: |
+    haproxy.router.openshift.io/timeout: '600s'
+    haproxy.router.openshift.io/set-forwarded-headers: 'never'
+  route_tls_termination_mechanism: Edge
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+  name: aap-operator-group
+  namespace: aap
+spec:
+  targetNamespaces:
+  - aap
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "-3"
+  name: ansible-automation-platform-operator
+  namespace: aap
+spec:
+  channel: stable-2.7
+  installPlanApproval: Automatic
+  name: ansible-automation-platform-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace

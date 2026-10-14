@@ -1,0 +1,25 @@
+---
+# cnpg_common is a utility role — do not call it directly.
+# Use include_role with tasks_from to invoke specific task files:
+#
+#   - include_role:
+#       name: cnpg_common
+#       tasks_from: psql_query.yml
+#     vars:
+#       _query_context: "{{ some_context }}"
+#       _query_labels: "cnpg.io/cluster=aap-postgres,cnpg.io/instanceRole=primary"
+#       _query: "SELECT timeline_id FROM pg_control_checkpoint();"
+#
+# Available task files:
+#   - psql_query.yml              — Find pod by label + run SQL query via psql
+#   - pg_controldata_timeline.yml — Get WAL timeline ID via pg_controldata
+#   - verify_streaming.yml        — Check pg_stat_replication streaming count
+#   - wait_healthy.yml            — Poll cnpg_cluster_info until healthy
+#   - cleanup_cnpg.yml            — Force-delete pods + PVCs + restart operator
+#   - wait_pods.yml               — Wait for pod count by label to reach target
+
+- name: cnpg_common called without tasks_from
+  ansible.builtin.fail:
+    msg: >
+      cnpg_common is a utility role — call it with include_role and tasks_from.
+      Example: include_role: name=cnpg_common tasks_from=psql_query.yml

@@ -1,0 +1,84 @@
+---
+# ODF Operator (full mode with Ceph) — S3 + Block + File storage
+# Installs the odf-operator which pulls in ocs-operator, rook-ceph,
+# mcg-operator/noobaa-operator as dependencies.
+#
+# The StorageCluster deploys a full Ceph cluster (MON, OSD, MGR)
+# plus the Multi-Cloud Gateway (NooBaa) for S3. This provides:
+#   - ocs-storagecluster-ceph-rbd  (block storage)
+#   - ocs-storagecluster-cephfs    (shared filesystem)
+#   - openshift-storage.noobaa.io  (S3 object storage via NooBaa)
+#
+# Requires 3 nodes labeled: cluster.ocs.openshift.io/openshift-storage=""
+# Each OSD PVC uses 1Ti from the gp3-csi storage class (EBS).
+#
+# Deploys into openshift-storage namespace.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openshift-storage
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+  labels:
+    openshift.io/cluster-monitoring: "true"
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: openshift-storage-operatorgroup
+  namespace: openshift-storage
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+spec:
+  targetNamespaces:
+    - openshift-storage
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: odf-operator
+  namespace: openshift-storage
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+spec:
+  channel: stable-4.20
+  name: odf-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  installPlanApproval: Automatic
+---
+# Full ODF StorageCluster with Ceph + NooBaa
+# Deploys Ceph (3x OSD on EBS, MON, MGR) + NooBaa (S3 gateway).
+#
+# Ceph OSD PVCs: 3x 1Ti on gp3-csi (3 TiB total)
+# Requires 3 nodes labeled: cluster.ocs.openshift.io/openshift-storage=""
+#
+# S3 endpoint (NooBaa): https://s3.openshift-storage.svc:443
+# S3 endpoint (RGW):    http://rook-ceph-rgw-ocs-storagecluster-cephobjectstore.openshift-storage.svc:80
+apiVersion: ocs.openshift.io/v1
+kind: StorageCluster
+metadata:
+  name: ocs-storagecluster
+  namespace: openshift-storage
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true,Prune=false
+spec:
+  failureDomain: host
+  storageDeviceSets:
+    - name: ocs-deviceset
+      count: 1
+      replica: 3
+      portable: true
+      dataPVCTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 1Ti
+          volumeMode: Block
+          storageClassName: MUST_BE_SET_BY_OVERLAY
+  multiCloudGateway:
+    reconcileStrategy: manage

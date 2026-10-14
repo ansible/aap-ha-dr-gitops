@@ -1,0 +1,37 @@
+---
+# cnpg_preflight — Instant health snapshot of a single CNPG cluster
+#
+# Delegates to cnpg_health_check with retries=1 (no waiting).
+# Adds topology context (site_id, replica_primary) to the result.
+#
+# Input:
+#   preflight_context  — K8s context of the target cluster
+#   aap_namespace, cluster_name
+#
+# Output (set_fact):
+#   preflight_result — dict with status, role, phase, ready, site_id, error
+
+- name: Validate preflight_context is set
+  ansible.builtin.fail:
+    msg: "preflight_context must be set — pass the K8s context of the cluster to check"
+  when: preflight_context | default('') == ''
+
+- name: Run instant health check on {{ preflight_context }}
+  ansible.builtin.include_role:
+    name: aap.hadr_ops.cnpg_health_check
+  vars:
+    health_check_context: "{{ preflight_context }}"
+    health_check_retries: 1
+    health_check_delay: 5
+
+- name: Set preflight result from health check
+  ansible.builtin.set_fact:
+    preflight_result:
+      context: "{{ preflight_context }}"
+      status: "{{ health_check_result.status | trim }}"
+      role: "{{ health_check_result.role | trim }}"
+      phase: "{{ health_check_result.phase }}"
+      ready: "{{ health_check_result.ready }}"
+      primary_pod: "{{ health_check_result.primary_pod }}"
+      site_id: "{{ health_check_result.site_id }}"
+      error: "{{ health_check_result.error | trim }}"

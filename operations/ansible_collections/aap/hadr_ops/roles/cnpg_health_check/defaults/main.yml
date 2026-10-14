@@ -1,0 +1,11 @@
+---
+# Role-specific variables only.
+# Shared variables (aap_namespace, cluster_name, etc.) are provided by
+# the config_loader role — do not duplicate here.
+
+# Target cluster context (required)
+health_check_context: ""
+
+# Timing — set retries=1 for instant snapshot, higher for wait-until-ready
+health_check_retries: 30
+health_check_delay: 10

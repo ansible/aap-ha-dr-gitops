@@ -1,0 +1,55 @@
+---
+# CHK-04: Failover Loop Detection
+# Queries K8s events for recent failover activity on each reachable cluster.
+# Flags a warning/failure if too many failovers occurred within the event window.
+
+- name: "CHK-04: Check failover events on cluster-a"
+  when: _chk01_a_reachable | bool
+  block:
+    - name: "CHK-04: Run failover event check on cluster-a"
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.cnpg_preflight
+        tasks_from: check_failover_events.yml
+      vars:
+        preflight_context: "{{ cluster_a_context }}"
+    - name: "CHK-04: Save cluster-a result"
+      ansible.builtin.set_fact:
+        _chk04_result_a: "{{ failover_events_result }}"
+
+- name: "CHK-04: Check failover events on cluster-b"
+  when: _chk01_b_reachable | bool
+  block:
+    - name: "CHK-04: Run failover event check on cluster-b"
+      ansible.builtin.include_role:
+        name: aap.hadr_ops.cnpg_preflight
+        tasks_from: check_failover_events.yml
+      vars:
+        preflight_context: "{{ cluster_b_context }}"
+    - name: "CHK-04: Save cluster-b result"
+      ansible.builtin.set_fact:
+        _chk04_result_b: "{{ failover_events_result }}"
+
+- name: "CHK-04: Evaluate combined failover loop status"
+  vars:
+    _status_a: "{{ _chk04_result_a.status | default('skip') | trim }}"
+    _status_b: "{{ _chk04_result_b.status | default('skip') | trim }}"
+  ansible.builtin.set_fact:
+    _chk04_status: >-
+      {% if _status_a == 'fail' or _status_b == 'fail' %}fail
+      {% elif _status_a == 'warn' or _status_b == 'warn' %}warn
+      {% else %}pass{% endif %}
+    _chk04_detail: >-
+      cluster-a={{ _chk04_result_a.event_count | default(0) }} events,
+      cluster-b={{ _chk04_result_b.event_count | default(0) }} events
+      (window={{ preflight_failover_event_window | default(30) }}min)
+
+- name: "CHK-04: Finalize"
+  vars:
+    _check_key: "chk04_failover_loop"
+    _check_name: "CHK-04 Failover Loop"
+    _check_status: "{{ _chk04_status | trim }}"
+    _check_detail: "{{ _chk04_detail | trim }}"
+    _check_data:
+      cluster_a: "{{ _chk04_result_a | default({'status': 'skip'}) }}"
+      cluster_b: "{{ _chk04_result_b | default({'status': 'skip'}) }}"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/finalize_check.yml"

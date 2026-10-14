@@ -1,0 +1,441 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+  name: external-secrets-operator
+---
+apiVersion: external-secrets.io/v1
+kind: ClusterSecretStore
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    argocd.argoproj.io/sync-wave: "3"
+  name: cluster-cross-account-secret-store
+spec:
+  provider:
+    aws:
+      auth:
+        jwt:
+          serviceAccountRef:
+            name: external-secrets
+            namespace: external-secrets
+      region: us-east-1
+      service: SecretsManager
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    argocd.argoproj.io/sync-wave: "4"
+  name: aap-admin-password
+  namespace: aap
+spec:
+  dataFrom:
+  - extract:
+      key: example/aap/shared/aap-admin-password
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cluster-cross-account-secret-store
+  target:
+    creationPolicy: Owner
+    name: aap-admin-password
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    argocd.argoproj.io/sync-wave: "4"
+  name: aap-controller-admin-password
+  namespace: aap
+spec:
+  dataFrom:
+  - extract:
+      key: example/aap/shared/aap-controller-admin-password
+  refreshInterval: 24h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cluster-cross-account-secret-store
+  target:
+    creationPolicy: Owner
+    name: aap-controller-admin-password
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    argocd.argoproj.io/sync-wave: "4"
+  name: aap-controller-postgres-configuration
+  namespace: aap
+spec:
+  dataFrom:
+  - extract:
+      key: example/aap/shared/aap-controller-postgres-configuration
+  refreshInterval: 24h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cluster-cross-account-secret-store
+  target:
+    creationPolicy: Owner
+    name: aap-controller-postgres-configuration
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    argocd.argoproj.io/sync-wave: "4"
+  name: aap-controller-receptor-ca
+  namespace: aap
+spec:
+  data:
+  - remoteRef:
+      key: example/aap/shared/aap-controller-receptor-ca
+      property: receptor-ca.crt
+    secretKey: tls.crt
+  - remoteRef:
+      key: example/aap/shared/aap-controller-receptor-ca
+      property: receptor-ca.key
+    secretKey: tls.key
+  refreshInterval: 24h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cluster-cross-account-secret-store
+  target:
+    creationPolicy: Owner
+    name: aap-controller-receptor-ca
+    template:
+      type: kubernetes.io/tls
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    argocd.argoproj.io/sync-wave: "4"
+  name: aap-controller-receptor-work-signing
+  namespace: aap
+spec:
+  dataFrom:
+  - extract:
+      key: example/aap/shared/aap-controller-receptor-work-signing
+  refreshInterval: 24h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cluster-cross-account-secret-store
+  target:
+    creationPolicy: Owner
+    name: aap-controller-receptor-work-signing
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    argocd.argoproj.io/sync-wave: "4"
+  name: aap-controller-secret-key
+  namespace: aap
+spec:
+  dataFrom:
+  - extract:
+      key: example/aap/shared/aap-controller-secret-key
+  refreshInterval: 24h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cluster-cross-account-secret-store
+  target:
+    creationPolicy: Owner
+    name: aap-controller-secret-key
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    argocd.argoproj.io/sync-wave: "4"
+  name: aap-db-fields-encryption-secret
+  namespace: aap
+spec:
+  dataFrom:
+  - extract:
+      key: example/aap/shared/aap-db-fields-encryption-secret
+  refreshInterval: 24h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cluster-cross-account-secret-store
+  target:
+    creationPolicy: Owner
+    name: aap-db-fields-encryption-secret
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    argocd.argoproj.io/sync-wave: "4"
+  name: aap-eda-admin-password
+  namespace: aap
+spec:
+  dataFrom:
+  - extract:
+      key: example/aap/shared/aap-eda-admin-password
+  refreshInterval: 24h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cluster-cross-account-secret-store
+  target:
+    creationPolicy: Owner
+    name: aap-eda-admin-password
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    argocd.argoproj.io/sync-wave: "4"
+  name: aap-eda-db-fields-encryption-secret
+  namespace: aap
+spec:
+  dataFrom:
+  - extract:
+      key: example/aap/shared/aap-eda-db-fields-encryption-secret
+  refreshInterval: 24h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cluster-cross-account-secret-store
+  target:
+    creationPolicy: Owner
+    name: aap-eda-db-fields-encryption-secret
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    argocd.argoproj.io/sync-wave: "4"
+  name: aap-eda-event-stream-postgres-configuration
+  namespace: aap
+spec:
+  dataFrom:
+  - extract:
+      key: example/aap/shared/aap-eda-event-stream-postgres-configuration
+  refreshInterval: 24h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cluster-cross-account-secret-store
+  target:
+    creationPolicy: Owner
+    name: aap-eda-event-stream-postgres-configuration
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    argocd.argoproj.io/sync-wave: "4"
+  name: aap-eda-postgres-configuration
+  namespace: aap
+spec:
+  dataFrom:
+  - extract:
+      key: example/aap/shared/aap-eda-postgres-configuration
+  refreshInterval: 24h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cluster-cross-account-secret-store
+  target:
+    creationPolicy: Owner
+    name: aap-eda-postgres-configuration
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    argocd.argoproj.io/sync-wave: "4"
+  name: aap-gateway-postgres-configuration
+  namespace: aap
+spec:
+  dataFrom:
+  - extract:
+      key: example/aap/shared/aap-gateway-postgres-configuration
+  refreshInterval: 24h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cluster-cross-account-secret-store
+  target:
+    creationPolicy: Owner
+    name: aap-gateway-postgres-configuration
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    argocd.argoproj.io/sync-wave: "4"
+  name: aap-hub-admin-password
+  namespace: aap
+spec:
+  dataFrom:
+  - extract:
+      key: example/aap/shared/aap-hub-admin-password
+  refreshInterval: 24h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cluster-cross-account-secret-store
+  target:
+    creationPolicy: Owner
+    name: aap-hub-admin-password
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    argocd.argoproj.io/sync-wave: "4"
+  name: aap-hub-container-auth
+  namespace: aap
+spec:
+  dataFrom:
+  - extract:
+      key: example/aap/shared/aap-hub-container-auth
+  refreshInterval: 24h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cluster-cross-account-secret-store
+  target:
+    creationPolicy: Owner
+    name: aap-hub-container-auth
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    argocd.argoproj.io/sync-wave: "4"
+  name: aap-hub-db-fields-encryption
+  namespace: aap
+spec:
+  dataFrom:
+  - extract:
+      key: example/aap/shared/aap-hub-db-fields-encryption
+  refreshInterval: 24h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cluster-cross-account-secret-store
+  target:
+    creationPolicy: Owner
+    name: aap-hub-db-fields-encryption
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    argocd.argoproj.io/sync-wave: "4"
+  name: aap-hub-postgres-configuration
+  namespace: aap
+spec:
+  dataFrom:
+  - extract:
+      key: example/aap/shared/aap-hub-postgres-configuration
+  refreshInterval: 24h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cluster-cross-account-secret-store
+  target:
+    creationPolicy: Owner
+    name: aap-hub-postgres-configuration
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    argocd.argoproj.io/sync-wave: "4"
+  name: cnpg-ca
+  namespace: aap
+spec:
+  data:
+  - remoteRef:
+      key: example/aap/shared/cnpg-tls
+      property: ca.crt
+    secretKey: ca.crt
+  - remoteRef:
+      key: example/aap/shared/cnpg-tls
+      property: ca.key
+    secretKey: ca.key
+  refreshInterval: 24h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cluster-cross-account-secret-store
+  target:
+    creationPolicy: Owner
+    name: cnpg-ca
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    argocd.argoproj.io/sync-wave: "4"
+  name: cnpg-init-sql
+  namespace: aap
+spec:
+  dataFrom:
+  - extract:
+      key: example/aap/shared/cnpg-init-sql
+  refreshInterval: 24h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cluster-cross-account-secret-store
+  target:
+    creationPolicy: Owner
+    name: cnpg-init-sql
+---
+apiVersion: operator.openshift.io/v1alpha1
+kind: ExternalSecretsConfig
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    argocd.argoproj.io/sync-wave: "2"
+  labels:
+    app: external-secrets-operator
+    app.kubernetes.io/name: cluster
+  name: cluster
+  namespace: external-secrets-operator
+spec:
+  controllerConfig:
+    networkPolicies:
+    - componentName: ExternalSecretsCoreController
+      egress:
+      - {}
+      name: allow-external-secrets-egress
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+  name: openshift-external-secrets-operator
+  namespace: external-secrets-operator
+spec:
+  targetNamespaces: []
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+  name: openshift-external-secrets-operator
+  namespace: external-secrets-operator
+spec:
+  channel: stable-v1
+  installPlanApproval: Automatic
+  name: openshift-external-secrets-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace

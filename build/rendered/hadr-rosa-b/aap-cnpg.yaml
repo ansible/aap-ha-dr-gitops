@@ -1,0 +1,267 @@
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    external-dns.alpha.kubernetes.io/alias: "false"
+    external-dns.alpha.kubernetes.io/hostname: postgres-repl.rosa.o5x7k1t3d0r6y3b.0re0.p3.openshiftapps.com
+    external-dns.alpha.kubernetes.io/ttl: "30"
+    service.beta.kubernetes.io/aws-load-balancer-connection-idle-timeout: "3600"
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
+  labels:
+    aap.redhat.com/external-dns: replication
+  name: aap-postgres-replication
+  namespace: aap
+spec:
+  ports:
+  - name: postgres
+    port: 5432
+    protocol: TCP
+    targetPort: 5432
+  selector:
+    cnpg.io/cluster: aap-postgres
+    cnpg.io/instanceRole: primary
+  type: LoadBalancer
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    argocd.argoproj.io/sync-wave: "4"
+  name: cnpg-replication-tls
+  namespace: aap
+spec:
+  data:
+  - remoteRef:
+      key: eso/aap/shared/cnpg-tls
+      property: rosa-b-replication.crt
+    secretKey: tls.crt
+  - remoteRef:
+      key: eso/aap/shared/cnpg-tls
+      property: rosa-b-replication.key
+    secretKey: tls.key
+  refreshInterval: 24h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cluster-cross-account-secret-store
+  target:
+    creationPolicy: Owner
+    name: cnpg-replication-tls
+    template:
+      type: kubernetes.io/tls
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    argocd.argoproj.io/sync-wave: "4"
+  name: cnpg-server-tls
+  namespace: aap
+spec:
+  data:
+  - remoteRef:
+      key: eso/aap/shared/cnpg-tls
+      property: rosa-b-server.crt
+    secretKey: tls.crt
+  - remoteRef:
+      key: eso/aap/shared/cnpg-tls
+      property: rosa-b-server.key
+    secretKey: tls.key
+  refreshInterval: 24h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cluster-cross-account-secret-store
+  target:
+    creationPolicy: Owner
+    name: cnpg-server-tls
+    template:
+      type: kubernetes.io/tls
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+  name: cloudnative-pg
+  namespace: openshift-operators
+spec:
+  channel: stable-v1
+  installPlanApproval: Automatic
+  name: cloudnative-pg
+  source: certified-operators
+  sourceNamespace: openshift-marketplace
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+  labels:
+    cnpg.io/cluster: aap-postgres
+  name: aap-postgres
+  namespace: aap
+spec:
+  affinity:
+    topologySpreadConstraints:
+    - labelSelector:
+        matchLabels:
+          cnpg.io/cluster: aap-postgres
+      maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+  backup:
+    barmanObjectStore:
+      data:
+        compression: snappy
+        immediateCheckpoint: true
+        jobs: 8
+      destinationPath: s3://cnpg-wal/rosa-b/
+      endpointURL: http://rook-ceph-rgw-hub-objectstore.openshift-storage.svc:80
+      s3Credentials:
+        accessKeyId:
+          key: ACCESS_KEY_ID
+          name: barman-rgw-credentials
+        secretAccessKey:
+          key: ACCESS_SECRET_KEY
+          name: barman-rgw-credentials
+      wal:
+        compression: gzip
+        maxParallel: 8
+    retentionPolicy: 2d
+  bootstrap:
+    pg_basebackup:
+      source: rosa-a
+  certificates:
+    clientCASecret: cnpg-ca
+    replicationTLSSecret: cnpg-replication-tls
+    serverCASecret: cnpg-ca
+    serverTLSSecret: cnpg-server-tls
+  enablePodAntiAffinity: true
+  externalClusters:
+  - barmanObjectStore:
+      destinationPath: s3://cnpg-wal/rosa-b/
+      endpointURL: http://rook-ceph-rgw-hub-objectstore.openshift-storage.svc:80
+      s3Credentials:
+        accessKeyId:
+          key: ACCESS_KEY_ID
+          name: barman-rgw-credentials
+        secretAccessKey:
+          key: ACCESS_SECRET_KEY
+          name: barman-rgw-credentials
+      wal:
+        compression: gzip
+        maxParallel: 8
+    connectionParameters:
+      dbname: postgres
+      host: postgres-repl.rosa.o5x7k1t3d0r6y3b.0re0.p3.openshiftapps.com
+      port: "5432"
+      sslmode: verify-ca
+      user: streaming_replica
+    name: rosa-b
+    sslCert:
+      key: tls.crt
+      name: cnpg-replication-tls
+    sslKey:
+      key: tls.key
+      name: cnpg-replication-tls
+    sslRootCert:
+      key: ca.crt
+      name: cnpg-ca
+  - barmanObjectStore:
+      destinationPath: s3://cnpg-wal/rosa-a/
+      endpointURL: http://rook-ceph-rgw-hub-objectstore.openshift-storage.svc:80
+      s3Credentials:
+        accessKeyId:
+          key: ACCESS_KEY_ID
+          name: barman-rgw-credentials
+        secretAccessKey:
+          key: ACCESS_SECRET_KEY
+          name: barman-rgw-credentials
+      wal:
+        compression: gzip
+        maxParallel: 8
+    connectionParameters:
+      dbname: postgres
+      host: postgres-repl.rosa.i8m2i7h2m5l3g4j.ff74.p3.openshiftapps.com
+      port: "5432"
+      sslmode: verify-ca
+      user: streaming_replica
+    name: rosa-a
+    sslCert:
+      key: tls.crt
+      name: cnpg-replication-tls
+    sslKey:
+      key: tls.key
+      name: cnpg-replication-tls
+    sslRootCert:
+      key: ca.crt
+      name: cnpg-ca
+  imageName: ghcr.io/cloudnative-pg/postgresql:15.10
+  instances: 3
+  postgresql:
+    parameters:
+      archive_timeout: 30min
+      autovacuum_analyze_scale_factor: "0.02"
+      autovacuum_max_workers: "6"
+      autovacuum_vacuum_cost_delay: 2ms
+      autovacuum_vacuum_scale_factor: "0.02"
+      checkpoint_completion_target: "0.9"
+      effective_cache_size: 24GB
+      effective_io_concurrency: "200"
+      log_autovacuum_min_duration: "250"
+      log_min_duration_statement: "1000"
+      log_statement: ddl
+      maintenance_work_mem: 2GB
+      max_connections: "1024"
+      max_wal_size: 8GB
+      min_wal_size: 2GB
+      pg_stat_statements.max: "5000"
+      pg_stat_statements.track: top
+      random_page_cost: "1.1"
+      shared_buffers: 8GB
+      tcp_keepalives_count: "3"
+      tcp_keepalives_idle: "30"
+      tcp_keepalives_interval: "10"
+      wal_buffers: 32MB
+      wal_level: replica
+      work_mem: 128MB
+    pg_hba:
+    - host all all all scram-sha-256
+  replica:
+    primary: rosa-a
+    self: rosa-b
+    source: rosa-a
+  resources:
+    ephemeralVolumeSource:
+      volumeClaimTemplate:
+        spec:
+          resources:
+            requests:
+              storage: 20Gi
+    limits:
+      cpu: "16"
+      memory: 32Gi
+    requests:
+      cpu: "8"
+      memory: 16Gi
+  startDelay: 300
+  stopDelay: 60
+  storage:
+    size: 2Ti
+    storageClass: gp3-csi
+  switchoverDelay: 60
+  walStorage:
+    size: 200Gi
+    storageClass: gp3-csi
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: aap-postgres-scheduled
+spec:
+  backupOwnerReference: cluster
+  cluster:
+    name: aap-postgres
+  method: barmanObjectStore
+  schedule: 0 0 19 * * *

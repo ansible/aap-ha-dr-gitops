@@ -1,0 +1,295 @@
+apiVersion: aap.ansible.com/v1alpha1
+kind: AnsibleAutomationPlatform
+metadata:
+  name: aap
+  namespace: aap
+  annotations:
+    argocd.argoproj.io/sync-wave: "6"
+spec:
+  # Admin password secret
+  # References: secrets/aap-admin-password.yaml (created separately)
+  admin_password_secret: aap-admin-password
+
+  # API Gateway
+  api:
+    log_level: INFO
+    replicas: 2
+    resource_requirements:
+      requests:
+        cpu: 500m
+        memory: 4Gi
+    node_selector:
+      dedicated: controlplane
+    tolerations:
+      - key: dedicated
+        operator: Equal
+        value: controlplane
+        effect: NoSchedule
+    topology_spread_constraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+
+  # Automation Controller
+  controller:
+    create_preload_data: false
+    disabled: false
+    postgres_configuration_secret: aap-controller-postgres-configuration
+
+    node_selector: |
+      dedicated: controlplane
+    tolerations: |
+      - key: dedicated
+        operator: Equal
+        value: controlplane
+        effect: NoSchedule
+
+    # Task resources
+    task_replicas: 2
+    task_resource_requirements:
+      requests:
+        cpu: 1000m
+        memory: 8Gi
+
+    # Web resources
+    web_replicas: 2
+    web_resource_requirements:
+      requests:
+        cpu: 500m
+        memory: 8Gi
+
+    # EE resources
+    # Max observed: 233Mi (7d). 1Gi gives ~4x headroom for job spikes.
+    ee_resource_requirements:
+      requests:
+        cpu: 100m
+        memory: 1Gi
+
+    # Max observed: 0Mi (init only). 256Mi is sufficient.
+    init_container_resource_requirements:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+
+    # Max observed: 193Mi (7d). 512Mi gives ~2.5x headroom.
+    rsyslog_resource_requirements:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+
+    uwsgi_processes: 16
+
+    task_topology_spread_constraints: |
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+
+    web_topology_spread_constraints: |
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+
+    extra_settings:
+    - setting: MAX_EVENT_RES_DATA
+      value: "100000000"
+    - setting: SYSTEM_TASK_ABS_MEM
+      value: '"6Gi"'
+    - setting: DEFAULT_EXECUTION_QUEUE_POD_SPEC_OVERRIDE
+      value: '{"spec":{"nodeSelector":{"dedicated":"executionplane"},"tolerations":[{"key":"dedicated","operator":"Equal","value":"executionplane","effect":"NoSchedule"}],"affinity":{"podAntiAffinity":{"preferredDuringSchedulingIgnoredDuringExecution":[{"weight":100,"podAffinityTerm":{"labelSelector":{"matchExpressions":[{"key":"app.kubernetes.io/name","operator":"In","values":["automation-controller-task","automation-platform"]}]},"topologyKey":"kubernetes.io/hostname"}}]}}}}'
+
+  # Automation Hub
+  hub:
+    disabled: false
+    postgres_configuration_secret: aap-hub-postgres-configuration
+    node_selector: |
+      dedicated: controlplane
+    tolerations: |
+      - key: dedicated
+        operator: Equal
+        value: controlplane
+        effect: NoSchedule
+    topology_spread_constraints: |
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+    # Hub storage_type and backing store MUST be set by per-cluster overlay
+    redis_storage_size: 1Gi
+
+    nginx_proxy_connect_timeout: 120s
+    nginx_proxy_read_timeout: 120s
+    nginx_proxy_send_timeout: 120s
+
+    pulp_settings:
+      analytics: false
+
+    api:
+      replicas: 2
+      resource_requirements:
+        requests:
+          cpu: 500m
+          memory: 4Gi
+
+    content:
+      replicas: 2
+      resource_requirements:
+        requests:
+          cpu: 250m
+          memory: 4Gi
+
+    web:
+      replicas: 2
+      resource_requirements:
+        requests:
+          cpu: 250m
+          memory: 4Gi
+
+    worker:
+      replicas: 2
+      resource_requirements:
+        requests:
+          cpu: 250m
+          memory: 8Gi
+
+  # Event-Driven Ansible - ENABLED
+  eda:
+    disabled: false
+
+    # Database - external CloudNativePG
+    database:
+      database_secret: aap-eda-postgres-configuration
+      externally_managed: true
+
+    # Event stream database (required for external DB)
+    event_stream:
+      database_secret: aap-eda-event-stream-postgres-configuration
+      externally_managed: true
+      node_selector:
+        dedicated: controlplane
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: controlplane
+          effect: NoSchedule
+
+    # API resources
+    api:
+      replicas: 2
+      resource_requirements:
+        requests:
+          cpu: 500m
+          memory: 4Gi
+      node_selector:
+        dedicated: controlplane
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: controlplane
+          effect: NoSchedule
+
+    # Worker resources
+    worker:
+      replicas: 2
+      resource_requirements:
+        requests:
+          cpu: 500m
+          memory: 4Gi
+      node_selector:
+        dedicated: controlplane
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: controlplane
+          effect: NoSchedule
+
+    # Default worker resources
+    default_worker:
+      replicas: 2
+      resource_requirements:
+        requests:
+          cpu: 500m
+          memory: 4Gi
+      node_selector:
+        dedicated: controlplane
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: controlplane
+          effect: NoSchedule
+
+    # Activation worker resources — runs on execution nodes (not control plane)
+    activation_worker:
+      replicas: 2
+      resource_requirements:
+        requests:
+          cpu: 500m
+          memory: 4Gi
+      node_selector:
+        dedicated: executionplane
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: executionplane
+          effect: NoSchedule
+
+    # UI disabled (gateway handles UI)
+    ui_disabled: true
+
+    # Redis storage
+    redis_storage_size: 1Gi
+
+  # Lightspeed disabled
+  lightspeed:
+    disabled: true
+
+  # Metrics Service - disabled until AAP-76947 is fixed (postgres_admin_password
+  # undefined error in grant_metrics_readonly_on_controller.yml blocks reconciliation)
+  metrics:
+    name: aap-metrics
+    disabled: true
+    database:
+      database_secret: aap-metrics-postgres-configuration
+      # NOTE: Must use externally_managed_database (not externally_managed)
+      # because combined_metrics in operator template overwrites the
+      # template's correct values. See issue-005.
+      externally_managed_database: true
+      externally_managed_ms_awx_readonly_user: true
+      ms_awx_readonly_user_secret: aap-metrics-controller-postgres-configuration
+
+  # Database - external CloudNativePG cluster (not operator-managed)
+  database:
+    disabled: true
+    database_secret: aap-gateway-postgres-configuration
+    postgres_admin_secret: postgres-admin-credentials
+
+  # General settings
+  # Stable external URL so generated URLs (event stream webhooks, hub
+  # downloads, controller callbacks) survive DR failover between clusters.
+  # Propagates to all child CRs via gateway_url.
+  public_base_url: "MUST_BE_SET_BY_OVERLAY"
+  image_pull_policy: IfNotPresent
+  no_log: false
+  redis_mode: standalone
+  redis:
+    node_selector:
+      dedicated: controlplane
+    tolerations:
+      - key: dedicated
+        operator: Equal
+        value: controlplane
+        effect: NoSchedule
+  route_annotations: |
+    haproxy.router.openshift.io/timeout: '300s'
+    haproxy.router.openshift.io/set-forwarded-headers: 'never'
+  route_tls_termination_mechanism: Edge

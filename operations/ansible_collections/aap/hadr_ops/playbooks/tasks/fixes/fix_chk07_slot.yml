@@ -1,0 +1,87 @@
+---
+# Fix CHK-07: Replication slot missing or inactive.
+# Lighter approach: scale down replica CNPG pods, delete PVCs, restart
+# operator. CNPG re-bootstraps the replica with a fresh slot.
+# Uses the existing cnpg_common/cleanup_cnpg.yml task.
+#
+# Input: _check_key, _check_name, _check_detail, _wal_replica_context
+# Output: _fix_result, _fix_detail
+
+- name: "FIX {{ _check_name }}: Determine replica context"
+  ansible.builtin.set_fact:
+    _slot_fix_context: "{{ _wal_replica_context | default(cluster_b_context) }}"
+
+- name: "FIX {{ _check_name }}: Scale down replica CNPG cluster"
+  kubernetes.core.k8s:
+    api_version: postgresql.cnpg.io/v1
+    kind: Cluster
+    name: "{{ cluster_name }}"
+    namespace: "{{ aap_namespace | default('aap') }}"
+    context: "{{ _slot_fix_context }}"
+    definition:
+      spec:
+        instances: 0
+    merge_type: merge
+  failed_when: false
+
+- name: "FIX {{ _check_name }}: Wait for replica pods to terminate"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ aap_namespace | default('aap') }}"
+    context: "{{ _slot_fix_context }}"
+    label_selectors:
+      - "cnpg.io/cluster={{ cluster_name }}"
+  register: _slot_fix_pods
+  until: _slot_fix_pods.resources | default([]) | length == 0
+  retries: 24
+  delay: 5
+  failed_when: false
+
+- name: "FIX {{ _check_name }}: Clean up replica PVCs and restart operator"
+  ansible.builtin.include_role:
+    name: aap.hadr_ops.cnpg_common
+    tasks_from: cleanup_cnpg.yml
+  vars:
+    _cleanup_context: "{{ _slot_fix_context }}"
+    _cleanup_force_pods: false
+    _cleanup_delete_pvcs: true
+    _cleanup_restart_operator: true
+
+- name: "FIX {{ _check_name }}: Scale replica back up"
+  kubernetes.core.k8s:
+    api_version: postgresql.cnpg.io/v1
+    kind: Cluster
+    name: "{{ cluster_name }}"
+    namespace: "{{ aap_namespace | default('aap') }}"
+    context: "{{ _slot_fix_context }}"
+    definition:
+      spec:
+        instances: 1
+    merge_type: merge
+  failed_when: false
+
+- name: "FIX {{ _check_name }}: Wait for replica pod to become ready"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ aap_namespace | default('aap') }}"
+    context: "{{ _slot_fix_context }}"
+    label_selectors:
+      - "cnpg.io/cluster={{ cluster_name }}"
+      - "role=replica"
+  register: _slot_fix_new_pod
+  until:
+    - _slot_fix_new_pod.resources | default([]) | length > 0
+    - _slot_fix_new_pod.resources[0].status.phase | default('') == 'Running'
+  retries: 60
+  delay: 10
+  failed_when: false
+
+- name: "FIX {{ _check_name }}: Record result"
+  ansible.builtin.set_fact:
+    _fix_result: "pending"
+    _fix_detail: >-
+      Recycled replica on {{ _slot_fix_context }}
+      (scale down → delete PVCs → restart operator → scale up).
+      Pod status: {{ _slot_fix_new_pod.resources[0].status.phase | default('not ready') }}

@@ -1,0 +1,9 @@
+# Gitleaks configuration for this GitOps repository.
+# These manifests reference External Secrets data in a remote secret store;
+# they do not contain the secret values themselves.
+
+[allowlist]
+  description = "Known-safe ExternalSecret manifest references"
+  regexes = [
+    '''(?m)^\s*secretKey:\s*manifest\.zip\s*$''',
+  ]

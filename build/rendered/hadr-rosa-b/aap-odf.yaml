@@ -1,0 +1,303 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+  labels:
+    openshift.io/cluster-monitoring: "true"
+  name: openshift-storage
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false
+    argocd.argoproj.io/sync-wave: "3"
+  name: hub-objectstore-ceph-rgw
+parameters:
+  objectStoreName: hub-objectstore
+  objectStoreNamespace: openshift-storage
+provisioner: openshift-storage.ceph.rook.io/bucket
+reclaimPolicy: Delete
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+  name: aap-hadr-ceph-tools
+  namespace: openshift-storage
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rook-ceph-tools
+  template:
+    metadata:
+      labels:
+        app: rook-ceph-tools
+    spec:
+      containers:
+      - command:
+        - /bin/bash
+        - -c
+        - |
+          set -e
+          mkdir -p /etc/ceph
+          MON_HOSTS=$(printf '%s' "$CEPH_MON" | sed 's/[a-z]=//g')
+          printf '[global]\nfsid = %s\nmon_host = %s\n' "$CEPH_FSID" "$MON_HOSTS" > /etc/ceph/ceph.conf
+          printf '[client.admin]\nkey = %s\n' "$CEPH_ADMIN_KEY" > /etc/ceph/ceph.client.admin.keyring
+          exec sleep infinity
+        env:
+        - name: CEPH_FSID
+          valueFrom:
+            secretKeyRef:
+              key: fsid
+              name: rook-ceph-mon
+        - name: CEPH_ADMIN_KEY
+          valueFrom:
+            secretKeyRef:
+              key: ceph-secret
+              name: rook-ceph-mon
+        - name: CEPH_MON
+          valueFrom:
+            configMapKeyRef:
+              key: data
+              name: rook-ceph-mon-endpoints
+        image: quay.io/ceph/ceph:v19.2.1
+        imagePullPolicy: IfNotPresent
+        name: tools
+        resources:
+          limits:
+            cpu: 500m
+            memory: 256Mi
+          requests:
+            cpu: 10m
+            memory: 64Mi
+        volumeMounts:
+        - mountPath: /etc/ceph
+          name: ceph-config
+      volumes:
+      - emptyDir: {}
+        name: ceph-config
+---
+apiVersion: ceph.rook.io/v1
+kind: CephObjectRealm
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true,Prune=false
+    argocd.argoproj.io/sync-wave: "1"
+  name: hub-realm
+  namespace: openshift-storage
+spec:
+  pull:
+    endpoint: https://rgw-s3-replication-openshift-storage.apps.rosa.i8m2i7h2m5l3g4j.ff74.p3.openshiftapps.com
+---
+apiVersion: ceph.rook.io/v1
+kind: CephObjectStore
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true,Prune=false
+    argocd.argoproj.io/sync-wave: "2"
+  name: hub-objectstore
+  namespace: openshift-storage
+spec:
+  dataPool:
+    replicated:
+      size: 3
+  gateway:
+    instances: 2
+    port: 80
+    resources:
+      limits:
+        cpu: "2"
+        memory: 4Gi
+      requests:
+        cpu: 500m
+        memory: 1Gi
+  metadataPool:
+    replicated:
+      size: 3
+  zone:
+    name: rosa-b
+---
+apiVersion: ceph.rook.io/v1
+kind: CephObjectStoreUser
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true,Prune=false
+    argocd.argoproj.io/sync-wave: "3"
+  name: hub-s3-user
+  namespace: openshift-storage
+spec:
+  capabilities:
+    bucket: '*'
+  displayName: Hub S3 User
+  store: hub-objectstore
+---
+apiVersion: ceph.rook.io/v1
+kind: CephObjectZone
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true,Prune=false
+    argocd.argoproj.io/sync-wave: "2"
+  name: rosa-b
+  namespace: openshift-storage
+spec:
+  customEndpoints:
+  - https://rgw-s3-replication-openshift-storage.apps.rosa.o5x7k1t3d0r6y3b.0re0.p3.openshiftapps.com
+  dataPool:
+    replicated:
+      size: 3
+  metadataPool:
+    replicated:
+      size: 3
+  zoneGroup: hub-zonegroup
+---
+apiVersion: ceph.rook.io/v1
+kind: CephObjectZoneGroup
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true,Prune=false
+    argocd.argoproj.io/sync-wave: "1"
+  name: hub-zonegroup
+  namespace: openshift-storage
+spec:
+  realm: hub-realm
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true,Prune=false
+    argocd.argoproj.io/sync-wave: "4"
+  name: barman-rgw-credentials
+  namespace: aap
+spec:
+  data:
+  - remoteRef:
+      key: eso/aap/shared/hub-rgw-s3-credentials
+      property: s3-access-key-id
+    secretKey: ACCESS_KEY_ID
+  - remoteRef:
+      key: eso/aap/shared/hub-rgw-s3-credentials
+      property: s3-secret-access-key
+    secretKey: ACCESS_SECRET_KEY
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cluster-cross-account-secret-store
+  target:
+    creationPolicy: Owner
+    name: barman-rgw-credentials
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true,Prune=false
+    argocd.argoproj.io/sync-wave: "4"
+  name: hub-rgw-s3-credentials
+  namespace: aap
+spec:
+  dataFrom:
+  - extract:
+      key: eso/aap/shared/hub-rgw-s3-credentials
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cluster-cross-account-secret-store
+  target:
+    creationPolicy: Owner
+    name: hub-rgw-s3-credentials
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true,Prune=false
+    argocd.argoproj.io/sync-wave: "0"
+  name: hub-realm-keys
+  namespace: openshift-storage
+spec:
+  dataFrom:
+  - extract:
+      key: eso/aap/shared/hub-realm-keys
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cluster-cross-account-secret-store
+  target:
+    creationPolicy: Owner
+    name: hub-realm-keys
+    template:
+      type: kubernetes.io/rook
+---
+apiVersion: ocs.openshift.io/v1
+kind: StorageCluster
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true,Prune=false
+    argocd.argoproj.io/sync-wave: "0"
+  name: ocs-storagecluster
+  namespace: openshift-storage
+spec:
+  failureDomain: host
+  multiCloudGateway:
+    reconcileStrategy: ignore
+  storageDeviceSets:
+  - count: 1
+    dataPVCTemplate:
+      spec:
+        accessModes:
+        - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Ti
+        storageClassName: gp3-csi
+        volumeMode: Block
+    name: ocs-deviceset
+    portable: true
+    replica: 3
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+  name: openshift-storage-operatorgroup
+  namespace: openshift-storage
+spec:
+  targetNamespaces:
+  - openshift-storage
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+  name: odf-operator
+  namespace: openshift-storage
+spec:
+  channel: stable-4.20
+  installPlanApproval: Automatic
+  name: odf-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false
+    argocd.argoproj.io/sync-wave: "2"
+  name: rgw-s3-replication
+  namespace: openshift-storage
+spec:
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+  to:
+    kind: Service
+    name: rook-ceph-rgw-hub-objectstore

@@ -1,0 +1,17 @@
+---
+# StorageClass for Ceph RGW OBC provisioning
+#
+# Multisite ObjectStores don't auto-create this StorageClass
+# (non-multisite stores do). Required for ObjectBucketClaims.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: hub-objectstore-ceph-rgw
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+    argocd.argoproj.io/sync-options: Prune=false
+provisioner: openshift-storage.ceph.rook.io/bucket
+reclaimPolicy: Delete
+parameters:
+  objectStoreName: hub-objectstore
+  objectStoreNamespace: openshift-storage

@@ -1,0 +1,15 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+patches:
+  - patch: |-
+      apiVersion: objectbucket.io/v1alpha1
+      kind: ObjectBucketClaim
+      metadata:
+        name: hub-rgw-obc
+        namespace: aap
+      $patch: delete
+    target:
+      kind: ObjectBucketClaim
+      name: hub-rgw-obc
+      namespace: aap

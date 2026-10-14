@@ -1,0 +1,40 @@
+---
+# Trigger an on-demand CNPG backup via the Backup CR.
+
+- name: Check WAL archiver health before backup
+  ansible.builtin.include_tasks: _check_wal_archiver.yml
+
+- name: Display backup parameters
+  ansible.builtin.debug:
+    msg:
+      - "Triggering on-demand backup"
+      - "  Cluster: {{ cluster_name }}"
+      - "  Namespace: {{ aap_namespace }}"
+      - "  Context: {{ target_context }}"
+      - "  Wait: {{ backup_wait }}"
+      - "  Timeout: {{ backup_wait_timeout }}s"
+
+- name: Trigger CNPG backup
+  aap.hadr_ops.cnpg_backup_manage:
+    namespace: "{{ aap_namespace }}"
+    cluster_name: "{{ cluster_name }}"
+    context: "{{ target_context }}"
+    oc_binary: "{{ oc_binary }}"
+    operation: backup
+    backup_name: "{{ backup_name | default(omit) }}"
+    wait: "{{ backup_wait }}"
+    wait_timeout: "{{ backup_wait_timeout }}"
+    poll_interval: "{{ backup_poll_interval }}"
+  register: _backup_result
+
+- name: Set backup result fact
+  ansible.builtin.set_fact:
+    cnpg_backup_result: "{{ _backup_result }}"
+
+- name: Display backup result
+  ansible.builtin.debug:
+    msg:
+      - "Backup: {{ _backup_result.backup_name }}"
+      - "Phase: {{ _backup_result.backup_phase }}"
+      - "Duration: {{ _backup_result.duration_seconds | round(1) }}s"
+      - "Message: {{ _backup_result.message }}"

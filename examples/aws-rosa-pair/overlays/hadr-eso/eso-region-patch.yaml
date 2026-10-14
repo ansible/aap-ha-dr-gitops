@@ -1,0 +1,5 @@
+# Local-render fallback only. Argo CD ApplicationSet overrides this with
+# infrastructure.secrets_manager_region for each environment.
+- op: replace
+  path: /spec/provider/aws/region
+  value: us-east-1

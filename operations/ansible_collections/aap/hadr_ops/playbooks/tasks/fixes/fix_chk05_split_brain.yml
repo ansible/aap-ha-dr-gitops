@@ -1,0 +1,69 @@
+---
+# Fix CHK-05: Resolve split-brain by restoring replication.
+# Only fixable when both clusters report as primary (SPLIT-BRAIN).
+# Not fixable when both report as replica (NO PRIMARY).
+#
+# Input: _check_key, _check_name, _check_detail
+# Output: _fix_result, _fix_detail
+
+- name: "FIX {{ _check_name }}: Check if fixable"
+  ansible.builtin.set_fact:
+    _chk05_fixable: "{{ 'SPLIT-BRAIN' in _check_detail }}"
+
+- name: "FIX {{ _check_name }}: Skip — no-primary requires manual intervention"
+  when: not (_chk05_fixable | bool)
+  ansible.builtin.set_fact:
+    _fix_result: "skipped"
+    _fix_detail: "NO PRIMARY detected — requires manual promotion"
+
+- name: "FIX {{ _check_name }}: Detect intended primary from AAP CR"
+  when: _chk05_fixable | bool
+  block:
+    - name: "FIX {{ _check_name }}: Use explicit target_primary if provided"
+      when: target_primary | default('') | length > 0
+      ansible.builtin.set_fact:
+        _autofix_target_primary: "{{ target_primary }}"
+
+    - name: "FIX {{ _check_name }}: Read AAP CR on cluster A"
+      when: target_primary | default('') | length == 0
+      kubernetes.core.k8s_info:
+        api_version: aap.ansible.com/v1alpha1
+        kind: AnsibleAutomationPlatform
+        namespace: "{{ aap_namespace | default('aap') }}"
+        context: "{{ cluster_a_context }}"
+      register: _aap_cr_a
+      failed_when: false
+
+    - name: "FIX {{ _check_name }}: Read AAP CR on cluster B"
+      when: target_primary | default('') | length == 0
+      kubernetes.core.k8s_info:
+        api_version: aap.ansible.com/v1alpha1
+        kind: AnsibleAutomationPlatform
+        namespace: "{{ aap_namespace | default('aap') }}"
+        context: "{{ cluster_b_context }}"
+      register: _aap_cr_b
+      failed_when: false
+
+    - name: "FIX {{ _check_name }}: Determine active site"
+      when: target_primary | default('') | length == 0
+      ansible.builtin.set_fact:
+        _autofix_target_primary: >-
+          {% set a_idle = _aap_cr_a.resources[0].spec.idle_aap | default(true) | bool if (_aap_cr_a.resources | default([]) | length > 0) else true %}
+          {% set b_idle = _aap_cr_b.resources[0].spec.idle_aap | default(true) | bool if (_aap_cr_b.resources | default([]) | length > 0) else true %}
+          {% if not a_idle %}{{ site_id_a }}
+          {% elif not b_idle %}{{ site_id_b }}
+          {% else %}{{ site_id_a }}{% endif %}
+
+- name: "FIX {{ _check_name }}: Restore replication"
+  when: _chk05_fixable | bool
+  ansible.builtin.include_role:
+    name: aap.hadr_ops.cnpg_restore_replication
+  vars:
+    target_primary: "{{ _autofix_target_primary | trim }}"
+    confirm: "{{ autofix_confirm | default('no') }}"
+
+- name: "FIX {{ _check_name }}: Record result"
+  when: _chk05_fixable | bool
+  ansible.builtin.set_fact:
+    _fix_result: "pending"
+    _fix_detail: "Restored replication with target_primary={{ _autofix_target_primary | trim }}"

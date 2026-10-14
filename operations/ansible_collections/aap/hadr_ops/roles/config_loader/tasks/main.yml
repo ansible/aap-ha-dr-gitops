@@ -1,0 +1,197 @@
+---
+# config_loader — Validate required variables and derive computed facts.
+#
+# This role is imported at the start of every playbook in the collection.
+# It ensures all required topology variables are defined and non-empty,
+# then derives computed facts (child CR names, deployment lists, context
+# maps) that other roles consume.
+
+# ============================================================================
+# STEP 1: Validate cluster topology is provided
+# ============================================================================
+
+- name: Validate cluster_sets is defined (must be provided via -e @clusters.yml)
+  ansible.builtin.assert:
+    that:
+      - cluster_sets is defined
+      - cluster_sets | length > 0
+    fail_msg: >
+      cluster_sets is not defined. You must provide cluster topology via extra vars:
+        ansible-playbook <playbook> -e @my-clusters.yml
+      See the generated <deployment>/operations/clusters.yml for the expected schema.
+
+- name: Validate cluster_set exists in cluster_sets
+  ansible.builtin.assert:
+    that:
+      - cluster_set in cluster_sets
+    fail_msg: >
+      cluster_set '{{ cluster_set }}' not found in cluster_sets.
+      Available sets: {{ cluster_sets.keys() | list | join(', ') }}
+
+- name: Validate cluster_sets[{{ cluster_set }}] schema structure
+  ansible.builtin.assert:
+    that:
+      - "'clusters' in cluster_sets[cluster_set]"
+      - "'a' in cluster_sets[cluster_set].clusters"
+      - "'b' in cluster_sets[cluster_set].clusters"
+      - "'context' in cluster_sets[cluster_set].clusters.a"
+      - "'site_id' in cluster_sets[cluster_set].clusters.a"
+      - "'context' in cluster_sets[cluster_set].clusters.b"
+      - "'site_id' in cluster_sets[cluster_set].clusters.b"
+      - "'overlay_prefix' in cluster_sets[cluster_set]"
+    fail_msg: >
+      Invalid schema for cluster_sets["{{ cluster_set }}"]. Required: clusters.a.{context,site_id}, clusters.b.{context,site_id}, overlay_prefix. Cluster keys must be 'a' and 'b'.
+
+# ============================================================================
+# STEP 2: Resolve topology from cluster_sets
+# ============================================================================
+
+- name: Resolve topology from cluster_sets[{{ cluster_set }}]
+  ansible.builtin.set_fact:
+    _config_set: "{{ cluster_sets[cluster_set] }}"
+
+- name: Set cluster contexts and site IDs from topology
+  ansible.builtin.set_fact:
+    cluster_a_context: "{{ _config_set.clusters.a.context }}"
+    cluster_b_context: "{{ _config_set.clusters.b.context }}"
+    site_id_a: "{{ _config_set.clusters.a.site_id }}"
+    site_id_b: "{{ _config_set.clusters.b.site_id }}"
+
+- name: Validate ApplicationSet identities are present in cluster topology
+  ansible.builtin.assert:
+    that:
+      - _config_set.application_set is defined
+      - _config_set.application_set.pair_id is defined
+      - _config_set.application_set.environment_id_a is defined
+      - _config_set.application_set.environment_id_b is defined
+    fail_msg: >-
+      cluster_sets[{{ cluster_set }}].application_set must define pair_id,
+      environment_id_a, and environment_id_b to match the deployment/argocd
+      pair and environment records.
+
+- name: Set ApplicationSet pair and environment IDs from topology
+  ansible.builtin.set_fact:
+    hadr_pair_id: "{{ _config_set.application_set.pair_id }}"
+    hadr_environment_id_a: "{{ _config_set.application_set.environment_id_a }}"
+    hadr_environment_id_b: "{{ _config_set.application_set.environment_id_b }}"
+
+# ============================================================================
+# STEP 3: Validate resolved topology values are non-empty and not placeholders
+# ============================================================================
+
+- name: Set placeholder sentinel used by clusters.yml.example
+  ansible.builtin.set_fact:
+    _unset_sentinel: "MUST_BE_SET_BY_OVERLAY"
+
+- name: Validate cluster contexts are non-empty
+  ansible.builtin.assert:
+    that:
+      - cluster_a_context | length > 0
+      - cluster_b_context | length > 0
+      - site_id_a | length > 0
+      - site_id_b | length > 0
+    fail_msg: >
+      Cluster topology has empty values. Check your clusters.yml file:
+        cluster_a_context: '{{ cluster_a_context }}'
+        cluster_b_context: '{{ cluster_b_context }}'
+        site_id_a: '{{ site_id_a }}'
+        site_id_b: '{{ site_id_b }}'
+
+- name: Validate cluster contexts are not unfilled template placeholders
+  ansible.builtin.assert:
+    that:
+      - cluster_a_context != _unset_sentinel
+      - cluster_b_context != _unset_sentinel
+      - site_id_a != _unset_sentinel
+      - site_id_b != _unset_sentinel
+    fail_msg: >
+      Cluster topology still has unfilled '{{ _unset_sentinel }}' placeholder values.
+      You copied clusters.yml.example but didn't fill in every field. Check:
+        cluster_a_context: '{{ cluster_a_context }}'
+        cluster_b_context: '{{ cluster_b_context }}'
+        site_id_a: '{{ site_id_a }}'
+        site_id_b: '{{ site_id_b }}'
+
+- name: Validate ApplicationSet pair identities
+  ansible.builtin.assert:
+    that:
+      - hadr_pair_id | length > 0
+      - hadr_environment_id_a | length > 0
+      - hadr_environment_id_b | length > 0
+      - hadr_environment_id_a != hadr_environment_id_b
+      - hadr_pair_id != _unset_sentinel
+      - hadr_environment_id_a != _unset_sentinel
+      - hadr_environment_id_b != _unset_sentinel
+    fail_msg: >-
+      ApplicationSet pair and environment IDs must be set and distinct for
+      cluster_set {{ cluster_set }}.
+
+# ============================================================================
+# STEP 4: Validate AAP resource names are set
+# ============================================================================
+
+- name: Validate AAP resource names
+  ansible.builtin.assert:
+    that:
+      - aap_namespace | length > 0
+      - cluster_name | length > 0
+      - aap_name | length > 0
+    fail_msg: >
+      AAP resource names must be non-empty:
+        aap_namespace: '{{ aap_namespace }}'
+        cluster_name: '{{ cluster_name }}'
+        aap_name: '{{ aap_name }}'
+
+# ============================================================================
+# STEP 5: Derive computed facts
+# ============================================================================
+
+- name: Derive site-to-context mapping
+  ansible.builtin.set_fact:
+    _site_to_context: >-
+      {{ { site_id_a: cluster_a_context,
+           site_id_b: cluster_b_context } }}
+
+- name: Derive child CR names from aap_name
+  ansible.builtin.set_fact:
+    aap_child_crs:
+      controller: "{{ aap_name }}-controller"
+      hub: "{{ aap_name }}-hub"
+      eda: "{{ aap_name }}-eda"
+
+- name: Derive key deployment names from aap_name
+  ansible.builtin.set_fact:
+    aap_key_deployments:
+      - "{{ aap_name }}-controller-task"
+      - "{{ aap_name }}-controller-web"
+      - "{{ aap_name }}-gateway"
+      - "{{ aap_name }}-hub-api"
+      - "{{ aap_name }}-eda-api"
+
+- name: Derive secret names from aap_name
+  ansible.builtin.set_fact:
+    oauth2_secret_name: "{{ aap_name }}-gateway-oauth2-token-secret"
+
+# Kubeconfig paths: callers pass cluster_a_kubeconfig / cluster_b_kubeconfig
+# as extra vars when kubeconfig-based auth is needed (e.g. krkn container).
+# Role defaults initialize both to "" — no derivation needed here.
+
+# ============================================================================
+# STEP 6: Log resolved configuration (debug)
+# ============================================================================
+
+- name: Log resolved configuration
+  ansible.builtin.debug:
+    msg:
+      - "=========================================="
+      - "Configuration loaded (cluster_set={{ cluster_set }})"
+      - "  Cluster A: {{ cluster_a_context }} (site={{ site_id_a }})"
+      - "  Cluster B: {{ cluster_b_context }} (site={{ site_id_b }})"
+      - "  HADR pair: {{ hadr_pair_id }} ({{ hadr_environment_id_a }}, {{ hadr_environment_id_b }})"
+      - "  Namespace: {{ aap_namespace }}"
+      - "  CNPG cluster: {{ cluster_name }}"
+      - "  AAP name: {{ aap_name }}"
+      - "  ArgoCD Applications: {{ argocd_application_names | join(', ') }} in {{ argocd_namespace }}"
+      - "  Derived CRs: {{ aap_child_crs }}"
+      - "=========================================="
+    verbosity: 1

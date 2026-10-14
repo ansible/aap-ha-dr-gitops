@@ -1,0 +1,30 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# A replica is initialized from the current partner over streaming replication.
+patches:
+  - target:
+      group: postgresql.cnpg.io
+      version: v1
+      kind: Cluster
+      name: aap-postgres
+    patch: |-
+      - op: replace
+        path: /spec/bootstrap
+        value:
+          pg_basebackup:
+            source: MUST_BE_SET_BY_OVERLAY
+
+replacements:
+  - source:
+      kind: ConfigMap
+      name: cnpg-cluster-params
+      fieldPath: data.partnerName
+    targets:
+      - select:
+          group: postgresql.cnpg.io
+          version: v1
+          kind: Cluster
+          name: aap-postgres
+        fieldPaths:
+          - spec.bootstrap.pg_basebackup.source

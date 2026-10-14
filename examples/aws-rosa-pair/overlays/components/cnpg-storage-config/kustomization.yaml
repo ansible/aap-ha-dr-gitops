@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+replacements:
+  - source:
+      kind: ConfigMap
+      name: cnpg-cluster-params
+      fieldPath: data.cnpgStorageClass
+    targets:
+      - select:
+          group: postgresql.cnpg.io
+          version: v1
+          kind: Cluster
+          name: aap-postgres
+        fieldPaths:
+          - spec.storage.storageClass
+          - spec.walStorage.storageClass

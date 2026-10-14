@@ -1,0 +1,19 @@
+# Generated from deployment records; edit inventory and regenerate.
+ansible_python_interpreter: '{{ ansible_playbook_python }}'
+cluster_set: '01'
+master_site: a
+autofix: false
+cluster_sets:
+  '01':
+    overlay_prefix: example-pair
+    clusters:
+      a:
+        context: customer-cluster-a
+        site_id: example-a
+      b:
+        context: customer-cluster-b
+        site_id: example-b
+    application_set:
+      pair_id: example-pair
+      environment_id_a: example-pair-a
+      environment_id_b: example-pair-b

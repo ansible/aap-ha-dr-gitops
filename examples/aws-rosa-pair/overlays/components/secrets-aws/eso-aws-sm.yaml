@@ -1,0 +1,26 @@
+---
+# The IRSA annotation cannot be in GitOps because the ESO operator must create
+# the SA first (chicken-and-egg). Run `make eso-annotate-sa` after gitops-install.
+# WARNING: ESO operator upgrades recreate the SA and wipe the annotation.
+# Symptom: ClusterSecretStore shows "unable to create client". Fix: re-run
+# `make eso-annotate-sa CLUSTER=<ctx>` for each cluster.
+---
+# ClusterSecretStore — IRSA provides the credentials via the SA annotation.
+# Do NOT set spec.provider.aws.role — that causes a double AssumeRole which fails.
+apiVersion: external-secrets.io/v1
+kind: ClusterSecretStore
+metadata:
+  name: cluster-cross-account-secret-store
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  provider:
+    aws:
+      region: MUST_BE_SET_BY_OVERLAY
+      service: SecretsManager
+      auth:
+        jwt:
+          serviceAccountRef:
+            name: external-secrets
+            namespace: external-secrets

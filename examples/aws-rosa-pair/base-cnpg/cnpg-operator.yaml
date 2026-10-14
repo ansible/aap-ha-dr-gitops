@@ -1,0 +1,17 @@
+---
+# CloudNativePG Operator Installation
+# Alternative to VM-based PostgreSQL with built-in HA and replication
+# For AAP Plus (ANSTRAT-1982, ANSTRAT-1991)
+
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: cloudnative-pg
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+spec:
+  channel: stable-v1
+  name: cloudnative-pg
+  source: certified-operators
+  sourceNamespace: openshift-marketplace
+  installPlanApproval: Automatic

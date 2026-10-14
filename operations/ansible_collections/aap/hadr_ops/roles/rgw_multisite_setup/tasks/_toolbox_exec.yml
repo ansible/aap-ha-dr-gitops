@@ -1,0 +1,33 @@
+---
+# Execute a radosgw-admin command on a pre-discovered rook-ceph-tools pod.
+#
+# The toolbox pod already has /etc/ceph/ceph.conf and the admin keyring mounted,
+# so no credential injection is needed (unlike ephemeral oc run pods).
+#
+# Required variables:
+#   _pod_name:  Name of the rook-ceph-tools pod (discovered during PREFLIGHT)
+#   _context:   Kubernetes context name
+#   _cmd:       Command or bash script string to execute
+#
+# Output variable:
+#   _exec_result:  k8s_exec result dict (stdout, stderr, return_code)
+#
+# Note: kubernetes.core.k8s_exec does NOT fail when the executed command
+# returns non-zero. The caller must check _exec_result.return_code explicitly.
+# Note: _exec_result is always overwritten by each include. Never assert on a
+# stale value from a prior call — assert immediately after each include_tasks.
+#
+# Optional variable:
+#   _no_log:    Set true on the include_tasks call to suppress output for
+#               tasks whose _cmd contains credentials (access-key / secret).
+
+- name: "toolbox_exec | {{ _cmd | truncate(60) }}"
+  kubernetes.core.k8s_exec:
+    namespace: "{{ rgw_namespace }}"
+    pod: "{{ _pod_name }}"
+    # base64-encode the script so shlex.split (used by k8s_exec internally)
+    # does not strip inner quote characters from nested shell/Python strings.
+    command: '/bin/bash -c "echo {{ _cmd | b64encode }} | base64 -d | bash"'
+    context: "{{ _context }}"
+  no_log: "{{ _no_log | default(false) }}"
+  register: _exec_result
